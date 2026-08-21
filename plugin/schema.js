@@ -242,7 +242,7 @@ function buildPluginSchema() {
               description:
                 "Comma-separated pairs of speed (knots) and power (watts), e.g., '5,10,10,50,20,100'",
               pattern:
-                "^\\\\d+(\\\\.\\\\d+)?,\\\\d+(\\\\.\\\\d+)?(,\\\\d+(\\\\.\\\\d+)?,\\\\d+(\\\\.\\\\d+)?)*$",
+                "^\\s*\\d+(\\.\\d+)?\\s*,\\s*\\d+(\\.\\d+)?\\s*(,\\s*\\d+(\\.\\d+)?\\s*,\\s*\\d+(\\.\\d+)?\\s*)*$",
             },
             enabled: {
               type: "boolean",
