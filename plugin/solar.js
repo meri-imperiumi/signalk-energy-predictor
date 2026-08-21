@@ -23,27 +23,30 @@ const CLEAR_SKY_TRANSMITTANCE = 0.75;
 /**
  * Calculates solar altitude (elevation) and azimuth using suncalc.
  *
- * Suncalc returns azimuth in radians from south (π = south, 0 = north positive eastward).
- * We convert to nautical convention: 0 = north, positive eastward.
+ * Suncalc returns azimuth in radians measured from south, clockwise
+ * (0 = south, π/2 = west, π/-π = north, -π/2 = east).
+ * We convert to nautical convention: 0 = north, positive clockwise (toward east).
+ * This is equivalent to adding π to suncalc's azimuth and normalizing to [-π, π].
  *
  * @param {Date} date - Date/time (UTC)
  * @param {number} latitude - Latitude in degrees (positive north)
  * @param {number} longitude - Longitude in degrees (positive east)
  * @returns {{altitude: number, azimuth: number}} Altitude in radians (0 at horizon, positive upward),
- *          azimuth in radians (0 = north, π/2 = east, π = south, -π/2 = west)
+ *          azimuth in radians (0 = north, π/2 = east, π/-π = south, -π/2 = west)
  */
 function sunPosition(date, latitude, longitude) {
   const pos = SunCalc.getPosition(date, latitude, longitude);
 
-  // suncalc returns azimuth from south clockwise (π = south, π/2 = west, 3π/2 = east)
-  // Convert to nautical: 0 = north, positive eastward
-  let azimuth = pos.azimuth - Math.PI / 2;
+  // suncalc azimuth: 0 = south, measured clockwise (π/2 = west, π = north, -π/2 = east)
+  // nautical azimuth: 0 = north, clockwise positive (π/2 = east, π = south, -π/2 = west)
+  // => nautical = suncalc + π
+  let azimuth = pos.azimuth + Math.PI;
 
-  // Normalize to [-π, π]
-  while (azimuth > Math.PI) {
+  // Normalize to [-π, π)
+  while (azimuth >= Math.PI) {
     azimuth -= 2 * Math.PI;
   }
-  while (azimuth <= -Math.PI) {
+  while (azimuth < -Math.PI) {
     azimuth += 2 * Math.PI;
   }
 
