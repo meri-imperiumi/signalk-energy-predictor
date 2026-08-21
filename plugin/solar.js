@@ -104,13 +104,68 @@ function oktasToFraction(oktas) {
  * @returns {Date|null} Next sunrise time, or null if no sunrise in near future (polar regions)
  */
 function nextSunrise(date, latitude, longitude) {
-  const times = SunCalc.getTimes(date, latitude, longitude);
-  return times.sunrise && times.sunrise > date ? times.sunrise : null;
+  // Check today and tomorrow: when called after today's sunrise, the next
+  // one is tomorrow's (SunCalc returns same-day times for a given date)
+  for (const d of [date, new Date(date.getTime() + 24 * 3600000)]) {
+    const t = SunCalc.getTimes(d, latitude, longitude).sunrise;
+    if (isValidDate(t) && t > date) return t;
+  }
+  return null;
+}
+
+/**
+ * Calculates the next sunset time after the given date.
+ *
+ * @param {Date} date - Starting date
+ * @param {number} latitude - Latitude in degrees (positive north)
+ * @param {number} longitude - Longitude in degrees (positive east)
+ * @returns {Date|null} Next sunset time, or null if no sunset in near future (polar regions)
+ */
+function nextSunset(date, latitude, longitude) {
+  for (const d of [date, new Date(date.getTime() + 24 * 3600000)]) {
+    const t = SunCalc.getTimes(d, latitude, longitude).sunset;
+    if (isValidDate(t) && t > date) return t;
+  }
+  return null;
+}
+
+/**
+ * Calculates the most recent sunset at or before the given date.
+ * For a time at night, this is the sunset that started that night.
+ *
+ * @param {Date} date - Starting date
+ * @param {number} latitude - Latitude in degrees (positive north)
+ * @param {number} longitude - Longitude in degrees (positive east)
+ * @returns {Date|null} Previous sunset time, or null if none found (polar regions)
+ */
+function lastSunset(date, latitude, longitude) {
+  const t = SunCalc.getTimes(date, latitude, longitude).sunset;
+  if (isValidDate(t) && t <= date) return t;
+  const prev = SunCalc.getTimes(
+    new Date(date.getTime() - 24 * 3600000),
+    latitude,
+    longitude,
+  ).sunset;
+  if (isValidDate(prev) && prev <= date) return prev;
+  return null;
+}
+
+/**
+ * Checks whether a value is a valid (non-NaN) Date.
+ * SunCalc returns Date objects with NaN time in polar day/night.
+ *
+ * @param {unknown} d - Value to check
+ * @returns {boolean}
+ */
+function isValidDate(d) {
+  return d instanceof Date && !Number.isNaN(d.getTime());
 }
 
 module.exports = {
   sunPosition,
   nextSunrise,
+  nextSunset,
+  lastSunset,
   maxIrradiance,
   irradianceFromCloudCover,
   oktasToFraction,

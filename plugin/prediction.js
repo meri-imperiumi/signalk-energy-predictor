@@ -7,7 +7,7 @@
  * @file prediction.js
  */
 
-const { sunPosition, nextSunrise } = require("./solar.js");
+const { sunPosition, nextSunrise, lastSunset } = require("./solar.js");
 
 /**
  * Prediction horizon in hours
@@ -272,6 +272,38 @@ function normalizeAngle(a) {
   while (r >= Math.PI) r -= 2 * Math.PI;
   while (r < -Math.PI) r += 2 * Math.PI;
   return r;
+}
+
+/**
+ * Inserts an action into the hourly bucket containing the target time.
+ * Targets before the forecast window clamp to hour 0; targets beyond the
+ * window are dropped. Replaces an existing action for the same device in
+ * the bucket.
+ *
+ * @param {HourlyPrediction[]} predictions - Hourly predictions (mutated)
+ * @param {number} startTimeMs - First bucket time in milliseconds
+ * @param {Date} targetTime - Exact time the action should occur
+ * @param {object} action - Action object (its `time` field is updated)
+ * @returns {void}
+ */
+function insertActionIntoBucket(predictions, startTimeMs, targetTime, action) {
+  let h = Math.floor((targetTime.getTime() - startTimeMs) / 3600000);
+  if (h < 0) {
+    // Target is before the forecast window (e.g. sunset already passed):
+    // the right advice is to act now, so stamp with the current hour's time
+    h = 0;
+    action.time = predictions[0].time.toISOString();
+  } else {
+    action.time = targetTime.toISOString();
+  }
+  if (h >= predictions.length) return;
+  const bucket = predictions[h].actions;
+  const idx = bucket.findIndex((a) => a.id === action.id);
+  if (idx >= 0) {
+    bucket[idx] = action;
+  } else {
+    bucket.push(action);
+  }
 }
 
 /**
@@ -679,18 +711,43 @@ class PredictionEngine {
     const array = this.solarArrays.find((a) => a.id === id);
     const generator = this.mechanicalGenerators.find((g) => g.id === id);
 
-    // FLINsail (deployable solar): gust limit is the deciding factor
+    // FLINsail (deployable solar): gust limit is the deciding factor.
+    // Night-time changes shift to sun boundaries (stow → sunset, deploy → sunrise)
     if (array && array.type === "deployable") {
       const gustLimit = array.gustLimitKnots ?? 20;
+      const pos = this.getSelfPath("navigation.position");
+      const lat = pos?.latitude;
+      const lon = pos?.longitude;
       for (const point of this.lastForecast) {
         const gust = point.gustSpeedKnots ?? 0;
         const wouldStow = gust >= gustLimit;
         const wouldDeploy = !wouldStow;
+        let changeTime = null;
         if (currentState === "deployed" && wouldStow) {
-          return this.toISOString(point.time);
+          changeTime = point.time;
+        } else if (currentState === "stowed" && wouldDeploy) {
+          changeTime = point.time;
         }
-        if (currentState === "stowed" && wouldDeploy) {
-          return this.toISOString(point.time);
+        if (changeTime) {
+          const t =
+            changeTime instanceof Date ? changeTime : new Date(changeTime);
+          if (lat != null && lon != null) {
+            const { altitude } = sunPosition(t, lat, lon);
+            if (altitude <= 0) {
+              // Change triggers at night: report at the sun boundary instead
+              const target =
+                currentState === "deployed"
+                  ? lastSunset(t, lat, lon) // Stow before dark, not at 2 AM
+                  : nextSunrise(t, lat, lon); // Deploy at sunrise, not at night
+              if (target) {
+                const clamped = new Date(
+                  Math.max(target.getTime(), Date.now()),
+                );
+                return this.toISOString(clamped);
+              }
+            }
+          }
+          return this.toISOString(t);
         }
       }
       return null;
@@ -732,6 +789,117 @@ class PredictionEngine {
   }
 
   /**
+   * Computes per-hour ideal states for deployable solar arrays with
+   * sunrise/sunset-aware night handling.
+   *
+   * Day hours: deployed iff gusts are below the array's gust limit.
+   * Night hours: stowed if any hour of the night block has gusts at/above
+   * the limit (the sail should be secured before dark); otherwise the state
+   * carries over from the previous day - deploying at night gains nothing,
+   * so no state flip happens until sunrise.
+   *
+   * @param {Array<{time: Date, gustSpeedKnots: number|null}>} forecast - Weather forecast
+   * @param {number} latitude - Latitude in degrees
+   * @param {number} longitude - Longitude in degrees
+   * @param {Date} startTime - First hour bucket time
+   * @param {number} hours - Number of hourly buckets
+   * @param {boolean} underway - Whether vessel is under way
+   * @returns {Array<Map<string, {state: string, reason: string}>>} Per-hour states per array ID
+   */
+  computeDeployableSolarStates(
+    forecast,
+    latitude,
+    longitude,
+    startTime,
+    hours,
+    underway,
+  ) {
+    const deployable = this.solarArrays.filter((a) => a.type === "deployable");
+    if (deployable.length === 0) return [];
+
+    // Per-hour sun altitude and matched forecast gust
+    const hourInfo = [];
+    for (let h = 0; h < hours; h++) {
+      const time = new Date(startTime.getTime() + h * 3600000);
+      const { altitude } = sunPosition(time, latitude, longitude);
+      const fp = forecast.find(
+        (p) =>
+          Math.abs(
+            (p.time instanceof Date
+              ? p.time.getTime()
+              : new Date(p.time).getTime()) - time.getTime(),
+          ) < 1800000,
+      );
+      hourInfo.push({
+        time,
+        isNight: altitude <= 0,
+        gust: fp?.gustSpeedKnots ?? 0,
+      });
+    }
+
+    // Annotate each night hour with its night block's max gust
+    const nightBlockMax = new Array(hours).fill(null);
+    let blockStart = -1;
+    let blockMax = 0;
+    const flushBlock = (end) => {
+      if (blockStart >= 0) {
+        for (let i = blockStart; i < end; i++) nightBlockMax[i] = blockMax;
+      }
+      blockStart = -1;
+      blockMax = 0;
+    };
+    for (let h = 0; h < hours; h++) {
+      if (hourInfo[h].isNight) {
+        if (blockStart < 0) {
+          blockStart = h;
+          blockMax = 0;
+        }
+        blockMax = Math.max(blockMax, hourInfo[h].gust);
+      } else {
+        flushBlock(h);
+      }
+    }
+    flushBlock(hours);
+
+    // Per-hour states, carrying the previous state through gust-free nights
+    const result = [];
+    const prevState = new Map();
+    for (let h = 0; h < hours; h++) {
+      const info = hourInfo[h];
+      const states = new Map();
+      for (const array of deployable) {
+        const gustLimit = array.gustLimitKnots ?? 20;
+        let state;
+        let reason;
+        if (underway) {
+          state = "stowed";
+          reason = "vessel under way";
+        } else if (info.isNight) {
+          const nightMax = nightBlockMax[h] ?? 0;
+          if (nightMax >= gustLimit) {
+            state = "stowed";
+            reason = `night gusts up to ${Math.round(nightMax)}kn ≥ limit ${gustLimit}kn`;
+          } else {
+            // No night gust risk: keep the previous state until sunrise
+            state = prevState.get(array.id) ?? "deployed";
+            reason = "no night gusts";
+          }
+        } else if (info.gust >= gustLimit) {
+          state = "stowed";
+          reason = `gusts ${Math.round(info.gust)}kn ≥ limit ${gustLimit}kn`;
+        } else {
+          state = "deployed";
+          reason = `gusts ${Math.round(info.gust)}kn < limit ${gustLimit}kn`;
+        }
+        states.set(array.id, { state, reason });
+        prevState.set(array.id, state);
+      }
+      result.push(states);
+    }
+    return result;
+  }
+
+  /**
    * Computes per-device deploy/stow actions for a given hour's conditions.
    *
    * Each action is:
@@ -746,7 +914,9 @@ class PredictionEngine {
    * @param {boolean} isSailing - Whether vessel is sailing this hour
    * @param {number|null} speedThroughWaterKnots - Boat speed in knots
    * @param {Map<string, string|null>} [detectedDeployStates] - Detected states
-   * @returns {Array<{id: string, idealState: string, idealAction: string, detectedAction: string|null, reason: string}>}
+   * @param {Map<string, {state: string, reason: string}>} [solarStates] - Precomputed
+   *        deployable solar states for this hour (from computeDeployableSolarStates)
+   * @returns {Array<{id: string, type: string, idealState: string, idealAction: string, detectedAction: string|null, reason: string}>}
    */
   getHourlyActions(
     gustKnots,
@@ -755,25 +925,20 @@ class PredictionEngine {
     isSailing,
     speedThroughWaterKnots,
     detectedDeployStates,
+    solarStates,
   ) {
     const actions = [];
 
-    // Deployable solar arrays (FLINsail)
+    // Deployable solar arrays (FLINsail) - states precomputed with
+    // sunrise/sunset-aware night handling
     for (const array of this.solarArrays) {
       if (array.type !== "deployable") continue;
-      const gustLimit = array.gustLimitKnots ?? 20;
-      let idealState;
-      let reason;
-      if (underway) {
-        idealState = "stowed";
-        reason = "vessel under way";
-      } else if (gustKnots >= gustLimit) {
-        idealState = "stowed";
-        reason = `gusts ${Math.round(gustKnots)}kn ≥ limit ${gustLimit}kn`;
-      } else {
-        idealState = "deployed";
-        reason = `gusts ${Math.round(gustKnots)}kn < limit ${gustLimit}kn`;
-      }
+      const s = solarStates?.get(array.id) ?? {
+        state: "deployed",
+        reason: "",
+      };
+      const idealState = s.state;
+      const reason = s.reason;
       const idealAction = idealState === "deployed" ? "deploy" : "stow";
       const detectedState = detectedDeployStates?.get(array.id) ?? null;
       const detectedAction =
@@ -786,6 +951,7 @@ class PredictionEngine {
               : "stow";
       actions.push({
         id: array.id,
+        type: "solar-deployable",
         idealState,
         idealAction,
         detectedAction,
@@ -846,6 +1012,7 @@ class PredictionEngine {
               : "stow";
       actions.push({
         id: generator.id,
+        type: generator.type,
         idealState,
         idealAction,
         detectedAction,
@@ -1107,6 +1274,15 @@ class PredictionEngine {
     const startTime = new Date(Date.now());
     // Track previous hour's ideal states to emit actions only on change
     let prevIdealStates = new Map();
+    // Deployable solar states with sunrise/sunset-aware night handling
+    const solarStatesPerHour = this.computeDeployableSolarStates(
+      forecast,
+      latitude,
+      longitude,
+      startTime,
+      PREDICTION_HOURS,
+      underway,
+    );
     this.app?.debug?.(`  prediction[0]: ${startTime.toISOString()}`);
 
     for (let h = 0; h < PREDICTION_HOURS; h++) {
@@ -1213,7 +1389,10 @@ class PredictionEngine {
       );
 
       // Compute per-device deploy/stow actions for this hour,
-      // emitting only when the ideal state changes (hour 0 = baseline)
+      // emitting only when the ideal state changes. At hour 0, emit only
+      // devices that actually need something done (detected state differs
+      // from ideal, or is unknown) - a device already in its ideal state
+      // ("stay") needs no action entry.
       const allActions = this.getHourlyActions(
         windGustKnots,
         windSpeedKnots,
@@ -1221,10 +1400,16 @@ class PredictionEngine {
         isSailing,
         speedThroughWater ?? null,
         detectedDeployStates,
+        solarStatesPerHour[h],
       );
       const actions = allActions.filter(
-        (a) => h === 0 || prevIdealStates.get(a.id) !== a.idealState,
+        (a) =>
+          (h === 0 && a.detectedAction !== "stay") ||
+          (h > 0 && prevIdealStates.get(a.id) !== a.idealState),
       );
+      for (const a of actions) {
+        a.time = time.toISOString();
+      }
       prevIdealStates = new Map(allActions.map((a) => [a.id, a.idealState]));
 
       predictions.push({
@@ -1244,9 +1429,55 @@ class PredictionEngine {
       });
     }
 
+    // FLINsail produces nothing at night: move night actions to sun boundaries
+    // (stow during night → at sunset, deploy during night → at sunrise)
+    this.shiftSolarActionsToSunBoundaries(predictions, latitude, longitude);
+
     this.lastPrediction = predictions;
     this.lastForecast = forecast;
     return predictions;
+  }
+
+  /**
+   * Moves deployable solar actions that occur during night hours to the
+   * surrounding sun boundary: a stow triggered at night is reported at the
+   * sunset that started the night (stow before dark, no 2 AM surprises), and
+   * a deploy triggered at night is reported at the next sunrise (deploying
+   * at night gains nothing since the array produces no power).
+   *
+   * Each shifted action carries the exact boundary time in its `time` field
+   * and is placed in the hourly bucket containing that time. Targets before
+   * the forecast window clamp to hour 0 ("do it now"); targets beyond the
+   * window are dropped.
+   *
+   * @param {HourlyPrediction[]} predictions - Hourly predictions (mutated)
+   * @param {number} latitude - Latitude in degrees
+   * @param {number} longitude - Longitude in degrees
+   * @returns {void}
+   */
+  shiftSolarActionsToSunBoundaries(predictions, latitude, longitude) {
+    if (predictions.length === 0) return;
+    const startTime = predictions[0].time.getTime();
+
+    for (const p of predictions) {
+      const { altitude } = sunPosition(p.time, latitude, longitude);
+      if (altitude > 0) continue; // Day hour: keep as-is
+
+      const solarActions = p.actions.filter(
+        (a) => a.type === "solar-deployable",
+      );
+      if (solarActions.length === 0) continue;
+      p.actions = p.actions.filter((a) => a.type !== "solar-deployable");
+
+      for (const action of solarActions) {
+        const target =
+          action.idealAction === "stow"
+            ? lastSunset(p.time, latitude, longitude)
+            : nextSunrise(p.time, latitude, longitude);
+        if (!target) continue; // Polar edge case: leave in place
+        insertActionIntoBucket(predictions, startTime, target, action);
+      }
+    }
   }
 
   /**

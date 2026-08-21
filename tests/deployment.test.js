@@ -7,6 +7,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const { PredictionEngine, LoadProfile } = require("../plugin/prediction.js");
+const { nextSunrise, lastSunset } = require("../plugin/solar.js");
 const { AdvisoryPublisher } = require("../plugin/advisory.js");
 const { parseManufacturerCurve } = require("../plugin/schema.js");
 
@@ -1704,13 +1705,16 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
         .getDeploymentRecommendations()
         .find((r) => r.id === "flinsail");
       assert.strictEqual(rec.recommendedState, "stowed");
-      // State should change at hour 5 (when gusts drop to 10kn)
+      // Gusts drop at hour 5 (17:00Z), which is after sunset at 60°N in March.
+      // Night-time deploy shifts to the next sunrise instead
       assert.ok(rec.recommendedStateTime);
       const changeTime = new Date(rec.recommendedStateTime);
-      assert.strictEqual(
-        changeTime.getTime(),
-        new Date(now.getTime() + 5 * 3600000).getTime(),
+      const expectedSunrise = nextSunrise(
+        new Date(now.getTime() + 5 * 3600000),
+        60,
+        18,
       );
+      assert.strictEqual(changeTime.getTime(), expectedSunrise.getTime());
     } finally {
       Date.now = realNow;
     }
@@ -2050,7 +2054,7 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
     }
   });
 
-  test("hourly actions: ideal stow (gusts), detected stay (already stowed)", () => {
+  test("hourly actions: no action entry when already in ideal state (stay)", () => {
     const app = makeFakeApp();
     app.setSelfPath("navigation.position", {
       latitude: 60,
@@ -2077,7 +2081,8 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       app,
     });
 
-    // Gusts 35kn (exceeds max 30) → ideal: stow
+    // Gusts 35kn (exceeds max 30) → ideal: stow. Detected as already stowed
+    // → nothing to do, no action entry at hour 0
     const now = new Date("2026-03-20T12:00:00Z");
     const forecast = Array.from({ length: 24 }, () => ({
       time: new Date(now.getTime()),
@@ -2092,11 +2097,11 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
     try {
       const detectedStates = new Map([["windgen", "stowed"]]);
       engine.runPrediction(forecast, detectedStates);
-      const actions = engine.lastPrediction[0].actions;
-      const windAction = actions.find((a) => a.id === "windgen");
-      assert.strictEqual(windAction.idealAction, "stow");
-      // Detected as stowed, ideal is stow → stay
-      assert.strictEqual(windAction.detectedAction, "stay");
+      assert.strictEqual(
+        engine.lastPrediction[0].actions.find((a) => a.id === "windgen"),
+        undefined,
+        "Device already stowed in stow conditions should produce no action",
+      );
     } finally {
       Date.now = realNow;
     }
@@ -2272,6 +2277,247 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
         engine.lastPrediction[4].actions.find((a) => a.id === "windgen"),
         undefined,
         "Hour 4 should not repeat the deploy action",
+      );
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test("FLINsail stow triggered at night is reported at sunset", () => {
+    const app = makeFakeApp();
+    // Helsinki midsummer: sunset 2026-06-20T19:50:54Z, sunrise 2026-06-21T00:55:14Z
+    app.setSelfPath("navigation.position", {
+      latitude: 60.17,
+      longitude: 24.94,
+    });
+    app.setSelfPath("navigation.state", "moored");
+
+    const engine = new PredictionEngine({
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [
+        {
+          id: "flinsail",
+          type: "deployable",
+          capacityWp: 300,
+          gustLimitKnots: 20,
+          powerPath: "electrical.solar.flinsail.power",
+        },
+      ],
+      mechanicalGenerators: [],
+      getEfficiency: () => 0.7,
+      getSelfPath: (path) => app.getSelfPath(path),
+      app,
+    });
+
+    // Gusts 25kn only at hour 14 (00:00Z, night). Night block is h10-h14
+    // (20:00Z-00:00Z). Night max gust exceeds limit → stow from sunset on.
+    const now = new Date("2026-06-20T10:00:00Z");
+    const forecast = Array.from({ length: 24 }, (_, h) => ({
+      time: new Date(now.getTime() + h * 3600000),
+      ghi: 500,
+      cloudCover: 0,
+      gustSpeedKnots: h === 14 ? 25 : 10,
+      windSpeedKnots: 10,
+      windDirectionDeg: null,
+    }));
+    const realNow = Date.now;
+    Date.now = () => now.getTime();
+    try {
+      engine.runPrediction(forecast);
+
+      // The stow action must NOT be at the night hour (h10, 20:00Z)...
+      assert.strictEqual(
+        engine.lastPrediction[10].actions.find((a) => a.id === "flinsail"),
+        undefined,
+        "Stow action must not sit at the night hour",
+      );
+      // ...but in the hour bucket containing sunset, with the exact sunset time
+      const sunsetBucket = engine.lastPrediction[9].actions.find(
+        (a) => a.id === "flinsail",
+      );
+      assert.ok(
+        sunsetBucket,
+        "Stow action should be in the sunset hour bucket",
+      );
+      assert.strictEqual(sunsetBucket.idealAction, "stow");
+      assert.strictEqual(sunsetBucket.type, "solar-deployable");
+      const expectedSunset = lastSunset(
+        new Date("2026-06-20T20:00:00Z"),
+        60.17,
+        24.94,
+      );
+      assert.strictEqual(sunsetBucket.time, expectedSunset.toISOString());
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test("FLINsail deploy suggested at night is reported at sunrise", () => {
+    const app = makeFakeApp();
+    app.setSelfPath("navigation.position", {
+      latitude: 60.17,
+      longitude: 24.94,
+    });
+    app.setSelfPath("navigation.state", "moored");
+
+    const engine = new PredictionEngine({
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [
+        {
+          id: "flinsail",
+          type: "deployable",
+          capacityWp: 300,
+          gustLimitKnots: 20,
+          powerPath: "electrical.solar.flinsail.power",
+        },
+      ],
+      mechanicalGenerators: [],
+      getEfficiency: () => 0.7,
+      getSelfPath: (path) => app.getSelfPath(path),
+      app,
+    });
+
+    // Forecast starts at night (22:00Z), gusts fine throughout.
+    // Hour 0 baseline: deployed → deploy action, but at a night hour
+    const now = new Date("2026-06-20T22:00:00Z");
+    const forecast = Array.from({ length: 24 }, (_, h) => ({
+      time: new Date(now.getTime() + h * 3600000),
+      ghi: 0,
+      cloudCover: 0,
+      gustSpeedKnots: 10,
+      windSpeedKnots: 10,
+      windDirectionDeg: null,
+    }));
+    const realNow = Date.now;
+    Date.now = () => now.getTime();
+    try {
+      engine.runPrediction(forecast);
+
+      // The deploy action must NOT be at hour 0 (night)...
+      assert.strictEqual(
+        engine.lastPrediction[0].actions.find((a) => a.id === "flinsail"),
+        undefined,
+        "Deploy action must not sit at a night hour",
+      );
+      // ...but at sunrise (00:55:14Z next day), in the hour bucket containing it
+      const sunriseBucket = engine.lastPrediction[2].actions.find(
+        (a) => a.id === "flinsail",
+      );
+      assert.ok(sunriseBucket, "Deploy action should be at the sunrise bucket");
+      assert.strictEqual(sunriseBucket.idealAction, "deploy");
+      const expectedSunrise = nextSunrise(now, 60.17, 24.94);
+      assert.strictEqual(sunriseBucket.time, expectedSunrise.toISOString());
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test("FLINsail night stow when sunset already passed is stamped now", () => {
+    const app = makeFakeApp();
+    // Helsinki June: sunset 2026-06-20T19:50:54Z. Forecast starts at 22:00Z,
+    // already in the night, with gusts above the limit all night.
+    app.setSelfPath("navigation.position", {
+      latitude: 60.17,
+      longitude: 24.94,
+    });
+    app.setSelfPath("navigation.state", "moored");
+
+    const engine = new PredictionEngine({
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [
+        {
+          id: "flinsail",
+          type: "deployable",
+          capacityWp: 300,
+          gustLimitKnots: 20,
+          powerPath: "electrical.solar.flinsail.power",
+        },
+      ],
+      mechanicalGenerators: [],
+      getEfficiency: () => 0.7,
+      getSelfPath: (path) => app.getSelfPath(path),
+      app,
+    });
+
+    const now = new Date("2026-06-20T22:00:00Z");
+    const forecast = Array.from({ length: 24 }, (_, h) => ({
+      time: new Date(now.getTime() + h * 3600000),
+      ghi: 0,
+      cloudCover: 0,
+      gustSpeedKnots: 25,
+      windSpeedKnots: 10,
+      windDirectionDeg: null,
+    }));
+    const realNow = Date.now;
+    Date.now = () => now.getTime();
+    try {
+      // Detected deployed: in gusty night, stow is needed
+      engine.runPrediction(forecast, new Map([["flinsail", "deployed"]]));
+      const stow = engine.lastPrediction[0].actions.find(
+        (a) => a.id === "flinsail",
+      );
+      assert.ok(stow, "Stow action should be present");
+      assert.strictEqual(stow.idealAction, "stow");
+      assert.match(stow.reason, /night gusts/);
+      // Sunset 19:50Z already passed: the advice is "stow now", not a past time
+      assert.strictEqual(
+        stow.time,
+        engine.lastPrediction[0].time.toISOString(),
+        "Past sunset should clamp to the current hour's time",
+      );
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test("FLINsail day-time actions stay at their hour (no shift)", () => {
+    const app = makeFakeApp();
+    app.setSelfPath("navigation.position", {
+      latitude: 60.17,
+      longitude: 24.94,
+    });
+    app.setSelfPath("navigation.state", "moored");
+
+    const engine = new PredictionEngine({
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [
+        {
+          id: "flinsail",
+          type: "deployable",
+          capacityWp: 300,
+          gustLimitKnots: 20,
+          powerPath: "electrical.solar.flinsail.power",
+        },
+      ],
+      mechanicalGenerators: [],
+      getEfficiency: () => 0.7,
+      getSelfPath: (path) => app.getSelfPath(path),
+      app,
+    });
+
+    // Gusts 25kn at hour 5 (15:00Z, day) → stow at that hour, unshifted
+    const now = new Date("2026-06-20T10:00:00Z");
+    const forecast = Array.from({ length: 24 }, (_, h) => ({
+      time: new Date(now.getTime() + h * 3600000),
+      ghi: 500,
+      cloudCover: 0,
+      gustSpeedKnots: h === 5 ? 25 : 10,
+      windSpeedKnots: 10,
+      windDirectionDeg: null,
+    }));
+    const realNow = Date.now;
+    Date.now = () => now.getTime();
+    try {
+      engine.runPrediction(forecast);
+      const stow = engine.lastPrediction[5].actions.find(
+        (a) => a.id === "flinsail",
+      );
+      assert.ok(stow, "Stow action should be at hour 5");
+      assert.strictEqual(stow.idealAction, "stow");
+      // Day-time action keeps the bucket time, no sun-boundary shift
+      assert.strictEqual(
+        stow.time,
+        new Date(now.getTime() + 5 * 3600000).toISOString(),
       );
     } finally {
       Date.now = realNow;
