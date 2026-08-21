@@ -1,0 +1,45 @@
+{
+  "name": "@meri-imperiumi/signalk-energy-predictor",
+  "version": "0.1.0",
+  "description": "Predictive energy management plugin for Signal K using offline-first incremental learning",
+  "main": "plugin/index.js",
+  "scripts": {
+    "lint": "npx @biomejs/biome check --use-editorconfig=true plugin/",
+    "format": "npx @biomejs/biome check --use-editorconfig=true --write plugin/ tests/ bin/",
+    "test": "node --test --test-force-exit \"tests/*.test.js\"",
+    "backtest": "node bin/backtest.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git://github.com/meri-imperiumi/signalk-energy-predictor.git"
+  },
+  "keywords": [
+    "signalk",
+    "signalk-node-server-plugin",
+    "energy",
+    "prediction",
+    "solar",
+    "wind",
+    "battery"
+  ],
+  "author": "Henri Bergius <henri.bergius@iki.fi>",
+  "license": "EUPL-1.2",
+  "bugs": {
+    "url": "https://github.com/meri-imperiumi/signalk-energy-predictor/issues"
+  },
+  "homepage": "https://github.com/meri-imperiumi/signalk-energy-predictor#readme",
+  "signalk-plugin-enabled-by-default": false,
+  "signalk": {
+    "displayName": "Energy Predictor",
+    "externalSchema": "config.json"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "dependencies": {
+    "suncalc": "^1.9.0"
+  },
+  "devDependencies": {
+    "@signalk/server-api": "^2.30.0"
+  }
+}
