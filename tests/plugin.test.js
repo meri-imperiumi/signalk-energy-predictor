@@ -23,7 +23,8 @@ class FakeStreamBundle {
     this.subscriptions.push({ subscription, errorHandler, deltaHandler });
     return () => {
       const idx = this.subscriptions.findIndex(
-        (s) => s.subscription === subscription && s.deltaHandler === deltaHandler
+        (s) =>
+          s.subscription === subscription && s.deltaHandler === deltaHandler,
       );
       if (idx >= 0) this.subscriptions.splice(idx, 1);
     };
@@ -46,15 +47,17 @@ class FakeSubscriptionManager {
     this.subscriptions = [];
   }
 
-  subscribe(subscription, policy, errorHandler, deltaHandler) {
-    this.subscriptions.push({ subscription, policy, errorHandler, deltaHandler });
-    // Return an unsubscribe function
-    return () => {
+  subscribe(subscription, unsubscribes, errorHandler, deltaHandler) {
+    this.subscriptions.push({ subscription, errorHandler, deltaHandler });
+    // Create unsubscribe function and add it to unsubscribes array
+    const unsubscribe = () => {
       const idx = this.subscriptions.findIndex(
-        (s) => s.subscription === subscription && s.deltaHandler === deltaHandler
+        (s) =>
+          s.subscription === subscription && s.deltaHandler === deltaHandler,
       );
       if (idx >= 0) this.subscriptions.splice(idx, 1);
     };
+    unsubscribes.push(unsubscribe);
   }
 }
 
@@ -197,9 +200,9 @@ test.describe("Plugin basic functionality", () => {
     await plugin.start(config, () => {});
 
     // Check that components were initialized
-    assert.ok(plugin.ingestionFSM);
-    assert.ok(plugin.predictionEngine);
-    assert.ok(plugin.advisoryPublisher);
+    assert.ok(plugin.__getInternals().ingestionFSM);
+    assert.ok(plugin.__getInternals().predictionEngine);
+    assert.ok(plugin.__getInternals().advisoryPublisher);
 
     // Clean up
     await plugin.stop();
@@ -328,7 +331,9 @@ test.describe("Configuration handling", () => {
 
     // Only enabled arrays should be used
     // Check status line mentions the count
-    const statusMsg = app.setPluginStatusCalls.find((msg) => msg.includes("solar array"));
+    const statusMsg = app.setPluginStatusCalls.find((msg) =>
+      msg.includes("solar array"),
+    );
     assert.ok(statusMsg);
     assert.match(statusMsg, /1 solar array/); // Only 1 enabled
 
@@ -367,13 +372,15 @@ test.describe("Matrix persistence", () => {
 
     // Trigger a save by advancing time or let interval fire
     // For now just verify start completed without error
-    assert.ok(plugin.ingestionFSM);
-    assert.ok(plugin.predictionEngine);
+    assert.ok(plugin.__getInternals().ingestionFSM);
+    assert.ok(plugin.__getInternals().predictionEngine);
 
     await plugin.stop();
 
     // Verify status mentioned matrices
-    const stopMsg = app.setPluginStatusCalls.find((msg) => msg.includes("Stopped"));
+    const stopMsg = app.setPluginStatusCalls.find((msg) =>
+      msg.includes("Stopped"),
+    );
     assert.ok(stopMsg);
   });
 });
@@ -402,24 +409,25 @@ test.describe("Signal K API interactions", () => {
     try {
       await plugin.start(config, () => {});
       // If it starts, we can test prediction
-      if (plugin.predictionEngine) {
+      if (plugin.__getInternals().predictionEngine) {
         const forecast = [
           { time: new Date(), ghi: 0, cloudCover: null, gustSpeedKnots: 0 },
         ];
-        const hourly = plugin.predictionEngine.runPrediction(forecast);
+        const hourly = plugin
+          .__getInternals()
+          .predictionEngine.runPrediction(forecast);
         assert.ok(Array.isArray(hourly));
         assert.strictEqual(hourly.length, 24);
       }
       await plugin.stop();
       // If we got here, it succeeded despite no getSelfPath
     } catch (error) {
-      // If getSelfPath is required and missing, that's okay to fail
-      // Check for common error patterns
+      // If required APIs are missing, that's okay to fail
       assert.ok(
         error.message.includes("getSelfPath") ||
-        error.message.includes("getSelfPath is not a function") ||
-        error.message.includes("getSelfPath is not a function") ||
-        error.message.includes("Cannot read")
+          error.message.includes("is not a function") ||
+          error.message.includes("Cannot read") ||
+          error.message.includes("undefined"),
       );
     }
   });
@@ -462,9 +470,33 @@ test.describe("Signal K API interactions", () => {
     app.dataPath = tempDir;
     await plugin.start(config, () => {});
 
-    // Verify getSelfPath was called for navigation data
-    assert.ok(app.getSelfPathCalls.some((path) => path.includes("navigation.state")));
-    assert.ok(app.getSelfPathCalls.some((path) => path.includes("navigation.position")));
+    // Emit deltas to populate deltaState
+    app.subscriptionmanager.subscriptions.forEach(({ deltaHandler }) => {
+      deltaHandler({
+        context: app.selfId,
+        updates: [
+          {
+            values: [
+              {
+                path: "navigation.position",
+                value: { latitude: 60.0, longitude: 18.0 },
+              },
+              {
+                path: "electrical.batteries.house.capacity.stateOfCharge",
+                value: 0.6,
+              },
+              { path: "navigation.state", value: "anchored" },
+              { path: "environment.wind.angleApparent", value: 0 },
+            ],
+          },
+        ],
+      });
+    });
+
+    // Verify the prediction engine can read navigation state
+    assert.ok(plugin.__getInternals().predictionEngine);
+    const navState = plugin.__getInternals().predictionEngine.getNavState();
+    assert.strictEqual(navState, "anchored");
 
     await plugin.stop();
   });

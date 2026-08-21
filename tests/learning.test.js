@@ -25,10 +25,10 @@ test.describe("SolarMatrix", () => {
 
     test("bins azimuth in 15° increments", () => {
       const key0 = anchoredKey(0, 0);
-      const key7 = anchoredKey(7 * Math.PI / 180, 0);
-      const key30 = anchoredKey(30 * Math.PI / 180, 0);
-      const keyNeg7 = anchoredKey(-7 * Math.PI / 180, 0);
-      const keyNeg30 = anchoredKey(-30 * Math.PI / 180, 0);
+      const key7 = anchoredKey((7 * Math.PI) / 180, 0);
+      const key30 = anchoredKey((30 * Math.PI) / 180, 0);
+      const keyNeg7 = anchoredKey((-7 * Math.PI) / 180, 0);
+      const keyNeg30 = anchoredKey((-30 * Math.PI) / 180, 0);
 
       assert.ok(typeof key0 === "string" && key0.includes("_"));
       assert.strictEqual(key0, key7);
@@ -39,7 +39,7 @@ test.describe("SolarMatrix", () => {
 
     test("bins elevation in 10° increments", () => {
       const key1 = anchoredKey(0, 0);
-      const key2 = anchoredKey(0, 5 * Math.PI / 180);
+      const key2 = anchoredKey(0, (5 * Math.PI) / 180);
       assert.ok(key1.includes("_"));
       assert.strictEqual(key1.split("_")[1], "0");
       assert.strictEqual(key2.split("_")[1], "0");
@@ -53,10 +53,10 @@ test.describe("SolarMatrix", () => {
     });
 
     test("bins AWA in 30° increments", () => {
-      const key15 = sailingKey(0, 0, 15 * Math.PI / 180);
-      const key45 = sailingKey(0, 0, 45 * Math.PI / 180);
-      const key90 = sailingKey(0, 0, 90 * Math.PI / 180);
-      const key120 = sailingKey(0, 0, 120 * Math.PI / 180);
+      const key15 = sailingKey(0, 0, (15 * Math.PI) / 180);
+      const key45 = sailingKey(0, 0, (45 * Math.PI) / 180);
+      const key90 = sailingKey(0, 0, (90 * Math.PI) / 180);
+      const key120 = sailingKey(0, 0, (120 * Math.PI) / 180);
 
       const parts15 = key15.split("_");
       const parts45 = key45.split("_");

@@ -15,12 +15,7 @@
   },
   "keywords": [
     "signalk",
-    "signalk-node-server-plugin",
-    "energy",
-    "prediction",
-    "solar",
-    "wind",
-    "battery"
+    "signalk-node-server-plugin"
   ],
   "author": "Henri Bergius <henri.bergius@iki.fi>",
   "license": "EUPL-1.2",

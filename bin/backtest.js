@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+
 /**
  * Backtesting CLI for Energy Predictor.
  *
@@ -10,12 +11,16 @@
  * @file backtest.js
  */
 
-import { parseArgs } from "node:util";
 import { readFile, writeFile } from "node:fs/promises";
-import { join, dirname } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { parseArgs } from "node:util";
 import { SolarMatrix } from "../plugin/learning.js";
-import { sunPosition, maxIrradiance, irradianceFromCloudCover } from "../plugin/solar.js";
+import {
+  irradianceFromCloudCover,
+  maxIrradiance,
+  sunPosition,
+} from "../plugin/solar.js";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -30,7 +35,9 @@ function parseArguments() {
     options: {
       from: {
         type: "string",
-        default: new Date(Date.now() - 7 * 24 * 3600000).toISOString().split("T")[0],
+        default: new Date(Date.now() - 7 * 24 * 3600000)
+          .toISOString()
+          .split("T")[0],
       },
       to: {
         type: "string",
@@ -82,7 +89,14 @@ async function readConfig(path) {
  * @param {number} resolution - Resolution in seconds
  * @returns {Promise<object>} Historical data
  */
-async function queryHistory(baseUrl, provider, from, to, paths, resolution = 300) {
+async function queryHistory(
+  baseUrl,
+  provider,
+  from,
+  to,
+  paths,
+  resolution = 300,
+) {
   const url = new URL(`${baseUrl}/signalk/v2/api/history/values`);
   url.searchParams.set("paths", paths.join(","));
   url.searchParams.set("from", from.toISOString());
@@ -96,7 +110,9 @@ async function queryHistory(baseUrl, provider, from, to, paths, resolution = 300
   const response = await fetch(url.toString());
 
   if (!response.ok) {
-    throw new Error(`History API returned ${response.status}: ${response.statusText}`);
+    throw new Error(
+      `History API returned ${response.status}: ${response.statusText}`,
+    );
   }
 
   return await response.json();
@@ -192,7 +208,15 @@ function interpolateWeather(weather, time) {
  * @param {number} params.longitude - Longitude
  * @returns {Promise<object>} Backtest results
  */
-async function backtestArray({ array, baseUrl, provider, from, to, latitude, longitude }) {
+async function backtestArray({
+  array,
+  baseUrl,
+  provider,
+  from,
+  to,
+  latitude,
+  longitude,
+}) {
   const powerPath = array.powerPath;
   if (!powerPath) {
     throw new Error(`Array ${array.id} has no power path configured`);
@@ -209,7 +233,7 @@ async function backtestArray({ array, baseUrl, provider, from, to, latitude, lon
 
   let totalPredictedWh = 0;
   let totalActualWh = 0;
-  let errors = [];
+  const errors = [];
   let binUpdates = 0;
 
   // Replay data
@@ -225,7 +249,8 @@ async function backtestArray({ array, baseUrl, provider, from, to, latitude, lon
       continue;
     }
 
-    const actualPowerW = typeof powerRaw === "number" ? powerRaw : powerRaw.value || 0;
+    const actualPowerW =
+      typeof powerRaw === "number" ? powerRaw : powerRaw.value || 0;
 
     if (actualPowerW <= 0) {
       continue;
@@ -285,15 +310,28 @@ async function backtestArray({ array, baseUrl, provider, from, to, latitude, lon
   }
 
   // Calculate statistics
-  const mae = errors.length > 0 ? errors.reduce((a, b) => a + b, 0) / errors.length : 0;
-  const maeRelative = errors.length > 0 && totalActualWh > 0 ? mae / (totalActualWh / (errors.length * 300 / 3600)) : 0;
-  const rmse = errors.length > 0 ? Math.sqrt(errors.reduce((a, b) => a + b * b, 0) / errors.length) : 0;
+  const mae =
+    errors.length > 0 ? errors.reduce((a, b) => a + b, 0) / errors.length : 0;
+  const maeRelative =
+    errors.length > 0 && totalActualWh > 0
+      ? mae / (totalActualWh / ((errors.length * 300) / 3600))
+      : 0;
+  const rmse =
+    errors.length > 0
+      ? Math.sqrt(errors.reduce((a, b) => a + b * b, 0) / errors.length)
+      : 0;
 
   // Check for bin drift
   const anchoredBins = matrix.toJSON().anchored;
   const binEfficiencies = Object.values(anchoredBins);
-  const avgBinEfficiency = binEfficiencies.length > 0 ? binEfficiencies.reduce((a, b) => a + b, 0) / binEfficiencies.length : 0.7;
-  const binDrift = binEfficiencies.length > 0 ? Math.max(...binEfficiencies) - Math.min(...binEfficiencies) : 0;
+  const avgBinEfficiency =
+    binEfficiencies.length > 0
+      ? binEfficiencies.reduce((a, b) => a + b, 0) / binEfficiencies.length
+      : 0.7;
+  const binDrift =
+    binEfficiencies.length > 0
+      ? Math.max(...binEfficiencies) - Math.min(...binEfficiencies)
+      : 0;
 
   return {
     arrayId: array.id,
@@ -334,13 +372,17 @@ async function main() {
     const longitude = Number(process.env.LONGITUDE || 0);
 
     if (latitude === 0 && longitude === 0) {
-      console.warn("Warning: No position set (LATITUDE/LONGITUDE env vars), using 0,0");
+      console.warn(
+        "Warning: No position set (LATITUDE/LONGITUDE env vars), using 0,0",
+      );
     }
 
     console.log(`\nConfiguration:`);
     console.log(`  Server: ${baseUrl}`);
     console.log(`  Provider: ${args.provider || "(default)"}`);
-    console.log(`  Period: ${args.from.toISOString().split("T")[0]} to ${args.to.toISOString().split("T")[0]}`);
+    console.log(
+      `  Period: ${args.from.toISOString().split("T")[0]} to ${args.to.toISOString().split("T")[0]}`,
+    );
     console.log(`  Position: ${latitude}°, ${longitude}°`);
     console.log(`  Solar Arrays: ${config.solarArrays?.length || 0}`);
 
@@ -378,7 +420,8 @@ async function main() {
     if (results.length === 0) {
       console.log("No arrays backtested");
     } else {
-      const avgAccuracy = results.reduce((a, b) => a + b.accuracy, 0) / results.length;
+      const avgAccuracy =
+        results.reduce((a, b) => a + b.accuracy, 0) / results.length;
       const avgMAE = results.reduce((a, b) => a + b.mae, 0) / results.length;
 
       console.log(`Arrays tested: ${results.length}`);
@@ -389,7 +432,9 @@ async function main() {
       if (driftResults.length > 0) {
         console.log(`\nWarning: High bin drift detected on:`);
         for (const r of driftResults) {
-          console.log(`  ${r.arrayId}: ${r.binDrift} (consider tuning bin resolution)`);
+          console.log(
+            `  ${r.arrayId}: ${r.binDrift} (consider tuning bin resolution)`,
+          );
         }
       }
     }
@@ -401,7 +446,11 @@ async function main() {
         results,
         timestamp: new Date().toISOString(),
       };
-      await writeFile(args.outputPath, JSON.stringify(output, null, 2), "utf-8");
+      await writeFile(
+        args.outputPath,
+        JSON.stringify(output, null, 2),
+        "utf-8",
+      );
       console.log(`\nResults saved to ${args.outputPath}`);
     }
   } catch (error) {

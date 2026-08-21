@@ -85,7 +85,10 @@ async function saveMatrix(dataDir, matrixData) {
  */
 async function listSavedMatrices(dataDir) {
   try {
-    const content = await readFile(join(dataDir, ".matrices-manifest"), "utf-8");
+    const content = await readFile(
+      join(dataDir, ".matrices-manifest"),
+      "utf-8",
+    );
     const manifest = JSON.parse(content);
     return manifest.arrays || [];
   } catch (error) {

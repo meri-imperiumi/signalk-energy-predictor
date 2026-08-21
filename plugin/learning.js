@@ -176,7 +176,8 @@ function emaUpdate(existingEfficiency, observedEfficiency, alpha = EMA_ALPHA) {
  * @returns {boolean} True if tick is valid for learning
  */
 function isValidTick(readings) {
-  const { engineRpm, batterySoc, shorePowerConnected, controllerMode } = readings;
+  const { engineRpm, batterySoc, shorePowerConnected, controllerMode } =
+    readings;
 
   // Engine running - drop tick (alternator charging confounds solar reading)
   if (engineRpm != null && engineRpm > 0) {

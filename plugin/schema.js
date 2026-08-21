@@ -14,7 +14,8 @@ function buildPluginSchema() {
   return {
     type: "object",
     title: "Energy Predictor Configuration",
-    description: "Configure battery, solar arrays, and mechanical generators for energy prediction",
+    description:
+      "Configure battery, solar arrays, and mechanical generators for energy prediction",
     properties: {
       updateIntervalMinutes: {
         type: "number",
@@ -59,7 +60,8 @@ function buildPluginSchema() {
           engineAlternatorWatts: {
             type: "number",
             title: "Engine Alternator Output",
-            description: "Expected alternator output when engine is running (watts)",
+            description:
+              "Expected alternator output when engine is running (watts)",
             default: 100,
             minimum: 50,
           },
@@ -101,12 +103,14 @@ function buildPluginSchema() {
             controllerModePath: {
               type: "string",
               title: "Controller Mode Path",
-              description: "Signal K path for charge controller mode (optional, for sanitization)",
+              description:
+                "Signal K path for charge controller mode (optional, for sanitization)",
             },
             gustLimitKnots: {
               type: "number",
               title: "Gust Limit",
-              description: "Wind gust threshold for stowing deployable arrays (knots)",
+              description:
+                "Wind gust threshold for stowing deployable arrays (knots)",
               default: 20,
               minimum: 10,
               maximum: 50,
@@ -114,7 +118,8 @@ function buildPluginSchema() {
             hardwareEpochs: {
               type: "array",
               title: "Hardware Epochs",
-              description: "Periods when this array was active with different capacity",
+              description:
+                "Periods when this array was active with different capacity",
               items: {
                 type: "object",
                 properties: {
@@ -165,7 +170,8 @@ function buildPluginSchema() {
             id: {
               type: "string",
               title: "Generator ID",
-              description: "Unique identifier (e.g., 'wind-aft', 'hydro-shaft')",
+              description:
+                "Unique identifier (e.g., 'wind-aft', 'hydro-shaft')",
               minLength: 1,
             },
             name: {
@@ -182,13 +188,15 @@ function buildPluginSchema() {
             deployable: {
               type: "boolean",
               title: "Deployable",
-              description: "Generator can be deployed/retracted (hydrogenerators are typically deployable)",
+              description:
+                "Generator can be deployed/retracted (hydrogenerators are typically deployable)",
               default: false,
             },
             maxWindKnots: {
               type: "number",
               title: "Max Wind Speed",
-              description: "Maximum safe wind speed (knots) - stow above this (wind generators only)",
+              description:
+                "Maximum safe wind speed (knots) - stow above this (wind generators only)",
               default: 30,
               minimum: 20,
               maximum: 60,
@@ -196,7 +204,8 @@ function buildPluginSchema() {
             minSpeedKnots: {
               type: "number",
               title: "Min Speed",
-              description: "Minimum boat speed to start generating (knots) - hydro generators only",
+              description:
+                "Minimum boat speed to start generating (knots) - hydro generators only",
               default: 3,
               minimum: 1,
               maximum: 10,
@@ -204,7 +213,8 @@ function buildPluginSchema() {
             maxSpeedKnots: {
               type: "number",
               title: "Max Speed",
-              description: "Maximum safe boat speed (knots) - stow above this (hydro generators only)",
+              description:
+                "Maximum safe boat speed (knots) - stow above this (hydro generators only)",
               default: 12,
               minimum: 8,
               maximum: 20,
@@ -217,8 +227,10 @@ function buildPluginSchema() {
             manufacturerCurve: {
               type: "string",
               title: "Power Curve",
-              description: "Comma-separated pairs of speed (knots) and power (watts), e.g., '5,10,10,50,20,100'",
-              pattern: "^\\\\d+(\\\\.\\\\d+)?,\\\\d+(\\\\.\\\\d+)?(,\\\\d+(\\\\.\\\\d+)?,\\\\d+(\\\\.\\\\d+)?)*$",
+              description:
+                "Comma-separated pairs of speed (knots) and power (watts), e.g., '5,10,10,50,20,100'",
+              pattern:
+                "^\\\\d+(\\\\.\\\\d+)?,\\\\d+(\\\\.\\\\d+)?(,\\\\d+(\\\\.\\\\d+)?,\\\\d+(\\\\.\\\\d+)?)*$",
             },
             enabled: {
               type: "boolean",
@@ -238,13 +250,15 @@ function buildPluginSchema() {
           enabled: {
             type: "boolean",
             title: "Enable Learning",
-            description: "Continuously update efficiency matrices from actual output",
+            description:
+              "Continuously update efficiency matrices from actual output",
             default: true,
           },
           saveIntervalMinutes: {
             type: "number",
             title: "Save Interval",
-            description: "How often to save learning matrices to disk (minutes)",
+            description:
+              "How often to save learning matrices to disk (minutes)",
             default: 60,
             minimum: 10,
             maximum: 1440,
@@ -252,7 +266,8 @@ function buildPluginSchema() {
           emaAlpha: {
             type: "number",
             title: "EMA Smoothing Factor",
-            description: "Exponential moving average alpha (lower = slower learning, higher = faster adaptation)",
+            description:
+              "Exponential moving average alpha (lower = slower learning, higher = faster adaptation)",
             default: 0.05,
             minimum: 0.01,
             maximum: 0.2,
@@ -260,7 +275,8 @@ function buildPluginSchema() {
           defaultEfficiency: {
             type: "number",
             title: "Default Efficiency",
-            description: "Starting efficiency for unlearned matrix bins (0.1-1.0)",
+            description:
+              "Starting efficiency for unlearned matrix bins (0.1-1.0)",
             default: 0.7,
             minimum: 0.1,
             maximum: 1.0,
@@ -275,7 +291,8 @@ function buildPluginSchema() {
           preferredProvider: {
             type: "string",
             title: "Preferred Provider",
-            description: "Signal K Weather plugin ID to use (fallback to Open-Meteo if unavailable)",
+            description:
+              "Signal K Weather plugin ID to use (fallback to Open-Meteo if unavailable)",
             default: "",
           },
           openMeteoEnabled: {
@@ -287,7 +304,8 @@ function buildPluginSchema() {
           useLogbook: {
             type: "boolean",
             title: "Use Logbook Fallback",
-            description: "Use signalk-logbook entries for cloud cover when no forecast available",
+            description:
+              "Use signalk-logbook entries for cloud cover when no forecast available",
             default: true,
           },
           forecastHours: {
@@ -352,7 +370,9 @@ function getActiveCapacity(array) {
 
   for (const epoch of array.hardwareEpochs) {
     const start = new Date(epoch.startDate);
-    const end = epoch.endDate ? new Date(epoch.endDate) : new Date("2099-12-31");
+    const end = epoch.endDate
+      ? new Date(epoch.endDate)
+      : new Date("2099-12-31");
 
     if (now >= start && now <= end) {
       return epoch.capacityWp;
@@ -397,7 +417,13 @@ function validateConfig(config) {
       if (array.powerPath) {
         const ownerId = powerPaths.get(array.powerPath);
         if (ownerId) {
-          warnings.push("Duplicate power path: " + array.powerPath + " (already used by " + ownerId + ")");
+          warnings.push(
+            "Duplicate power path: " +
+              array.powerPath +
+              " (already used by " +
+              ownerId +
+              ")",
+          );
         }
         powerPaths.set(array.powerPath, array.id);
       }
@@ -405,7 +431,13 @@ function validateConfig(config) {
       if (array.controllerModePath) {
         const ownerId = controllerModePaths.get(array.controllerModePath);
         if (ownerId) {
-          warnings.push("Duplicate controller mode path: " + array.controllerModePath + " (already used by " + ownerId + ")");
+          warnings.push(
+            "Duplicate controller mode path: " +
+              array.controllerModePath +
+              " (already used by " +
+              ownerId +
+              ")",
+          );
         }
         controllerModePaths.set(array.controllerModePath, array.id);
       }
@@ -423,7 +455,13 @@ function validateConfig(config) {
       if (gen.powerPath) {
         const ownerId = powerPaths.get(gen.powerPath);
         if (ownerId) {
-          warnings.push("Generator shares power path: " + gen.powerPath + " (already used by " + ownerId + ")");
+          warnings.push(
+            "Generator shares power path: " +
+              gen.powerPath +
+              " (already used by " +
+              ownerId +
+              ")",
+          );
         }
         powerPaths.set(gen.powerPath, gen.id);
       }

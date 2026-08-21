@@ -15,7 +15,13 @@ const { SolarMatrix } = require("./learning.js");
 const matrixModule = require("./matrix.js");
 const { PredictionEngine } = require("./prediction.js");
 const { AdvisoryPublisher } = require("./advisory.js");
-const { buildPluginSchema, parseManufacturerCurve, getActiveCapacity, getDisplayName, validateConfig } = require("./schema.js");
+const {
+  buildPluginSchema,
+  parseManufacturerCurve,
+  getActiveCapacity,
+  getDisplayName,
+  validateConfig,
+} = require("./schema.js");
 const { sunPosition } = require("./solar.js");
 
 /**
@@ -59,9 +65,8 @@ const SUBSCRIPTION_PATHS = [
   "environment.wind.speedApparent",
   "environment.wind.speedOverGround",
   "electrical.batteries.house.capacity.stateOfCharge",
-  "electrical.batteries.house.current",
-  "electrical.batteries.house.load",
-  "network.wan.status",
+  "electrical.venus.dcPower",
+  "electrical.venus.acPower",
 ];
 
 /**
@@ -108,11 +113,17 @@ module.exports = (app) => {
   /** @type {object|null} */
   let pluginConfig = null;
 
+  /** @type {boolean} */
+  let hasPosition = false;
+
+  /** @type {boolean} */
+  let hasRunPredictionWithPosition = false;
+
   /** @type {Function} */
-  const setStatus = app.setPluginStatus || app.setProviderStatus;
+  const setStatus = (app.setPluginStatus || app.setProviderStatus)?.bind(app);
 
   /** @type {{lastPrediction: object, lastForecastTime: Date|null, sourceInfo: object}|null} */
-  let statusCache = null;
+  const statusCache = null;
 
   /**
    * Gets active solar arrays from configuration.
@@ -211,8 +222,22 @@ module.exports = (app) => {
     }
 
     try {
-      const currentSoC = app.getSelfPath(pluginConfig?.battery?.socPath || "electrical.batteries.house.capacity.stateOfCharge");
-      const socPercent = currentSoC != null ? Math.round(currentSoC * 100) : null;
+      let currentSoC = app.getSelfPath(
+        pluginConfig?.battery?.socPath ||
+          "electrical.batteries.house.capacity.stateOfCharge",
+      );
+      // Handle Signal K object-structured values
+      if (
+        currentSoC &&
+        typeof currentSoC === "object" &&
+        typeof currentSoC.value === "number"
+      ) {
+        currentSoC = currentSoC.value;
+      }
+      const socPercent =
+        currentSoC != null && !isNaN(currentSoC)
+          ? Math.round(currentSoC * 100)
+          : null;
 
       const sourceInfo = ingestionFSM?.getSourceInfo();
       const timeToFull = predictionEngine?.getTimeToFull();
@@ -225,10 +250,14 @@ module.exports = (app) => {
         status += ` SoC: ${socPercent}%`;
 
         if (timeToFull) {
-          const hoursToFull = Math.ceil((timeToFull.getTime() - Date.now()) / 3600000);
+          const hoursToFull = Math.ceil(
+            (timeToFull.getTime() - Date.now()) / 3600000,
+          );
           status += ` → full (${hoursToFull}h)`;
         } else if (timeToEmpty) {
-          const hoursToEmpty = Math.ceil((timeToEmpty.getTime() - Date.now()) / 3600000);
+          const hoursToEmpty = Math.ceil(
+            (timeToEmpty.getTime() - Date.now()) / 3600000,
+          );
           status += ` ↓ empty (${hoursToEmpty}h)`;
         }
       }
@@ -247,8 +276,10 @@ module.exports = (app) => {
         }
 
         // Add 24h forecast summary
-        const totalYield24h = predictionEngine.lastPrediction
-          .reduce((sum, p) => sum + p.solarYieldWh + p.windYieldWh, 0);
+        const totalYield24h = predictionEngine.lastPrediction.reduce(
+          (sum, p) => sum + p.solarYieldWh + p.windYieldWh,
+          0,
+        );
         status += ` 24h: ${Math.round(totalYield24h)}Wh`;
       }
 
@@ -268,8 +299,11 @@ module.exports = (app) => {
       }
 
       // Add active advisories count
-      const activeNotifications = advisoryPublisher?.getActiveNotifications?.() ?? new Map();
-      const activeCount = Array.from(activeNotifications.values()).filter((n) => n.state !== "normal").length;
+      const activeNotifications =
+        advisoryPublisher?.getActiveNotifications?.() ?? new Map();
+      const activeCount = Array.from(activeNotifications.values()).filter(
+        (n) => n.state !== "normal",
+      ).length;
       if (activeCount > 0) {
         status += ` [${activeCount} active]`;
       }
@@ -287,26 +321,50 @@ module.exports = (app) => {
    */
   async function runPredictionCycle() {
     if (!ingestionFSM || !predictionEngine || !advisoryPublisher) {
+      app.debug(
+        `Prediction cycle skipped: components not ready (ingestionFSM: ${!!ingestionFSM}, predictionEngine: ${!!predictionEngine}, advisoryPublisher: ${!!advisoryPublisher})`,
+      );
       return;
     }
 
+    // Skip if we don't have a valid GPS position yet
+    if (
+      ingestionFSM.position.latitude == null ||
+      ingestionFSM.position.longitude == null
+    ) {
+      app.debug("Prediction cycle skipped: no GPS position yet");
+      return;
+    }
+
+    app.debug("Starting prediction cycle...");
+
     try {
       // Get weather forecast
+      app.debug("Fetching weather forecast...");
       const forecast = await ingestionFSM.getForecast();
+      app.debug(
+        `Got forecast with ${forecast.length} points, source: ${ingestionFSM.getSourceInfo().source}`,
+      );
 
       // Run prediction engine
       const hourly = predictionEngine.runPrediction(forecast);
+      app.debug(`Prediction complete: ${hourly.length} hours forecasted`);
 
       // Calculate advisories
       const timeToFull = predictionEngine.getTimeToFull();
       const timeToEmpty = predictionEngine.getTimeToEmpty();
       const stowageOpportunity = predictionEngine.findStowageOpportunity();
-      const deploymentOpportunities = predictionEngine.findDeploymentOpportunities();
+      const deploymentOpportunities =
+        predictionEngine.findDeploymentOpportunities();
 
-      const engineRunTime = predictionEngine.calculateEngineRunTime(pluginConfig.battery?.engineAlternatorWatts || 100);
+      const engineRunTime = predictionEngine.calculateEngineRunTime(
+        pluginConfig.battery?.engineAlternatorWatts || 100,
+      );
 
       // Check FLINsail risk
-      const flinSailArray = getActiveSolarArrays(pluginConfig).find((a) => a.type === "deployable");
+      const flinSailArray = getActiveSolarArrays(pluginConfig).find(
+        (a) => a.type === "deployable",
+      );
       const currentGHI = await ingestionFSM.getCurrentGHI();
       const flinSailStowNeeded =
         flinSailArray &&
@@ -314,7 +372,14 @@ module.exports = (app) => {
         currentGHI.gustSpeedKnots != null &&
         currentGHI.gustSpeedKnots >= flinSailArray.gustLimitKnots;
 
+      if (flinSailStowNeeded) {
+        app.debug(
+          `FLINsail stow needed: gusts ${currentGHI.gustSpeedKnots.toFixed(1)}kn >= limit ${flinSailArray.gustLimitKnots}kt`,
+        );
+      }
+
       // Publish all advisories
+      app.debug("Publishing advisories...");
       advisoryPublisher.publishAll({
         hourlyForecast: hourly,
         timeToFull,
@@ -323,10 +388,11 @@ module.exports = (app) => {
         engineRunTime,
         flinSailStowNeeded,
         flinSailName: flinSailArray ? getDisplayName(flinSailArray) : "",
-        currentGustKnots: currentGHI.gustSpeedKnots ?? 0,
+        currentGustKnots: currentGHI.gustSpeedKnots ?? null,
         gustLimitKnots: flinSailArray?.gustLimitKnots ?? 20,
         deploymentOpportunities,
       });
+      app.debug(`Advisories published successfully`);
 
       app.debug(`Prediction cycle complete: ${hourly.length} hours forecasted`);
 
@@ -364,6 +430,20 @@ module.exports = (app) => {
    * @param {object} delta - Signal K delta
    * @returns {Promise<void>}
    */
+  /** @type {Map<string, any>} */
+  const deltaState = new Map();
+
+  /** @type {Set<string>} */
+  const solarPowerPaths = new Set();
+
+  /**
+   * Processes a delta update.
+   * Reads values from the delta and stores them in deltaState for later use.
+   * Only triggers learning when solar power values are received.
+   *
+   * @param {object} delta - Signal K delta
+   * @returns {Promise<void>}
+   */
   async function processDelta(delta) {
     const learning = pluginConfig?.learning || DEFAULT_CONFIG.learning;
 
@@ -376,43 +456,135 @@ module.exports = (app) => {
     }
 
     try {
-      // Get current GHI
-      const currentGHI = await ingestionFSM.getCurrentGHI();
+      // Track which solar power paths we saw in this delta
+      const solarPowerDelta = [];
 
-      // Get navigation state
-      const navState = app.getSelfPath("navigation.state") || "unknown";
+      // Update state from delta values
+      if (delta.updates) {
+        for (const update of delta.updates) {
+          if (!update.values) {
+            continue;
+          }
+
+          for (const v of update.values) {
+            deltaState.set(v.path, v.value);
+
+            if (v.path === "navigation.position" && v.value) {
+              // Update ingestionFSM position immediately
+              if (ingestionFSM) {
+                ingestionFSM.position = {
+                  latitude: v.value.latitude,
+                  longitude: v.value.longitude,
+                };
+              }
+
+              // Trigger first prediction cycle once we have GPS
+              if (!hasPosition) {
+                hasPosition = true;
+                app.debug(
+                  `Got first GPS position: ${v.value.latitude.toFixed(4)}, ${v.value.longitude.toFixed(4)}, triggering prediction cycle`,
+                );
+                if (!hasRunPredictionWithPosition) {
+                  hasRunPredictionWithPosition = true;
+                  runPredictionCycle().catch((error) => {
+                    app.error(
+                      `Initial prediction cycle error: ${error.message}`,
+                    );
+                  });
+                }
+              }
+            }
+
+            // Track if this is a solar power path we care about
+            if (solarPowerPaths.has(v.path)) {
+              solarPowerDelta.push(v.path);
+            }
+          }
+        }
+      }
+
+      // Only run learning if we got a solar power reading
+      if (solarPowerDelta.length === 0) {
+        return;
+      }
+
+      app.debug(
+        `Learning triggered by solar power delta: ${JSON.stringify(solarPowerDelta)}`,
+      );
+
+      // Get current GHI (will use cached forecast if available)
+      const currentGHI = await ingestionFSM.getCurrentGHI();
+      app.debug(
+        `Current GHI: ${currentGHI.ghi.toFixed(0)} W/m², tier: ${currentGHI.tier}`,
+      );
+
+      // Get navigation state from delta state
+      const navStateRaw =
+        deltaState.get("navigation.state") ||
+        app.getSelfPath("navigation.state");
+      const navState =
+        typeof navStateRaw === "string" ? navStateRaw : "unknown";
       const isSailing = navState === "sailing";
 
       // Get AWA if sailing
       let awa = null;
       if (isSailing) {
-        awa = app.getSelfPath("environment.wind.angleApparent");
+        awa =
+          deltaState.get("environment.wind.angleApparent") ||
+          app.getSelfPath("environment.wind.angleApparent");
       }
 
       // Update each solar array
       const arrays = getActiveSolarArrays(pluginConfig);
+      let updatedArrays = 0;
+      app.debug(
+        `Checking ${arrays.length} configured solar arrays for learning...`,
+      );
       for (const array of arrays) {
         const powerPath = array.powerPath;
         if (!powerPath) {
+          app.debug(`Array ${array.id}: no powerPath, skipping`);
           continue;
         }
 
-        // Read current power output
-        const powerReading = app.getSelfPath(powerPath);
-        const actualPowerW = typeof powerReading === "number" ? powerReading : null;
+        // Read current power output from delta state
+        const powerReading =
+          deltaState.get(powerPath) || app.getSelfPath(powerPath);
+        // Handle both direct number values and object values with value property
+        let actualPowerW = null;
+        if (typeof powerReading === "number") {
+          actualPowerW = powerReading;
+        } else if (
+          powerReading &&
+          typeof powerReading === "object" &&
+          typeof powerReading.value === "number"
+        ) {
+          actualPowerW = powerReading.value;
+        }
 
         if (actualPowerW == null || actualPowerW <= 0) {
+          app.debug(
+            `Array ${array.id}: powerPath="${powerPath}" -> ${typeof powerReading === "object" ? "[object]" : powerReading}, skipping`,
+          );
           continue;
         }
 
-        // Get sun position
-        const pos = app.getSelfPath("navigation.position");
+        app.debug(`Array ${array.id}: learning with ${actualPowerW}W output`);
+
+        // Get sun position (prefer delta state, fall back to app.getSelfPath)
+        const pos =
+          deltaState.get("navigation.position") ||
+          app.getSelfPath("navigation.position");
         if (!pos || pos.latitude == null || pos.longitude == null) {
+          app.debug(`Array ${array.id}: no GPS position, skipping learning`);
           continue;
         }
 
         const { sunPosition } = await import("./solar.js");
         const sunPos = sunPosition(new Date(), pos.latitude, pos.longitude);
+        app.debug(
+          `Array ${array.id}: sun at ${sunPos.azimuth.toFixed(1)}° azimuth, ${sunPos.elevation.toFixed(1)}° elevation`,
+        );
 
         // Get matrix
         const matrix = solarMatrices.get(array.id);
@@ -420,12 +592,27 @@ module.exports = (app) => {
           continue;
         }
 
-        // Build sanitization gate readings
+        // Build sanitization gate readings (prefer delta state, fall back to app.getSelfPath)
         const readings = {
-          engineRpm: app.getSelfPath("propulsion.engine.revolutions"),
-          batterySoc: app.getSelfPath(pluginConfig.battery?.socPath || "electrical.batteries.house.capacity.stateOfCharge"),
-          shorePowerConnected: app.getSelfPath("electrical.shore.power.connected"),
-          controllerMode: array.controllerModePath ? app.getSelfPath(array.controllerModePath) : null,
+          engineRpm:
+            deltaState.get("propulsion.engine.revolutions") ||
+            app.getSelfPath("propulsion.engine.revolutions"),
+          batterySoc:
+            deltaState.get(
+              pluginConfig.battery?.socPath ||
+                "electrical.batteries.house.capacity.stateOfCharge",
+            ) ||
+            app.getSelfPath(
+              pluginConfig.battery?.socPath ||
+                "electrical.batteries.house.capacity.stateOfCharge",
+            ),
+          shorePowerConnected:
+            deltaState.get("electrical.shore.power.connected") ||
+            app.getSelfPath("electrical.shore.power.connected"),
+          controllerMode: array.controllerModePath
+            ? deltaState.get(array.controllerModePath) ||
+              app.getSelfPath(array.controllerModePath)
+            : null,
         };
 
         // Update matrix
@@ -439,6 +626,11 @@ module.exports = (app) => {
           awaRad: awa,
           readings,
         });
+        updatedArrays++;
+      }
+
+      if (updatedArrays > 0) {
+        app.debug(`Learning cycle complete: updated ${updatedArrays} arrays`);
       }
     } catch (error) {
       app.error(`Failed to process delta for learning: ${error.message}`);
@@ -456,7 +648,7 @@ module.exports = (app) => {
       subscribe: SUBSCRIPTION_PATHS.map((path) => ({ path })),
     };
 
-    const unsubscribe = app.subscriptionmanager.subscribe(
+    app.subscriptionmanager.subscribe(
       subscription,
       unsubscribes,
       (subscriptionError) => {
@@ -468,15 +660,17 @@ module.exports = (app) => {
         });
       },
     );
-
-    unsubscribes.push(unsubscribe);
+    app.debug(
+      `Delta subscription established, ${unsubscribes.length} unsubscribes registered`,
+    );
   }
 
   /** @type {Plugin} */
   const plugin = {
     id: "signalk-energy-predictor",
     name: "Energy Predictor",
-    description: "Predictive energy management with offline-first incremental learning",
+    description:
+      "Predictive energy management with offline-first incremental learning",
 
     /**
      * Starts the plugin.
@@ -498,9 +692,24 @@ module.exports = (app) => {
       // Store config for later use
       pluginConfig = config || DEFAULT_CONFIG;
 
+      // Reset position tracking flags
+      hasPosition = false;
+      hasRunPredictionWithPosition = false;
+
+      // Populate solar power paths set for delta filtering
+      solarPowerPaths.clear();
+      for (const array of getActiveSolarArrays(config)) {
+        if (array.powerPath) {
+          solarPowerPaths.add(array.powerPath);
+        }
+      }
+      app.debug(
+        `Tracking ${solarPowerPaths.size} solar power paths for learning triggers`,
+      );
+
       // Initialize components
       ingestionFSM = new deps.IngestionFSM(app);
-      advisoryPublisher = new deps.AdvisoryPublisher(app);
+      advisoryPublisher = new deps.AdvisoryPublisher(app, plugin.id);
 
       await initializeMatrices(config);
 
@@ -514,16 +723,23 @@ module.exports = (app) => {
         })),
         mechanicalGenerators: getActiveGenerators(config),
         getEfficiency,
-        getSelfPath: (path) => app.getSelfPath(path),
+        getSelfPath: (path) => deltaState.get(path) ?? app.getSelfPath(path),
         getDisplayName,
+        app,
       });
 
       // Subscribe to Signal K updates
       subscribeToDeltas();
 
       // Start periodic update cycle
-      const updateInterval = (config.updateIntervalMinutes || DEFAULT_CONFIG.updateIntervalMinutes) * 60000;
+      const updateInterval =
+        (config.updateIntervalMinutes || DEFAULT_CONFIG.updateIntervalMinutes) *
+        60000;
+      app.debug(
+        `Scheduling prediction cycle every ${updateInterval / 60000} minutes`,
+      );
       updateIntervalId = setInterval(() => {
+        app.debug(`Running scheduled prediction cycle...`);
         runPredictionCycle().catch((error) => {
           app.error(`Prediction cycle error: ${error.message}`);
         });
@@ -531,20 +747,33 @@ module.exports = (app) => {
 
       // Start periodic save cycle
       const learning = config.learning || DEFAULT_CONFIG.learning;
-      const saveInterval = (learning.saveIntervalMinutes || DEFAULT_CONFIG.learning.saveIntervalMinutes) * 60000;
+      const saveInterval =
+        (learning.saveIntervalMinutes ||
+          DEFAULT_CONFIG.learning.saveIntervalMinutes) * 60000;
+      app.debug(`Scheduling matrix save every ${saveInterval / 60000} minutes`);
       saveIntervalId = setInterval(() => {
+        app.debug(`Saving matrices to disk...`);
         saveMatricesToDisk().catch((error) => {
           app.error(`Save cycle error: ${error.message}`);
         });
       }, saveInterval);
 
       // Run initial prediction
+      app.debug(`Running initial prediction cycle...`);
       await runPredictionCycle();
 
       // Set initial status
-      const activeSolar = getActiveSolarArrays(pluginConfig).filter((a) => a.enabled !== false).length;
-      const activeGenerators = getActiveGenerators(pluginConfig).filter((g) => g.enabled !== false).length;
-      setStatus(`Ready. Learning: ${activeSolar} solar array${activeSolar !== 1 ? "s" : ""}, ${solarMatrices.size} matrices, ${activeGenerators} generator${activeGenerators !== 1 ? "s" : ""} configured`);
+      const activeSolar = getActiveSolarArrays(pluginConfig).filter(
+        (a) => a.enabled !== false,
+      ).length;
+      const activeGenerators = getActiveGenerators(pluginConfig).filter(
+        (g) => g.enabled !== false,
+      ).length;
+      if (setStatus) {
+        setStatus(
+          `Ready. Learning: ${activeSolar} solar array${activeSolar !== 1 ? "s" : ""}, ${solarMatrices.size} matrices, ${activeGenerators} generator${activeGenerators !== 1 ? "s" : ""} configured`,
+        );
+      }
 
       app.debug("Energy Predictor plugin started");
     },
@@ -585,10 +814,13 @@ module.exports = (app) => {
       for (const matrix of solarMatrices.values()) {
         totalBins += matrix.anchored.size + matrix.sailing.size;
       }
-      const finalStatus = totalBins > 0
-        ? `Stopped. Learning: ${solarMatrices.size} arrays, ${totalBins} efficiency bins saved`
-        : "Stopped";
-      setStatus(finalStatus);
+      const finalStatus =
+        totalBins > 0
+          ? `Stopped. Learning: ${solarMatrices.size} arrays, ${totalBins} efficiency bins saved`
+          : "Stopped";
+      if (setStatus) {
+        setStatus(finalStatus);
+      }
 
       app.debug("Energy Predictor plugin stopped");
     },
@@ -602,6 +834,13 @@ module.exports = (app) => {
       return buildPluginSchema();
     },
   };
+
+  // Expose internals for testing
+  plugin.__getInternals = () => ({
+    ingestionFSM,
+    predictionEngine,
+    advisoryPublisher,
+  });
 
   // Export dependencies for testing
   plugin.deps = deps;

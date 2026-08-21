@@ -78,7 +78,7 @@ function maxIrradiance(altitudeRad) {
 function irradianceFromCloudCover(altitudeRad, cloudCover) {
   const ghiClear = maxIrradiance(altitudeRad);
   const c = Math.max(0, Math.min(1, cloudCover));
-  const attenuation = 1 - 0.75 * Math.pow(c, 3.4);
+  const attenuation = 1 - 0.75 * c ** 3.4;
   return ghiClear * attenuation;
 }
 

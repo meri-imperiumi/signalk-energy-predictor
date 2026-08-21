@@ -7,7 +7,11 @@
  * @file prediction.js
  */
 
-const { sunPosition, maxIrradiance, irradianceFromCloudCover } = require("./solar.js");
+const {
+  sunPosition,
+  maxIrradiance,
+  irradianceFromCloudCover,
+} = require("./solar.js");
 
 /**
  * Prediction horizon in hours
@@ -52,7 +56,9 @@ function interpolateWindPower(curve, speedKnots) {
   // Find the interval containing speedKnots
   for (let i = 1; i < curve.length; i++) {
     if (speedKnots <= curve[i].speed) {
-      const t = (speedKnots - curve[i - 1].speed) / (curve[i].speed - curve[i - 1].speed);
+      const t =
+        (speedKnots - curve[i - 1].speed) /
+        (curve[i].speed - curve[i - 1].speed);
       return curve[i - 1].watts + t * (curve[i].watts - curve[i - 1].watts);
     }
   }
@@ -75,7 +81,13 @@ function interpolateWindPower(curve, speedKnots) {
  * @param {number} params.efficiency - Array efficiency [0, 1] from learning matrix
  * @returns {number} Predicted yield in watt-hours for the hour
  */
-function predictSolarHour({ array, sunPosition, ghi, windGustKnots, efficiency }) {
+function predictSolarHour({
+  array,
+  sunPosition,
+  ghi,
+  windGustKnots,
+  efficiency,
+}) {
   // Check FLINsail risk for deployable arrays
   if (array.type === "deployable" && array.gustLimitKnots != null) {
     if (windGustKnots >= array.gustLimitKnots) {
@@ -110,7 +122,12 @@ function predictSolarHour({ array, sunPosition, ghi, windGustKnots, efficiency }
  * @param {boolean} params.isSailing - Whether vessel is sailing (affects deployable yield)
  * @returns {number} Predicted yield in watt-hours for the hour
  */
-function predictWindHour({ generator, windSpeedKnots, isSailing = false, navState = "unknown" }) {
+function predictWindHour({
+  generator,
+  windSpeedKnots,
+  isSailing = false,
+  navState = "unknown",
+}) {
   if (generator.type !== "wind") {
     return 0;
   }
@@ -147,7 +164,11 @@ function predictWindHour({ generator, windSpeedKnots, isSailing = false, navStat
  * @param {boolean} params.isSailing - Whether vessel is sailing
  * @returns {number} Predicted yield in watt-hours for the hour
  */
-function predictHydroHour({ generator, speedThroughWaterKnots, isSailing = false }) {
+function predictHydroHour({
+  generator,
+  speedThroughWaterKnots,
+  isSailing = false,
+}) {
   if (generator.type !== "hydro") {
     return 0;
   }
@@ -219,6 +240,19 @@ class LoadProfile {
 }
 
 /**
+ * Extracts a numeric value from a Signal K value that may be a number or an object with .value.
+ * @param {unknown} v
+ * @returns {number|null}
+ */
+function toNumber(v) {
+  if (v == null) return null;
+  if (typeof v === "number") return isNaN(v) ? null : v;
+  if (typeof v === "object" && typeof v.value === "number")
+    return isNaN(v.value) ? null : v.value;
+  return null;
+}
+
+/**
  * Prediction engine.
  */
 class PredictionEngine {
@@ -233,13 +267,23 @@ class PredictionEngine {
    * @param {(arrayId: string, isSailing: boolean, azimuth: number, elevation: number, awa?: number) => number} getEfficiency - Function to get efficiency from learning matrix
    * @param {(path: string) => unknown} getSelfPath - Function to read Signal K values
    */
-  constructor({ battery, solarArrays, mechanicalGenerators, getEfficiency, getSelfPath, getDisplayName }) {
+  constructor({
+    battery,
+    solarArrays,
+    mechanicalGenerators,
+    getEfficiency,
+    getSelfPath,
+    getDisplayName,
+    app,
+  }) {
     this.battery = battery;
     this.solarArrays = solarArrays;
     this.mechanicalGenerators = mechanicalGenerators;
     this.getEfficiency = getEfficiency;
     this.getSelfPath = getSelfPath;
-    this.getDisplayName = getDisplayName || ((config) => config.name || config.id);
+    this.getDisplayName =
+      getDisplayName || ((config) => config.name || config.id);
+    this.app = app;
 
     this.capacityWh = battery.capacityAh * battery.systemVoltage;
     this.loadProfile = new LoadProfile();
@@ -252,11 +296,20 @@ class PredictionEngine {
    * @returns {void}
    */
   updateLoadProfile() {
-    // Read instantaneous house load (convert watts to Wh for hourly rate)
-    const houseLoadW = this.getSelfPath("electrical.batteries.house.load");
+    // Read actual consumption from Victron Venus
+    // dcPower and acPower are already net consumption (producers removed)
+    const rawDc = this.getSelfPath("electrical.venus.dcPower");
+    const rawAc = this.getSelfPath("electrical.venus.acPower");
+    const dcPowerW = toNumber(rawDc);
+    const acPowerW = toNumber(rawAc);
 
-    if (houseLoadW != null && typeof houseLoadW === "number") {
-      this.loadProfile.addSample(houseLoadW);
+    this.app?.debug?.(
+      `updateLoadProfile: dcPower=${JSON.stringify(rawDc)} (${dcPowerW}), acPower=${JSON.stringify(rawAc)} (${acPowerW}), samples=${this.loadProfile.samples.length}`,
+    );
+
+    if (dcPowerW != null || acPowerW != null) {
+      const totalConsumptionW = (dcPowerW ?? 0) + (acPowerW ?? 0);
+      this.loadProfile.addSample(totalConsumptionW);
     }
   }
 
@@ -276,8 +329,7 @@ class PredictionEngine {
    * @returns {number|null} AWA in radians
    */
   getAWA() {
-    const awa = this.getSelfPath("environment.wind.angleApparent");
-    return awa != null ? awa : null;
+    return toNumber(this.getSelfPath("environment.wind.angleApparent"));
   }
 
   /**
@@ -286,8 +338,7 @@ class PredictionEngine {
    * @returns {number|null} Speed in knots
    */
   getSpeedThroughWater() {
-    const stw = this.getSelfPath("navigation.speedThroughWater");
-    return stw != null ? stw : null;
+    return toNumber(this.getSelfPath("navigation.speedThroughWater"));
   }
 
   /**
@@ -296,8 +347,15 @@ class PredictionEngine {
    * @returns {number} SoC [0, 1]
    */
   getCurrentSoC() {
-    const soc = this.getSelfPath(this.battery.socPath || "electrical.batteries.house.capacity.stateOfCharge");
-    return soc != null ? soc : 0.5;
+    let soc = this.getSelfPath(
+      this.battery.socPath ||
+        "electrical.batteries.house.capacity.stateOfCharge",
+    );
+    // Handle Signal K object-structured values
+    if (soc && typeof soc === "object" && typeof soc.value === "number") {
+      soc = soc.value;
+    }
+    return soc != null && !isNaN(soc) ? soc : 0.5;
   }
 
   /**
@@ -323,7 +381,23 @@ class PredictionEngine {
     const latitude = pos?.latitude ?? 0;
     const longitude = pos?.longitude ?? 0;
 
+    this.app?.debug?.(
+      `runPrediction: SoC=${Math.round(currentSoC * 100)}%, load=${Math.round(averageLoad)}W, pos=${latitude.toFixed(2)},${longitude.toFixed(2)}, sailing=${isSailing}, forecast=${forecast.length}pts`,
+    );
+    if (forecast.length > 0) {
+      this.app?.debug?.(
+        `  forecast[0]: ${forecast[0].time.toISOString()} ghi=${forecast[0].ghi}`,
+      );
+      this.app?.debug?.(
+        `  forecast[12]: ${forecast[12].time.toISOString()} ghi=${forecast[12].ghi}`,
+      );
+      this.app?.debug?.(
+        `  forecast[24]: ${forecast[24]?.time.toISOString()} ghi=${forecast[24]?.ghi}`,
+      );
+    }
+
     const startTime = new Date();
+    this.app?.debug?.(`  prediction[0]: ${startTime.toISOString()}`);
 
     for (let h = 0; h < PREDICTION_HOURS; h++) {
       const time = new Date(startTime.getTime() + h * 3600000);
@@ -337,7 +411,7 @@ class PredictionEngine {
       const ghi = forecastPoint?.ghi ?? 0;
       const cloudCover = forecastPoint?.cloudCover ?? 0;
       const windGustKnots = forecastPoint?.gustSpeedKnots ?? 0;
-      const windSpeedKnots = forecastPoint?.cloudCover ?? 0; // Will need separate wind data
+      const windSpeedKnots = forecastPoint?.windSpeedKnots ?? 0;
 
       // Get sun position
       const sunPos = sunPosition(time, latitude, longitude);
@@ -354,13 +428,24 @@ class PredictionEngine {
           isSailing ? awa : undefined,
         );
 
-        solarYieldWh += predictSolarHour({
+        const arrayYield = predictSolarHour({
           array,
           sunPosition: sunPos,
           ghi,
           windGustKnots,
           efficiency,
         });
+        solarYieldWh += arrayYield;
+
+        if (h === 12 || h === 22) {
+          const extra =
+            array.type === "deployable"
+              ? ` gust=${windGustKnots.toFixed(0)}kn limit=${array.gustLimitKnots ?? "n/a"}kn`
+              : "";
+          this.app?.debug?.(
+            `  h=${h} array=${array.id}: alt=${((sunPos.altitude * 180) / Math.PI).toFixed(1)}° ghi=${ghi.toFixed(0)} eff=${efficiency.toFixed(2)} cap=${array.capacityWp}Wp yield=${arrayYield.toFixed(1)}Wh${extra}`,
+          );
+        }
       }
 
       // Calculate wind/hydro yield
@@ -404,22 +489,60 @@ class PredictionEngine {
 
   /**
    * Calculates time to full (SoC = 1.0).
+   * Extrapolates beyond 24h if the trend is consistently upward.
    *
-   * @returns {Date|null} Timestamp when battery will be full, or null if never
+   * @returns {Date|null} Timestamp when battery will be full, or null if not trending toward full
    */
   getTimeToFull() {
+    if (this.lastPrediction.length === 0) return null;
+
     const full = this.lastPrediction.find((p) => p.soc >= 1.0);
-    return full ? full.time : null;
+    if (full) return full.time;
+
+    // Extrapolate: if average net is positive, estimate when SoC reaches 1.0
+    const currentSoC = this.getCurrentSoC();
+    if (currentSoC >= 1.0) return new Date(); // Already full
+
+    const avgNetWh =
+      this.lastPrediction.reduce((sum, p) => sum + p.netWh, 0) /
+      this.lastPrediction.length;
+    if (avgNetWh <= 0) return null; // Not charging
+
+    const deficitWh = (1.0 - currentSoC) * this.capacityWh;
+    const hoursToFull = deficitWh / avgNetWh;
+    if (hoursToFull > 72) return null; // Too far to be useful
+
+    return new Date(Date.now() + hoursToFull * 3600000);
   }
 
   /**
    * Calculates time to empty (SoC reaches minSafeSoC).
+   * Extrapolates beyond 24h if the trend is consistently downward.
    *
-   * @returns {Date|null} Timestamp when battery will be depleted, or null if never
+   * @returns {Date|null} Timestamp when battery will be depleted, or null if not trending toward empty
    */
   getTimeToEmpty() {
-    const depleted = this.lastPrediction.find((p) => p.soc <= this.battery.minSafeSoC);
-    return depleted ? depleted.time : null;
+    if (this.lastPrediction.length === 0) return null;
+
+    const depleted = this.lastPrediction.find(
+      (p) => p.soc <= this.battery.minSafeSoC,
+    );
+    if (depleted) return depleted.time;
+
+    // Extrapolate: if average net is negative, estimate when SoC reaches minSafeSoC
+    const currentSoC = this.getCurrentSoC();
+    if (currentSoC <= this.battery.minSafeSoC) return new Date(); // Already depleted
+
+    const avgNetWh =
+      this.lastPrediction.reduce((sum, p) => sum + p.netWh, 0) /
+      this.lastPrediction.length;
+    if (avgNetWh >= 0) return null; // Not discharging
+
+    const surplusWh = (currentSoC - this.battery.minSafeSoC) * this.capacityWh;
+    const hoursToEmpty = surplusWh / Math.abs(avgNetWh);
+    if (hoursToEmpty > 72) return null; // Too far to be useful
+
+    return new Date(Date.now() + hoursToEmpty * 3600000);
   }
 
   /**
@@ -491,7 +614,11 @@ class PredictionEngine {
     let minSolarIndex = 0;
     let minSolarYield = Infinity;
 
-    for (let i = 0; i < Math.min(this.lastPrediction.length, Math.ceil(hoursNeeded) + 1); i++) {
+    for (
+      let i = 0;
+      i < Math.min(this.lastPrediction.length, Math.ceil(hoursNeeded) + 1);
+      i++
+    ) {
       const p = this.lastPrediction[i];
       if (p.solarYieldWh < minSolarYield) {
         minSolarYield = p.solarYieldWh;
@@ -541,21 +668,23 @@ class PredictionEngine {
               generatorName: name,
               type: "hydro",
               hour: 0,
-              reason: `Stow hydro - boat speed ${currentSpeed.toFixed(1)}kts exceeds limit of ${maxSpeedKnots}kts`,
+              reason: `Stow hydro - boat speed ${currentSpeed.toFixed(1)}kn exceeds limit of ${maxSpeedKnots}kn`,
               action: "stow",
               currentSpeed,
               maxSpeedKnots,
             });
           } else {
             // Check if hydro would be beneficial
-            const firstBenefitHour = this.lastPrediction.findIndex((p) => p.windYieldWh > 50); // Hydro contributes to windYieldWh
+            const firstBenefitHour = this.lastPrediction.findIndex(
+              (p) => p.windYieldWh > 50,
+            ); // Hydro contributes to windYieldWh
             if (firstBenefitHour >= 0) {
               opportunities.push({
                 generatorId: generator.id,
                 generatorName: name,
                 type: "hydro",
                 hour: firstBenefitHour,
-                reason: `Deploy hydro - sailing at ${currentSpeed.toFixed(1)}kts (min ${minSpeedKnots}kts, max ${maxSpeedKnots}kts)`,
+                reason: `Deploy hydro - sailing at ${currentSpeed.toFixed(1)}kn (min ${minSpeedKnots}kn, max ${maxSpeedKnots}kn)`,
                 currentSpeed,
                 minSpeedKnots,
                 maxSpeedKnots,
@@ -563,13 +692,20 @@ class PredictionEngine {
             }
           }
         } else if (!isSailing && currentSpeed < minSpeedKnots) {
-          // Energy deficit when not sailing, hydro can't help
+          // Not sailing - hydro can't help
+          const navState = this.getNavState();
+          const reason =
+            navState === "anchored" || navState === "moored"
+              ? "Hydro generator stowed - vessel at anchor"
+              : navState === "under way" || navState === "motoring"
+                ? `Hydro not applicable - vessel not sailing fast enough (${currentSpeed.toFixed(1)}kn < ${minSpeedKnots}kn)`
+                : "Hydro not applicable - vessel not sailing fast enough";
           opportunities.push({
             generatorId: generator.id,
             generatorName: name,
             type: "hydro",
             hour: 0,
-            reason: "Hydro not applicable - vessel not sailing fast enough",
+            reason,
             action: "info",
             currentSpeed,
             minSpeedKnots,
@@ -578,8 +714,11 @@ class PredictionEngine {
       } else if (generator.type === "wind") {
         // Wind generators are used at anchor/moored, stowed when under way
         // Deploy when wind is favorable (above minimum but below max)
-        const currentWindSpeed = this.getSelfPath("environment.wind.speedOverGround") ?? 0;
-        const currentGust = this.getSelfPath("environment.wind.gust") ?? currentWindSpeed;
+        const currentWindSpeed =
+          toNumber(this.getSelfPath("environment.wind.speedOverGround")) ?? 0;
+        const currentGust =
+          toNumber(this.getSelfPath("environment.wind.gust")) ??
+          currentWindSpeed;
         const maxWindKnots = generator.maxWindKnots ?? 30;
         const minDeployWind = 5; // Minimum wind to make deployment worthwhile
 
@@ -599,12 +738,15 @@ class PredictionEngine {
             generatorName: name,
             type: "wind",
             hour: 0,
-            reason: `Gusts ${maxForecastGust.toFixed(1)}kts exceed limit of ${maxWindKnots}kts`,
+            reason: `Gusts ${maxForecastGust.toFixed(1)}kn exceed limit of ${maxWindKnots}kn`,
             action: "stow",
             currentSpeed: maxForecastGust,
             maxWindKnots,
           });
-        } else if (maxForecastWind >= minDeployWind && maxForecastWind < maxWindKnots * 0.7) {
+        } else if (
+          maxForecastWind >= minDeployWind &&
+          maxForecastWind < maxWindKnots * 0.7
+        ) {
           // Favorable wind conditions, recommend deployment
           const hour = this.lastPrediction.findIndex((p) => p.windYieldWh > 50);
           if (hour >= 0) {
@@ -613,7 +755,7 @@ class PredictionEngine {
               generatorName: name,
               type: "wind",
               hour,
-              reason: `Wind ${maxForecastWind.toFixed(1)}kts (within safe range ${minDeployWind}-${maxWindKnots}kts)`,
+              reason: `Wind ${maxForecastWind.toFixed(1)}kn (within safe range ${minDeployWind}-${maxWindKnots}kn)`,
               currentSpeed: maxForecastWind,
               maxWindKnots,
             });
@@ -625,7 +767,7 @@ class PredictionEngine {
             generatorName: name,
             type: "wind",
             hour: 0,
-            reason: `Wind approaching limit (${maxForecastWind.toFixed(1)}kts, limit ${maxWindKnots}kts), consider stowing`,
+            reason: `Wind approaching limit (${maxForecastWind.toFixed(1)}kn, limit ${maxWindKnots}kn), consider stowing`,
             action: "stow",
             currentSpeed: maxForecastWind,
             maxWindKnots,
@@ -662,4 +804,5 @@ module.exports = {
   predictWindHour,
   predictHydroHour,
   PREDICTION_HOURS,
+  toNumber,
 };
