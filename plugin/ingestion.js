@@ -150,6 +150,9 @@ async function fetchSignalKWeather(app, latitude, longitude) {
         ghi: null,
         cloudCover: point.outside?.cloudCover ?? null,
         gustSpeedKnots: point.wind?.gust ? point.wind.gust * 1.94384 : null, // m/s to knots
+        windSpeedKnots: point.wind?.speed
+          ? point.wind.speed * 1.94384 // m/s to knots
+          : null,
         windDirectionDeg: point.wind?.directionTrue
           ? (point.wind.directionTrue * 180) / Math.PI // radians to degrees
           : null,
@@ -250,6 +253,7 @@ function generateClearSkyForecast(startTime, hours, latitude, longitude) {
       ghi: maxIrradiance(altitude),
       cloudCover: 0,
       gustSpeedKnots: null,
+      windSpeedKnots: null,
       windDirectionDeg: null,
     });
   }
@@ -345,12 +349,9 @@ class IngestionFSM {
 
     switch (tier) {
       case Tier.OPEN_METEO: {
-        const network = await this.getNetworkStatus();
-        if (!network.wanOnline) {
-          this.app.debug("Open-Meteo: network offline");
-          return null;
-        }
         this.app.debug("Open-Meteo: fetching from API");
+        // No network pre-check: just try. The fetch has its own timeout,
+        // and a pre-check (e.g. dns.google) can wrongly skip a reachable API.
         return await fetchOpenMeteo(latitude, longitude);
       }
 
@@ -361,17 +362,40 @@ class IngestionFSM {
 
       case Tier.LOGBOOK: {
         this.app.debug("Logbook: reading recent cloud cover");
-        // For logbook, we don't get future data - we use it as a cloud cover baseline
-        // combined with sun position for the current time only
+        // Logbook has no forward-looking data - use recent observed cloud
+        // cover as a proxy and combine with sun position for a forecast
         const cloudReadings = await fetchLogbookCloudCover(this.app, 48);
         this.cachedCloudCover = cloudReadings;
         this.app.debug(
           `Logbook: got ${cloudReadings.length} cloud cover readings`,
         );
 
-        // Return empty array - logbook doesn't provide forward-looking forecasts
-        // This tier is used as a fallback anchor for generating forecasts based on recent patterns
-        return [];
+        if (cloudReadings.length === 0) {
+          return null; // No recent observations, no basis for a forecast
+        }
+
+        // Use the most recent reading as the cloud cover assumption
+        const latestCloudCover =
+          cloudReadings[cloudReadings.length - 1].cloudCover;
+        this.app.debug(
+          `Logbook: assuming cloud cover ${Math.round(latestCloudCover * 100)}% from latest observation`,
+        );
+
+        const points = [];
+        const nowMs = Date.now();
+        for (let i = 0; i < FORECAST_HOURS; i++) {
+          const time = new Date(nowMs + i * 3600000);
+          const { altitude } = sunPosition(time, latitude, longitude);
+          points.push({
+            time,
+            ghi: irradianceFromCloudCover(altitude, latestCloudCover),
+            cloudCover: latestCloudCover,
+            gustSpeedKnots: null,
+            windSpeedKnots: null,
+            windDirectionDeg: null,
+          });
+        }
+        return points;
       }
 
       case Tier.CLEAR_SKY: {
@@ -437,11 +461,23 @@ class IngestionFSM {
       `Fetching forecast for position: ${latitude.toFixed(4)}, ${longitude.toFixed(4)}`,
     );
 
-    // Try tiers in order until one succeeds
+    // Try tiers in order until one succeeds with actual data.
+    // Note: empty forecast counts as failure (an empty array is truthy in JS,
+    // but carries no data - fall through to the next tier instead).
     for (let tier = Tier.OPEN_METEO; tier <= Tier.CLEAR_SKY; tier++) {
       this.app.debug(`Trying tier ${tier}: ${this.getTierName(tier)}`);
-      const forecast = await this.fetchFromTier(tier);
-      if (forecast) {
+      let forecast;
+      try {
+        forecast = await this.fetchFromTier(tier);
+      } catch (error) {
+        // A failing tier (network error, timeout) must not abort the
+        // fallback chain - try the next tier instead
+        this.app.debug(
+          `Tier ${this.getTierName(tier)} failed: ${error.message}`,
+        );
+        continue;
+      }
+      if (forecast && forecast.length > 0) {
         this.currentTier = tier;
         this.lastFetchTime = new Date();
         this.lastForecast = this.postProcessForecast(forecast);

@@ -284,8 +284,8 @@ module.exports = (app) => {
       // Add current generation (current hour from forecast)
       if (predictionEngine?.lastPrediction?.length > 0) {
         const current = predictionEngine.lastPrediction[0];
-        const solarGen = Math.round(current.solarYieldWh);
-        const windGen = Math.round(current.windYieldWh);
+        const solarGen = Math.round(current.idealSolarYieldWh);
+        const windGen = Math.round(current.idealWindYieldWh);
         const totalGen = solarGen + windGen;
         if (totalGen > 0) {
           const genParts = [];
@@ -296,7 +296,7 @@ module.exports = (app) => {
 
         // Add 24h forecast summary
         const totalYield24h = predictionEngine.lastPrediction.reduce(
-          (sum, p) => sum + p.solarYieldWh + p.windYieldWh,
+          (sum, p) => sum + p.idealSolarYieldWh + p.idealWindYieldWh,
           0,
         );
         status += ` 24h: ${Math.round(totalYield24h)}Wh`;
@@ -365,24 +365,8 @@ module.exports = (app) => {
         `Got forecast with ${forecast.length} points, source: ${ingestionFSM.getSourceInfo().source}`,
       );
 
-      // Run prediction engine
-      const hourly = predictionEngine.runPrediction(forecast);
-      app.debug(`Prediction complete: ${hourly.length} hours forecasted`);
-
-      // Calculate advisories
-      const timeToFull = predictionEngine.getTimeToFull();
-      const timeToEmpty = predictionEngine.getTimeToEmpty();
-      const stowageOpportunity = predictionEngine.findStowageOpportunity();
-
-      const engineRunTime = predictionEngine.calculateEngineRunTime(
-        pluginConfig.battery?.engineAlternatorWatts || 100,
-      );
-
-      // Get unified deployment recommendations for all deployable systems
-      const deploymentRecommendations =
-        predictionEngine.getDeploymentRecommendations();
-
-      // Build map of current deploy states from deltaState
+      // Build map of current deploy states from deltaState (before runPrediction
+      // so the detected-state yield track can use it)
       const navState = deltaState.get("navigation.state");
       const underway =
         navState === "sailing" ||
@@ -515,6 +499,26 @@ module.exports = (app) => {
           currentDeployStates.set(gen.id, "stowed");
         }
       }
+
+      // Run prediction engine (with detected deploy states for the detected track)
+      const hourly = predictionEngine.runPrediction(
+        forecast,
+        currentDeployStates,
+      );
+      app.debug(`Prediction complete: ${hourly.length} hours forecasted`);
+
+      // Calculate advisories
+      const timeToFull = predictionEngine.getTimeToFull();
+      const timeToEmpty = predictionEngine.getTimeToEmpty();
+      const stowageOpportunity = predictionEngine.findStowageOpportunity();
+
+      const engineRunTime = predictionEngine.calculateEngineRunTime(
+        pluginConfig.battery?.engineAlternatorWatts || 100,
+      );
+
+      // Get unified deployment recommendations for all deployable systems
+      const deploymentRecommendations =
+        predictionEngine.getDeploymentRecommendations();
 
       // Publish all advisories
       app.debug("Publishing advisories...");

@@ -1870,7 +1870,415 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
     }
   });
 
-  test("windYieldWh is 0 in hours when gusts exceed max (deployable wind stowed)", () => {
+  test("two yield tracks: recommended vs detected (Superwind stowed for repair)", () => {
+    const app = makeFakeApp();
+    app.setSelfPath("navigation.position", {
+      latitude: 60,
+      longitude: 18,
+    });
+    app.setSelfPath("navigation.state", "moored");
+
+    const engine = new PredictionEngine({
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [],
+      mechanicalGenerators: [
+        withCurve({
+          id: "windgen",
+          type: "wind",
+          deployable: true,
+          powerPath: "electrical.wind.power",
+          maxWindKnots: 30,
+          startupSpeedKnots: 5,
+          manufacturerCurve: "6,30,8,100,10,170,12,220",
+        }),
+      ],
+      getEfficiency: () => 0.7,
+      getSelfPath: (path) => app.getSelfPath(path),
+      app,
+    });
+
+    // Wind 10kn, gusts 15kn (both below limits) → recommended: deployed
+    const now = new Date("2026-03-20T12:00:00Z");
+    const forecast = Array.from({ length: 24 }, (_, h) => ({
+      time: new Date(now.getTime() + h * 3600000),
+      ghi: 0,
+      cloudCover: 0,
+      gustSpeedKnots: 15,
+      windSpeedKnots: 10,
+      windDirectionDeg: null,
+    }));
+    const realNow = Date.now;
+    Date.now = () => now.getTime();
+    try {
+      // Detected as stowed (e.g. being repaired) → detected track should be 0
+      const detectedStates = new Map([["windgen", "stowed"]]);
+      engine.runPrediction(forecast, detectedStates);
+      const rec = engine
+        .getDeploymentRecommendations()
+        .find((r) => r.id === "windgen");
+      // Recommended: deployed (conditions are fine)
+      assert.strictEqual(rec.recommendedState, "deployed");
+      // Recommended track: wind yield > 0 (should be deployed)
+      assert.ok(
+        engine.lastPrediction[0].idealWindYieldWh > 0,
+        "Recommended track should have wind yield (conditions fine)",
+      );
+      // Detected track: yield 0 (detected as stowed)
+      assert.strictEqual(
+        engine.lastPrediction[0].detectedYieldWh,
+        0,
+        "Detected track yield should be 0 (device stowed for repair)",
+      );
+      // Net tracks diverge: recommended is positive, detected is negative (load only)
+      assert.ok(
+        engine.lastPrediction[0].idealNetWh >
+          engine.lastPrediction[0].detectedNetWh,
+        "Recommended net should exceed detected net",
+      );
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test("two yield tracks match when device detected as deployed", () => {
+    const app = makeFakeApp();
+    app.setSelfPath("navigation.position", {
+      latitude: 60,
+      longitude: 18,
+    });
+    app.setSelfPath("navigation.state", "moored");
+
+    const engine = new PredictionEngine({
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [],
+      mechanicalGenerators: [
+        withCurve({
+          id: "windgen",
+          type: "wind",
+          deployable: true,
+          powerPath: "electrical.wind.power",
+          maxWindKnots: 30,
+          startupSpeedKnots: 5,
+          manufacturerCurve: "6,30,8,100,10,170,12,220",
+        }),
+      ],
+      getEfficiency: () => 0.7,
+      getSelfPath: (path) => app.getSelfPath(path),
+      app,
+    });
+
+    const now = new Date("2026-03-20T12:00:00Z");
+    const forecast = Array.from({ length: 24 }, (_, h) => ({
+      time: new Date(now.getTime() + h * 3600000),
+      ghi: 0,
+      cloudCover: 0,
+      gustSpeedKnots: 15,
+      windSpeedKnots: 10,
+      windDirectionDeg: null,
+    }));
+    const realNow = Date.now;
+    Date.now = () => now.getTime();
+    try {
+      // Detected as deployed → both tracks should match
+      const detectedStates = new Map([["windgen", "deployed"]]);
+      engine.runPrediction(forecast, detectedStates);
+      assert.strictEqual(
+        engine.lastPrediction[0].idealWindYieldWh,
+        engine.lastPrediction[0].detectedYieldWh,
+        "Tracks should match when device detected as deployed",
+      );
+      assert.strictEqual(
+        engine.lastPrediction[0].idealNetWh,
+        engine.lastPrediction[0].detectedNetWh,
+        "Net tracks should match when device detected as deployed",
+      );
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test("hourly actions: ideal deploy, detected needs deploy (stowed for repair)", () => {
+    const app = makeFakeApp();
+    app.setSelfPath("navigation.position", {
+      latitude: 60,
+      longitude: 18,
+    });
+    app.setSelfPath("navigation.state", "moored");
+
+    const engine = new PredictionEngine({
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [],
+      mechanicalGenerators: [
+        withCurve({
+          id: "windgen",
+          type: "wind",
+          deployable: true,
+          powerPath: "electrical.wind.power",
+          maxWindKnots: 30,
+          startupSpeedKnots: 5,
+          manufacturerCurve: "6,30,8,100,10,170,12,220",
+        }),
+      ],
+      getEfficiency: () => 0.7,
+      getSelfPath: (path) => app.getSelfPath(path),
+      app,
+    });
+
+    // Wind 10kn, gusts 15kn (below limits) → ideal: deploy
+    const now = new Date("2026-03-20T12:00:00Z");
+    const forecast = Array.from({ length: 24 }, (_, h) => ({
+      time: new Date(now.getTime() + h * 3600000),
+      ghi: 0,
+      cloudCover: 0,
+      gustSpeedKnots: 15,
+      windSpeedKnots: 10,
+      windDirectionDeg: null,
+    }));
+    const realNow = Date.now;
+    Date.now = () => now.getTime();
+    try {
+      const detectedStates = new Map([["windgen", "stowed"]]);
+      engine.runPrediction(forecast, detectedStates);
+      const actions = engine.lastPrediction[0].actions;
+      const windAction = actions.find((a) => a.id === "windgen");
+      assert.strictEqual(windAction.idealAction, "deploy");
+      // Detected as stowed, ideal is deploy → detectedAction = deploy
+      assert.strictEqual(windAction.detectedAction, "deploy");
+      assert.match(windAction.reason, /wind.*startup/);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test("hourly actions: ideal stow (gusts), detected stay (already stowed)", () => {
+    const app = makeFakeApp();
+    app.setSelfPath("navigation.position", {
+      latitude: 60,
+      longitude: 18,
+    });
+    app.setSelfPath("navigation.state", "moored");
+
+    const engine = new PredictionEngine({
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [],
+      mechanicalGenerators: [
+        withCurve({
+          id: "windgen",
+          type: "wind",
+          deployable: true,
+          powerPath: "electrical.wind.power",
+          maxWindKnots: 30,
+          startupSpeedKnots: 5,
+          manufacturerCurve: "6,30,8,100,10,170,12,220",
+        }),
+      ],
+      getEfficiency: () => 0.7,
+      getSelfPath: (path) => app.getSelfPath(path),
+      app,
+    });
+
+    // Gusts 35kn (exceeds max 30) → ideal: stow
+    const now = new Date("2026-03-20T12:00:00Z");
+    const forecast = Array.from({ length: 24 }, () => ({
+      time: new Date(now.getTime()),
+      ghi: 0,
+      cloudCover: 0,
+      gustSpeedKnots: 35,
+      windSpeedKnots: 10,
+      windDirectionDeg: null,
+    }));
+    const realNow = Date.now;
+    Date.now = () => now.getTime();
+    try {
+      const detectedStates = new Map([["windgen", "stowed"]]);
+      engine.runPrediction(forecast, detectedStates);
+      const actions = engine.lastPrediction[0].actions;
+      const windAction = actions.find((a) => a.id === "windgen");
+      assert.strictEqual(windAction.idealAction, "stow");
+      // Detected as stowed, ideal is stow → stay
+      assert.strictEqual(windAction.detectedAction, "stay");
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test("hourly actions: FLINsail stows when gusts exceed limit", () => {
+    const app = makeFakeApp();
+    app.setSelfPath("navigation.position", {
+      latitude: 60,
+      longitude: 18,
+    });
+    app.setSelfPath("navigation.state", "moored");
+
+    const engine = new PredictionEngine({
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [
+        {
+          id: "flinsail",
+          type: "deployable",
+          capacityWp: 300,
+          gustLimitKnots: 20,
+          powerPath: "electrical.solar.flinsail.power",
+        },
+      ],
+      mechanicalGenerators: [],
+      getEfficiency: () => 0.7,
+      getSelfPath: (path) => app.getSelfPath(path),
+      app,
+    });
+
+    // Gusts 25kn (exceeds limit 20) → ideal: stow
+    const now = new Date("2026-03-20T12:00:00Z");
+    const forecast = Array.from({ length: 24 }, () => ({
+      time: new Date(now.getTime()),
+      ghi: 500,
+      cloudCover: 0,
+      gustSpeedKnots: 25,
+      windSpeedKnots: 10,
+      windDirectionDeg: null,
+    }));
+    const realNow = Date.now;
+    Date.now = () => now.getTime();
+    try {
+      // Detected as deployed → detectedAction = stow (needs to stow)
+      const detectedStates = new Map([["flinsail", "deployed"]]);
+      engine.runPrediction(forecast, detectedStates);
+      const actions = engine.lastPrediction[0].actions;
+      const solarAction = actions.find((a) => a.id === "flinsail");
+      assert.strictEqual(solarAction.idealAction, "stow");
+      assert.strictEqual(solarAction.detectedAction, "stow");
+      assert.match(solarAction.reason, /gusts.*limit/);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test("hourly actions: detectedAction null when detected state unknown", () => {
+    const app = makeFakeApp();
+    app.setSelfPath("navigation.position", {
+      latitude: 60,
+      longitude: 18,
+    });
+    app.setSelfPath("navigation.state", "moored");
+
+    const engine = new PredictionEngine({
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [],
+      mechanicalGenerators: [
+        withCurve({
+          id: "windgen",
+          type: "wind",
+          deployable: true,
+          powerPath: "electrical.wind.power",
+          maxWindKnots: 30,
+          startupSpeedKnots: 5,
+          manufacturerCurve: "6,30,8,100,10,170,12,220",
+        }),
+      ],
+      getEfficiency: () => 0.7,
+      getSelfPath: (path) => app.getSelfPath(path),
+      app,
+    });
+
+    const now = new Date("2026-03-20T12:00:00Z");
+    const forecast = Array.from({ length: 24 }, () => ({
+      time: new Date(now.getTime()),
+      ghi: 0,
+      cloudCover: 0,
+      gustSpeedKnots: 15,
+      windSpeedKnots: 10,
+      windDirectionDeg: null,
+    }));
+    const realNow = Date.now;
+    Date.now = () => now.getTime();
+    try {
+      // No detected states passed → all unknown
+      engine.runPrediction(forecast);
+      const actions = engine.lastPrediction[0].actions;
+      const windAction = actions.find((a) => a.id === "windgen");
+      assert.strictEqual(windAction.idealAction, "deploy");
+      assert.strictEqual(windAction.detectedAction, null);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test("hourly actions only emitted on state change, not repeated every hour", () => {
+    const app = makeFakeApp();
+    app.setSelfPath("navigation.position", {
+      latitude: 60,
+      longitude: 18,
+    });
+    app.setSelfPath("navigation.state", "moored");
+
+    const engine = new PredictionEngine({
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [],
+      mechanicalGenerators: [
+        withCurve({
+          id: "windgen",
+          type: "wind",
+          deployable: true,
+          powerPath: "electrical.wind.power",
+          maxWindKnots: 30,
+          startupSpeedKnots: 5,
+          manufacturerCurve: "6,30,8,100,10,170,12,220",
+        }),
+      ],
+      getEfficiency: () => 0.7,
+      getSelfPath: (path) => app.getSelfPath(path),
+      app,
+    });
+
+    // Gusts 35kn (above 30 limit) for hours 0-2, then 15kn (below limit) for hours 3+.
+    // Wind always 10kn (above startup).
+    const now = new Date("2026-03-20T12:00:00Z");
+    const forecast = Array.from({ length: 24 }, (_, h) => ({
+      time: new Date(now.getTime() + h * 3600000),
+      ghi: 0,
+      cloudCover: 0,
+      gustSpeedKnots: h < 3 ? 35 : 15,
+      windSpeedKnots: 10,
+      windDirectionDeg: null,
+    }));
+    const realNow = Date.now;
+    Date.now = () => now.getTime();
+    try {
+      engine.runPrediction(forecast);
+      // Hour 0: baseline, action emitted (stow)
+      const h0 = engine.lastPrediction[0].actions.find(
+        (a) => a.id === "windgen",
+      );
+      assert.strictEqual(h0.idealAction, "stow");
+      // Hours 1-2: still stowed, no repeated action
+      assert.strictEqual(
+        engine.lastPrediction[1].actions.find((a) => a.id === "windgen"),
+        undefined,
+        "Hour 1 should not repeat the stow action",
+      );
+      assert.strictEqual(
+        engine.lastPrediction[2].actions.find((a) => a.id === "windgen"),
+        undefined,
+        "Hour 2 should not repeat the stow action",
+      );
+      // Hour 3: gusts drop → deploy action emitted
+      const h3 = engine.lastPrediction[3].actions.find(
+        (a) => a.id === "windgen",
+      );
+      assert.strictEqual(h3.idealAction, "deploy");
+      assert.match(h3.reason, /gusts.*limit|wind.*startup/);
+      // Hour 4: still deployed, no repeated action
+      assert.strictEqual(
+        engine.lastPrediction[4].actions.find((a) => a.id === "windgen"),
+        undefined,
+        "Hour 4 should not repeat the deploy action",
+      );
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test("idealWindYieldWh is 0 in hours when gusts exceed max (deployable wind stowed)", () => {
     const app = makeFakeApp();
     app.setSelfPath("navigation.position", {
       latitude: 60,
@@ -1912,25 +2320,25 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
     Date.now = () => now.getTime();
     try {
       engine.runPrediction(forecast);
-      // Hours 0-2: gusts 35kn >= max 30kn → windYieldWh should be 0
+      // Hours 0-2: gusts 35kn >= max 30kn → idealWindYieldWh should be 0
       assert.strictEqual(
-        engine.lastPrediction[0].windYieldWh,
+        engine.lastPrediction[0].idealWindYieldWh,
         0,
         "Hour 0 gusts exceed limit, yield should be 0",
       );
       assert.strictEqual(
-        engine.lastPrediction[1].windYieldWh,
+        engine.lastPrediction[1].idealWindYieldWh,
         0,
         "Hour 1 gusts exceed limit, yield should be 0",
       );
       assert.strictEqual(
-        engine.lastPrediction[2].windYieldWh,
+        engine.lastPrediction[2].idealWindYieldWh,
         0,
         "Hour 2 gusts exceed limit, yield should be 0",
       );
       // Hour 3: gusts drop to 15kn, wind 10kn → should generate
       assert.ok(
-        engine.lastPrediction[3].windYieldWh > 0,
+        engine.lastPrediction[3].idealWindYieldWh > 0,
         "Hour 3 gusts below limit, should generate",
       );
     } finally {
