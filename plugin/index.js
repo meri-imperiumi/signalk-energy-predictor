@@ -401,6 +401,21 @@ module.exports = (app) => {
           if (powerVal != null && powerVal > 0) {
             currentDeployStates.set(array.id, "deployed");
           }
+          // No solar output during daytime means array is stowed
+          if (powerVal != null && powerVal === 0) {
+            const pos = deltaState.get("navigation.position");
+            if (pos && pos.latitude != null) {
+              const { sunPosition } = require("./solar.js");
+              const sunPos = sunPosition(
+                new Date(),
+                pos.latitude,
+                pos.longitude ?? 0,
+              );
+              if (sunPos.altitude > 0) {
+                currentDeployStates.set(array.id, "stowed");
+              }
+            }
+          }
         }
         // FLINsail always stowed when underway
         if (array.type === "deployable" && underway) {
@@ -419,9 +434,49 @@ module.exports = (app) => {
             currentDeployStates.set(gen.id, "deployed");
           }
         }
+        // Wind generator: if there is wind but no power output, it is stowed
+        if (
+          gen.deployable &&
+          gen.type === "wind" &&
+          !currentDeployStates.has(gen.id)
+        ) {
+          const windSpeed = toNumber(
+            deltaState.get("environment.wind.speedApparent"),
+          );
+          const powerVal = toNumber(deltaState.get(gen.powerPath));
+          const startupSpeed = gen.startupSpeedKnots ?? 5;
+          if (
+            powerVal != null &&
+            powerVal === 0 &&
+            windSpeed != null &&
+            windSpeed >= startupSpeed
+          ) {
+            currentDeployStates.set(gen.id, "stowed");
+          }
+        }
         // Hydro is stowed when not sailing
         if (gen.deployable && gen.type === "hydro" && navState !== "sailing") {
           currentDeployStates.set(gen.id, "stowed");
+        }
+        // Hydro: if sailing above min speed but no power output, it is stowed
+        if (
+          gen.deployable &&
+          gen.type === "hydro" &&
+          !currentDeployStates.has(gen.id)
+        ) {
+          const powerVal = toNumber(deltaState.get(gen.powerPath));
+          const speed = toNumber(
+            deltaState.get("navigation.speedThroughWater"),
+          );
+          const minSpeed = gen.minSpeedKnots ?? 3;
+          if (
+            powerVal != null &&
+            powerVal === 0 &&
+            speed != null &&
+            speed >= minSpeed
+          ) {
+            currentDeployStates.set(gen.id, "stowed");
+          }
         }
         // Wind generators stowed when underway (like FLINsail)
         if (gen.deployable && gen.type === "wind" && underway) {
@@ -598,21 +653,11 @@ module.exports = (app) => {
         // Read current power output from delta state
         const powerReading =
           deltaState.get(powerPath) || app.getSelfPath(powerPath);
-        // Handle both direct number values and object values with value property
-        let actualPowerW = null;
-        if (typeof powerReading === "number") {
-          actualPowerW = powerReading;
-        } else if (
-          powerReading &&
-          typeof powerReading === "object" &&
-          typeof powerReading.value === "number"
-        ) {
-          actualPowerW = powerReading.value;
-        }
+        const actualPowerW = toNumber(powerReading);
 
         if (actualPowerW == null || actualPowerW <= 0) {
           app.debug(
-            `Array ${array.id}: powerPath="${powerPath}" -> ${typeof powerReading === "object" ? "[object]" : powerReading}, skipping`,
+            `Array ${array.id}: powerPath="${powerPath}" -> ${actualPowerW == null ? "null/no data" : actualPowerW + "W"}, skipping`,
           );
           continue;
         }
@@ -691,20 +736,26 @@ module.exports = (app) => {
    * @returns {void}
    */
   function subscribeToDeltas() {
-    // Collect deploy state paths from configured devices
-    const deployStatePaths = [];
+    // Collect deploy state and power paths from configured devices
+    const extraPaths = [];
     for (const array of getActiveSolarArrays(pluginConfig)) {
       if (array.deployStatePath) {
-        deployStatePaths.push(array.deployStatePath);
+        extraPaths.push(array.deployStatePath);
+      }
+      if (array.powerPath) {
+        extraPaths.push(array.powerPath);
       }
     }
     for (const gen of getActiveGenerators(pluginConfig)) {
       if (gen.deployStatePath) {
-        deployStatePaths.push(gen.deployStatePath);
+        extraPaths.push(gen.deployStatePath);
+      }
+      if (gen.powerPath) {
+        extraPaths.push(gen.powerPath);
       }
     }
 
-    const allPaths = [...SUBSCRIPTION_PATHS, ...deployStatePaths];
+    const allPaths = [...SUBSCRIPTION_PATHS, ...extraPaths];
     const subscription = {
       context: "vessels.self",
       subscribe: allPaths.map((path) => ({ path })),
@@ -902,6 +953,7 @@ module.exports = (app) => {
     ingestionFSM,
     predictionEngine,
     advisoryPublisher,
+    runPredictionCycle,
   });
 
   // Export dependencies for testing

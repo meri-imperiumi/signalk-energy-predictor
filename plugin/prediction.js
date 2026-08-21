@@ -288,6 +288,7 @@ class PredictionEngine {
     this.capacityWh = battery.capacityAh * battery.systemVoltage;
     this.loadProfile = new LoadProfile();
     this.lastPrediction = [];
+    this.lastForecast = [];
   }
 
   /**
@@ -393,6 +394,71 @@ class PredictionEngine {
     return this.lastPrediction.reduce((max, p) => {
       return Math.max(max, p.windSpeedKnots ?? 0);
     }, 0);
+  }
+
+  /**
+   * Computes the potential 24h yield (in Wh) for a deployable device if it were deployed.
+   * Uses the last forecast and prediction data.
+   *
+   * @param {string} deviceId - Device ID
+   * @returns {number} Potential yield in watt-hours over the prediction window
+   */
+  getPotentialYieldWh(deviceId) {
+    if (this.lastForecast.length === 0) return 0;
+
+    const array = this.solarArrays.find((a) => a.id === deviceId);
+    if (array && array.type === "deployable") {
+      const pos = this.getSelfPath("navigation.position");
+      const lat = pos?.latitude ?? 0;
+      const lon = pos?.longitude ?? 0;
+      let total = 0;
+      for (const point of this.lastForecast) {
+        const time = new Date(
+          point.time.getTime
+            ? point.time.getTime()
+            : new Date(point.time).getTime(),
+        );
+        const sunPos = sunPosition(time, lat, lon);
+        const ghi = point.ghi ?? 0;
+        const windGustKnots = point.gustSpeedKnots ?? 0;
+        const efficiency = this.getEfficiency(
+          array.id,
+          false,
+          sunPos.azimuth,
+          sunPos.altitude,
+        );
+        total += predictSolarHour({
+          array,
+          sunPosition: sunPos,
+          ghi,
+          windGustKnots,
+          efficiency,
+        });
+      }
+      return Math.round(total);
+    }
+
+    const generator = this.mechanicalGenerators.find((g) => g.id === deviceId);
+    if (generator) {
+      let total = 0;
+      const isSailing = this.getNavState() === "sailing";
+      const speedThroughWater = this.getSpeedThroughWater() ?? 0;
+      for (const point of this.lastForecast) {
+        if (generator.type === "wind") {
+          const windSpeedKnots = point.windSpeedKnots ?? 0;
+          total += predictWindHour({ generator, windSpeedKnots, isSailing });
+        } else if (generator.type === "hydro") {
+          total += predictHydroHour({
+            generator,
+            speedThroughWaterKnots: speedThroughWater,
+            isSailing,
+          });
+        }
+      }
+      return Math.round(total);
+    }
+
+    return 0;
   }
 
   /**
@@ -506,7 +572,7 @@ class PredictionEngine {
         }
       } else if (generator.type === "wind") {
         const maxWindKnots = generator.maxWindKnots ?? 30;
-        const minDeployWind = 5;
+        const minDeployWind = generator.startupSpeedKnots ?? 5;
 
         if (underway) {
           // Wind generators stowed when under way (like FLINsail)
@@ -549,7 +615,13 @@ class PredictionEngine {
       }
     }
 
-    return recommendations;
+    return recommendations.map((rec) => ({
+      ...rec,
+      missedYieldWh:
+        rec.recommendedState === "deployed"
+          ? this.getPotentialYieldWh(rec.id)
+          : 0,
+    }));
   }
 
   /**
@@ -697,6 +769,7 @@ class PredictionEngine {
     }
 
     this.lastPrediction = predictions;
+    this.lastForecast = forecast;
     return predictions;
   }
 

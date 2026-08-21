@@ -218,6 +218,8 @@ class AdvisoryPublisher {
       updates[`${PREDICTION_BASE}.deployment.${rec.id}.detectedState`] =
         currentStates.get(rec.id) ?? null;
       updates[`${PREDICTION_BASE}.deployment.${rec.id}.reason`] = rec.reason;
+      updates[`${PREDICTION_BASE}.deployment.${rec.id}.missedYieldWh`] =
+        rec.missedYieldWh ?? 0;
 
       // Check current state to decide if notification is needed
       const currentState = currentStates.get(rec.id) ?? null;
@@ -230,11 +232,11 @@ class AdvisoryPublisher {
           rec.recommendedState === "deployed"
             ? DeployState.WARN
             : DeployState.ALERT;
-        this.publishNotification(
-          `deploy_${rec.id}`,
-          state,
-          `${rec.name}: ${action} now - ${rec.reason}`,
-        );
+        let message = `${rec.name}: ${action} now - ${rec.reason}`;
+        if (rec.recommendedState === "deployed" && rec.missedYieldWh > 0) {
+          message += ` (${rec.missedYieldWh}Wh in 24h)`;
+        }
+        this.publishNotification(`deploy_${rec.id}`, state, message);
       } else {
         // State matches or unknown - clear any existing notification
         this.publishNotification(

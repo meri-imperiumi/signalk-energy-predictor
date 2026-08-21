@@ -207,6 +207,14 @@ function buildPluginSchema() {
               minimum: 20,
               maximum: 60,
             },
+            startupSpeedKnots: {
+              type: "number",
+              title: "Startup Wind Speed",
+              description:
+                "Minimum wind speed (knots) for the generator to produce power (wind generators only)",
+              default: 5,
+              minimum: 0,
+            },
             minSpeedKnots: {
               type: "number",
               title: "Min Speed",
