@@ -13,7 +13,7 @@
 const { IngestionFSM, Tier } = require("./ingestion.js");
 const { SolarMatrix } = require("./learning.js");
 const matrixModule = require("./matrix.js");
-const { PredictionEngine, toNumber } = require("./prediction.js");
+const { PredictionEngine, toNumber, toKnots } = require("./prediction.js");
 const { AdvisoryPublisher } = require("./advisory.js");
 const {
   buildPluginSchema,
@@ -440,16 +440,50 @@ module.exports = (app) => {
           gen.type === "wind" &&
           !currentDeployStates.has(gen.id)
         ) {
-          const windSpeed = toNumber(
-            deltaState.get("environment.wind.speedApparent"),
-          );
           const powerVal = toNumber(deltaState.get(gen.powerPath));
           const startupSpeed = gen.startupSpeedKnots ?? 5;
+          // Use average wind speed over recent history to avoid false positives
+          // from brief gusts - wind generators need sustained wind to spin up
+          const currentWind = toKnots(
+            deltaState.get("environment.wind.speedApparent") ||
+              deltaState.get("environment.wind.speedOverGround") ||
+              deltaState.get("environment.wind.speedTrue") ||
+              app.getSelfPath("environment.wind.speedApparent") ||
+              app.getSelfPath("environment.wind.speedOverGround") ||
+              app.getSelfPath("environment.wind.speedTrue"),
+          );
+          const allWindHistory = [
+            ...(windHistory.get("environment.wind.speedApparent") || []),
+            ...(windHistory.get("environment.wind.speedOverGround") || []),
+            ...(windHistory.get("environment.wind.speedTrue") || []),
+          ];
+          // Use the most recent sample time as reference, falling back to Date.now()
+          // This allows tests to "time travel" via delta timestamps
+          const refTime =
+            allWindHistory.length > 0
+              ? Math.max(...allWindHistory.map((s) => s.time))
+              : Date.now();
+          const recentWind = allWindHistory.filter(
+            (s) => s.time >= refTime - WIND_HISTORY_MS,
+          );
+          // Include current reading as an additional sample
+          const samples =
+            currentWind != null
+              ? [...recentWind, { speed: currentWind }]
+              : recentWind;
+          const avgWind =
+            samples.length > 0
+              ? samples.reduce((sum, s) => sum + s.speed, 0) / samples.length
+              : null;
+          app.debug(
+            `Wind gen ${gen.id}: avgWind=${avgWind?.toFixed(1) ?? "null"}kn (${recentWind.length} samples), powerVal=${powerVal}, startupSpeed=${startupSpeed}kn`,
+          );
           if (
             powerVal != null &&
             powerVal === 0 &&
-            windSpeed != null &&
-            windSpeed >= startupSpeed
+            avgWind != null &&
+            avgWind >= startupSpeed &&
+            recentWind.length >= 2
           ) {
             currentDeployStates.set(gen.id, "stowed");
           }
@@ -465,9 +499,7 @@ module.exports = (app) => {
           !currentDeployStates.has(gen.id)
         ) {
           const powerVal = toNumber(deltaState.get(gen.powerPath));
-          const speed = toNumber(
-            deltaState.get("navigation.speedThroughWater"),
-          );
+          const speed = toKnots(deltaState.get("navigation.speedThroughWater"));
           const minSpeed = gen.minSpeedKnots ?? 3;
           if (
             powerVal != null &&
@@ -539,6 +571,11 @@ module.exports = (app) => {
   /** @type {Set<string>} */
   const solarPowerPaths = new Set();
 
+  /** @type {Map<string, {speed: number, time: number}[]>} */
+  const windHistory = new Map();
+  const WIND_HISTORY_MS = 5 * 60 * 1000; // 5 minutes
+  const WIND_SAMPLE_INTERVAL_MS = 30 * 1000; // 30 seconds
+
   /**
    * Processes a delta update.
    * Reads values from the delta and stores them in deltaState for later use.
@@ -550,19 +587,11 @@ module.exports = (app) => {
   async function processDelta(delta) {
     const learning = pluginConfig?.learning || DEFAULT_CONFIG.learning;
 
-    if (!learning.enabled) {
-      return;
-    }
-
-    if (!ingestionFSM) {
-      return;
-    }
-
     try {
       // Track which solar power paths we saw in this delta
       const solarPowerDelta = [];
 
-      // Update state from delta values
+      // Update state from delta values - always cache, regardless of learning
       if (delta.updates) {
         for (const update of delta.updates) {
           if (!update.values) {
@@ -602,11 +631,45 @@ module.exports = (app) => {
             if (solarPowerPaths.has(v.path)) {
               solarPowerDelta.push(v.path);
             }
+
+            // Track wind speed history for wind generator spin-up detection
+            if (
+              v.path === "environment.wind.speedApparent" ||
+              v.path === "environment.wind.speedOverGround" ||
+              v.path === "environment.wind.speedTrue"
+            ) {
+              // Use update timestamp if available, otherwise Date.now()
+              const now = update.timestamp
+                ? new Date(update.timestamp).getTime()
+                : Date.now();
+              const history = windHistory.get(v.path) || [];
+              // Only sample if enough time since last sample
+              if (
+                history.length === 0 ||
+                now - history[history.length - 1].time >=
+                  WIND_SAMPLE_INTERVAL_MS
+              ) {
+                history.push({
+                  speed: toKnots(v.value),
+                  time: now,
+                });
+                // Trim to window
+                const cutoff = now - WIND_HISTORY_MS;
+                while (history.length > 0 && history[0].time < cutoff) {
+                  history.shift();
+                }
+                windHistory.set(v.path, history);
+              }
+            }
           }
         }
       }
 
-      // Only run learning if we got a solar power reading
+      // Only run learning if learning is enabled and we got a solar power reading
+      if (!learning.enabled || !ingestionFSM) {
+        return;
+      }
+
       if (solarPowerDelta.length === 0) {
         return;
       }

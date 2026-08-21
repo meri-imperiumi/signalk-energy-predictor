@@ -252,6 +252,20 @@ function toNumber(v) {
   return null;
 }
 
+/** Conversion factor: 1 m/s = 1.94384 knots */
+const MS_TO_KN = 1.94384;
+
+/**
+ * Converts a Signal K speed value (m/s) to knots.
+ * Handles plain numbers and {value: number} objects.
+ * @param {number|object|null} v - Speed in m/s
+ * @returns {number|null} Speed in knots, or null
+ */
+function toKnots(v) {
+  const ms = toNumber(v);
+  return ms == null ? null : ms * MS_TO_KN;
+}
+
 /**
  * Prediction engine.
  */
@@ -329,7 +343,7 @@ class PredictionEngine {
    * @returns {number|null} Speed in knots
    */
   getSpeedThroughWater() {
-    return toNumber(this.getSelfPath("navigation.speedThroughWater"));
+    return toKnots(this.getSelfPath("navigation.speedThroughWater"));
   }
 
   /**
@@ -758,13 +772,13 @@ class PredictionEngine {
       predictions.push({
         hour: h,
         time,
-        solarYieldWh,
-        windYieldWh: mechanicalYieldWh,
-        houseLoadWh: averageLoad,
-        netWh,
-        soc: runningSoC,
-        gustSpeedKnots: windGustKnots || 0,
-        windSpeedKnots: windSpeedKnots || 0,
+        solarYieldWh: Math.round(solarYieldWh),
+        windYieldWh: Math.round(mechanicalYieldWh),
+        houseLoadWh: Math.round(averageLoad),
+        netWh: Math.round(netWh),
+        soc: Math.round(runningSoC * 1000) / 1000,
+        gustSpeedKnots: Math.round((windGustKnots || 0) * 10) / 10,
+        windSpeedKnots: Math.round((windSpeedKnots || 0) * 10) / 10,
       });
     }
 
@@ -951,4 +965,6 @@ module.exports = {
   predictHydroHour,
   PREDICTION_HOURS,
   toNumber,
+  toKnots,
+  MS_TO_KN,
 };

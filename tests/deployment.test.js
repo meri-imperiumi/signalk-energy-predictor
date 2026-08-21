@@ -46,7 +46,8 @@ function makePredictionEngine({
 }) {
   const a = app || makeFakeApp();
   if (navState != null) a.setSelfPath("navigation.state", navState);
-  if (speed != null) a.setSelfPath("navigation.speedThroughWater", speed);
+  if (speed != null)
+    a.setSelfPath("navigation.speedThroughWater", speed / 1.94384); // knots to m/s
 
   return new PredictionEngine({
     battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
@@ -1027,6 +1028,232 @@ test.describe("Detected state inference from navigation state", () => {
                 path: "navigation.position",
                 value: { latitude: 60, longitude: 18 },
               },
+              { path: "environment.wind.speedApparent", value: 2 },
+              { path: "electrical.wind.superwind.power", value: 0 },
+            ],
+          },
+        ],
+      });
+    });
+
+    const internals = plugin.__getInternals();
+    await internals.runPredictionCycle();
+
+    const deployDeltas = app.handleMessageCalls
+      .filter((c) => c.m.updates)
+      .flatMap((c) => c.m.updates[0].values)
+      .filter(
+        (v) =>
+          v.path ===
+          "electrical.energy.prediction.deployment.superwind.detectedState",
+      );
+
+    // Wind 2 m/s (~3.9kn) is below startup speed of 8kn, so we cannot infer stow
+    assert.ok(deployDeltas.length > 0, "Should have published detectedState");
+    assert.strictEqual(deployDeltas[0].value, null);
+
+    await plugin.stop();
+    await fs.rm(app.dataPath, { recursive: true, force: true });
+  });
+
+  test("wind generator detected as stowed with sustained wind above startup", async () => {
+    const makePlugin = require("../plugin/index.js");
+
+    class FakeSubManager {
+      constructor() {
+        this.subs = [];
+      }
+      subscribe(sub, unsubs, err, handler) {
+        this.subs.push({ handler });
+        unsubs.push(() => {});
+      }
+    }
+
+    class FakeApp {
+      constructor() {
+        this.selfId = "self";
+        this.subscriptionmanager = new FakeSubManager();
+        this.dataPath = null;
+        this.pathValues = new Map();
+        this.handleMessageCalls = [];
+      }
+      getSelfPath(p) {
+        return this.pathValues.get(p);
+      }
+      getDataPath() {
+        return this.dataPath;
+      }
+      debug() {}
+      error() {}
+      setPluginStatus() {}
+      handleMessage(s, m) {
+        this.handleMessageCalls.push({ s, m });
+      }
+    }
+
+    const app = new FakeApp();
+    const plugin = makePlugin(app);
+    const config = {
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [],
+      mechanicalGenerators: [
+        {
+          id: "superwind",
+          type: "wind",
+          deployable: true,
+          maxWindKnots: 30,
+          startupSpeedKnots: 5,
+          powerPath: "electrical.wind.superwind.power",
+          manufacturerCurve: "5,10,10,50,15,100,20,150,25,200,30,250",
+        },
+      ],
+      weather: {
+        openMeteoEnabled: false,
+        useLogbook: false,
+        forecastHours: 24,
+      },
+    };
+
+    const os = require("node:os");
+    const fs = require("node:fs/promises");
+    app.dataPath = await fs.mkdtemp(
+      require("node:path").join(os.tmpdir(), "energy-"),
+    );
+    await plugin.start(config, () => {});
+
+    // Emit multiple wind deltas above startup threshold (sustained wind)
+    // 6 m/s = ~11.7kn, well above 5kn startup
+    // Use timestamps 60s apart to simulate sustained wind over time
+    const baseTime = new Date("2026-01-01T12:00:00Z");
+    for (let i = 0; i < 3; i++) {
+      const ts = new Date(baseTime.getTime() + i * 60000);
+      app.subscriptionmanager.subs.forEach(({ handler }) => {
+        handler({
+          context: "self",
+          updates: [
+            {
+              timestamp: ts.toISOString(),
+              values: [{ path: "environment.wind.speedApparent", value: 6 }],
+            },
+          ],
+        });
+      });
+    }
+    // Final delta with all state
+    app.subscriptionmanager.subs.forEach(({ handler }) => {
+      handler({
+        context: "self",
+        updates: [
+          {
+            values: [
+              { path: "navigation.state", value: "moored" },
+              {
+                path: "navigation.position",
+                value: { latitude: 60, longitude: 18 },
+              },
+              { path: "electrical.wind.superwind.power", value: 0 },
+            ],
+          },
+        ],
+      });
+    });
+
+    const internals = plugin.__getInternals();
+    await internals.runPredictionCycle();
+
+    const deployDeltas = app.handleMessageCalls
+      .filter((c) => c.m.updates)
+      .flatMap((c) => c.m.updates[0].values)
+      .filter(
+        (v) =>
+          v.path ===
+          "electrical.energy.prediction.deployment.superwind.detectedState",
+      );
+
+    assert.ok(deployDeltas.length > 0, "Should have published detectedState");
+    assert.strictEqual(deployDeltas[0].value, "stowed");
+
+    await plugin.stop();
+    await fs.rm(app.dataPath, { recursive: true, force: true });
+  });
+
+  test("wind generator not inferred stowed from single gust above startup", async () => {
+    const makePlugin = require("../plugin/index.js");
+
+    class FakeSubManager {
+      constructor() {
+        this.subs = [];
+      }
+      subscribe(sub, unsubs, err, handler) {
+        this.subs.push({ handler });
+        unsubs.push(() => {});
+      }
+    }
+
+    class FakeApp {
+      constructor() {
+        this.selfId = "self";
+        this.subscriptionmanager = new FakeSubManager();
+        this.dataPath = null;
+        this.pathValues = new Map();
+        this.handleMessageCalls = [];
+      }
+      getSelfPath(p) {
+        return this.pathValues.get(p);
+      }
+      getDataPath() {
+        return this.dataPath;
+      }
+      debug() {}
+      error() {}
+      setPluginStatus() {}
+      handleMessage(s, m) {
+        this.handleMessageCalls.push({ s, m });
+      }
+    }
+
+    const app = new FakeApp();
+    const plugin = makePlugin(app);
+    const config = {
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [],
+      mechanicalGenerators: [
+        {
+          id: "superwind",
+          type: "wind",
+          deployable: true,
+          maxWindKnots: 30,
+          startupSpeedKnots: 5,
+          powerPath: "electrical.wind.superwind.power",
+          manufacturerCurve: "5,10,10,50,15,100,20,150,25,200,30,250",
+        },
+      ],
+      weather: {
+        openMeteoEnabled: false,
+        useLogbook: false,
+        forecastHours: 24,
+      },
+    };
+
+    const os = require("node:os");
+    const fs = require("node:fs/promises");
+    app.dataPath = await fs.mkdtemp(
+      require("node:path").join(os.tmpdir(), "energy-"),
+    );
+    await plugin.start(config, () => {});
+
+    // Emit single wind delta above threshold (just a gust)
+    app.subscriptionmanager.subs.forEach(({ handler }) => {
+      handler({
+        context: "self",
+        updates: [
+          {
+            values: [
+              { path: "navigation.state", value: "moored" },
+              {
+                path: "navigation.position",
+                value: { latitude: 60, longitude: 18 },
+              },
               { path: "environment.wind.speedApparent", value: 6 },
               { path: "electrical.wind.superwind.power", value: 0 },
             ],
@@ -1047,7 +1274,7 @@ test.describe("Detected state inference from navigation state", () => {
           "electrical.energy.prediction.deployment.superwind.detectedState",
       );
 
-    // Wind 6kn is below startup speed of 8kn, so we cannot infer stow
+    // Single reading (a gust) is not enough to infer stowed
     assert.ok(deployDeltas.length > 0, "Should have published detectedState");
     assert.strictEqual(deployDeltas[0].value, null);
 
