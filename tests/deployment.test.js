@@ -2107,6 +2107,182 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
     }
   });
 
+  test("deployable solar deployed against stow advice produces on the detected track only", () => {
+    const app = makeFakeApp();
+    app.setSelfPath("navigation.position", {
+      latitude: 60,
+      longitude: 18,
+    });
+    app.setSelfPath("navigation.state", "moored");
+
+    const engine = new PredictionEngine({
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [
+        {
+          id: "flinsail",
+          type: "deployable",
+          capacityWp: 300,
+          gustLimitKnots: 20,
+          powerPath: "electrical.solar.flinsail.panelPower",
+        },
+      ],
+      mechanicalGenerators: [],
+      getEfficiency: () => 0.7,
+      getSelfPath: (path) => app.getSelfPath(path),
+      app,
+    });
+
+    // Daytime GHI but gusts over the stow limit: ideal track stows FLINsail
+    const now = new Date("2026-03-20T12:00:00Z");
+    const forecast = Array.from({ length: 24 }, (_, h) => ({
+      time: new Date(now.getTime() + h * 3600000),
+      ghi: 500,
+      cloudCover: 0,
+      gustSpeedKnots: 25,
+      windSpeedKnots: 18,
+      windDirectionDeg: null,
+    }));
+    const realNow = Date.now;
+    Date.now = () => now.getTime();
+    try {
+      // FLINsail actually deployed despite the stow recommendation
+      const detectedStates = new Map([["flinsail", "deployed"]]);
+      engine.runPrediction(forecast, detectedStates);
+
+      const first = engine.lastPrediction[0];
+      assert.strictEqual(
+        first.idealSolarYieldWh,
+        0,
+        "Ideal track should assume FLINsail stowed (gusts over limit)",
+      );
+      assert.ok(
+        first.detectedYieldWh > 0,
+        "Detected track should credit the actually-deployed array",
+      );
+      const last = engine.lastPrediction[engine.lastPrediction.length - 1];
+      assert.ok(
+        last.detectedSoC > last.idealSoC,
+        "Detected SoC should run above ideal when the array is deployed against advice",
+      );
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test("deployable wind generator deployed against gust advice produces on the detected track only", () => {
+    const app = makeFakeApp();
+    app.setSelfPath("navigation.position", {
+      latitude: 60,
+      longitude: 18,
+    });
+    app.setSelfPath("navigation.state", "moored");
+
+    const engine = new PredictionEngine({
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [],
+      mechanicalGenerators: [
+        withCurve({
+          id: "windgen",
+          type: "wind",
+          deployable: true,
+          powerPath: "electrical.wind.power",
+          maxWindKnots: 30,
+          manufacturerCurve: "6,30,8,100,10,170,12,220",
+        }),
+      ],
+      getEfficiency: () => 0.7,
+      getSelfPath: (path) => app.getSelfPath(path),
+      app,
+    });
+
+    // Wind 20kn (spinning) but gusts 35kn over the 30kn stow limit
+    const now = new Date("2026-03-20T12:00:00Z");
+    const forecast = Array.from({ length: 24 }, (_, h) => ({
+      time: new Date(now.getTime() + h * 3600000),
+      ghi: 0,
+      cloudCover: 0,
+      gustSpeedKnots: 35,
+      windSpeedKnots: 20,
+      windDirectionDeg: null,
+    }));
+    const realNow = Date.now;
+    Date.now = () => now.getTime();
+    try {
+      const detectedStates = new Map([["windgen", "deployed"]]);
+      engine.runPrediction(forecast, detectedStates);
+
+      const first = engine.lastPrediction[0];
+      assert.strictEqual(
+        first.idealWindYieldWh,
+        0,
+        "Ideal track should assume wind generator stowed (gusts over limit)",
+      );
+      assert.ok(
+        first.detectedYieldWh > 0,
+        "Detected track should credit the actually-deployed generator",
+      );
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test("fixed-mount wind generator produces on the detected track above max wind", () => {
+    const app = makeFakeApp();
+    app.setSelfPath("navigation.position", {
+      latitude: 60,
+      longitude: 18,
+    });
+    app.setSelfPath("navigation.state", "moored");
+
+    const engine = new PredictionEngine({
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [],
+      mechanicalGenerators: [
+        withCurve({
+          id: "windgen",
+          type: "wind",
+          deployable: false,
+          powerPath: "electrical.wind.power",
+          maxWindKnots: 30,
+          manufacturerCurve: "6,30,8,100,10,170,12,220,20,300,25,350,30,300",
+        }),
+      ],
+      getEfficiency: () => 0.7,
+      getSelfPath: (path) => app.getSelfPath(path),
+      app,
+    });
+
+    // Wind 35kn exceeds the 30kn limit: ideal track assumes stow, but a
+    // fixed mount cannot be stowed and keeps producing
+    const now = new Date("2026-03-20T12:00:00Z");
+    const forecast = Array.from({ length: 24 }, (_, h) => ({
+      time: new Date(now.getTime() + h * 3600000),
+      ghi: 0,
+      cloudCover: 0,
+      gustSpeedKnots: 35,
+      windSpeedKnots: 35,
+      windDirectionDeg: null,
+    }));
+    const realNow = Date.now;
+    Date.now = () => now.getTime();
+    try {
+      engine.runPrediction(forecast);
+
+      const first = engine.lastPrediction[0];
+      assert.strictEqual(
+        first.idealWindYieldWh,
+        0,
+        "Ideal track should assume wind generator stowed (wind over limit)",
+      );
+      assert.ok(
+        first.detectedYieldWh > 0,
+        "Detected track should credit the fixed-mount generator",
+      );
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
   test("hourly actions: ideal deploy, detected needs deploy (stowed for repair)", () => {
     const app = makeFakeApp();
     app.setSelfPath("navigation.position", {

@@ -690,4 +690,88 @@ test.describe("Solar learning regression", () => {
 
     await plugin.stop();
   });
+
+  test("learning gate drops ticks when any engine reports started", async () => {
+    const app = new FakeSignalKApp();
+    const plugin = makePlugin(app);
+    const testDir = await mkdtemp(join(tmpdir(), "engine-gate-"));
+
+    const now = new Date();
+    const utcHours = now.getUTCHours() + now.getUTCMinutes() / 60;
+    const longitude = (12 - utcHours) * 15;
+    const latitude = 0;
+
+    const powerPath = "electrical.solar.cabin-roof.panelPower";
+    const config = {
+      battery: {
+        capacityAh: 400,
+        systemVoltage: 12,
+        minSafeSoC: 0.2,
+        socPath: "electrical.batteries.house.capacity.stateOfCharge",
+      },
+      solarArrays: [
+        {
+          id: "cabin-roof",
+          type: "fixed",
+          capacityWp: 200,
+          powerPath,
+          enabled: true,
+        },
+      ],
+      mechanicalGenerators: [],
+      learning: {
+        enabled: true,
+        minIntervalSeconds: 60,
+      },
+      weather: {
+        openMeteoEnabled: false,
+        useLogbook: false,
+      },
+    };
+
+    app.dataPath = testDir;
+    await plugin.start(config, () => {});
+
+    const emit = (values) => {
+      app.subscriptionmanager.subscriptions.forEach(({ deltaHandler }) => {
+        deltaHandler({ context: app.selfId, updates: [{ values }] });
+      });
+    };
+
+    // Baseline: all stopped (multi-engine instance names), learning updates
+    emit([
+      { path: "navigation.position", value: { latitude, longitude } },
+      {
+        path: "electrical.batteries.house.capacity.stateOfCharge",
+        value: 0.5,
+      },
+      { path: "navigation.state", value: "anchored" },
+      { path: "propulsion.port.state", value: "stopped" },
+      { path: "propulsion.starboard.state", value: "stopped" },
+      { path: powerPath, value: 42 },
+    ]);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const afterStopped = plugin
+      .__getInternals()
+      .solarMatrices.get("cabin-roof").anchored.size;
+    assert.ok(afterStopped > 0, "stopped engines allow learning");
+
+    // Now one engine started: gate must drop the tick (bin count unchanged
+    // at same sun position)
+    emit([
+      { path: "propulsion.port.state", value: "started" },
+      { path: powerPath, value: 45 },
+    ]);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const afterStarted = plugin
+      .__getInternals()
+      .solarMatrices.get("cabin-roof").anchored.size;
+    assert.strictEqual(
+      afterStarted,
+      afterStopped,
+      "started engine must suppress learning (same sun bin)",
+    );
+
+    await plugin.stop();
+  });
 });

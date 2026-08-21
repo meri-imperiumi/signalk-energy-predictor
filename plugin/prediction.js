@@ -76,6 +76,9 @@ function interpolateWindPower(curve, speedKnots) {
  * @param {number} params.ghi - Global Horizontal Irradiance in W/m²
  * @param {number} params.windGustKnots - Wind gust speed in knots
  * @param {number} params.efficiency - Array efficiency [0, 1] from learning matrix
+ * @param {boolean} [params.skipStowGate] - Skip the gust stow gate (detected track:
+ *   the array is actually deployed, so it produces even when the ideal
+ *   track would stow it)
  * @returns {number} Predicted yield in watt-hours for the hour
  */
 function predictSolarHour({
@@ -84,9 +87,14 @@ function predictSolarHour({
   ghi,
   windGustKnots,
   efficiency,
+  skipStowGate = false,
 }) {
   // Check FLINsail risk for deployable arrays
-  if (array.type === "deployable" && array.gustLimitKnots != null) {
+  if (
+    !skipStowGate &&
+    array.type === "deployable" &&
+    array.gustLimitKnots != null
+  ) {
     if (windGustKnots >= array.gustLimitKnots) {
       return 0; // Should be stowed, no yield
     }
@@ -118,6 +126,9 @@ function predictSolarHour({
  * @param {number} params.windSpeedKnots - Average wind speed in knots
  * @param {number} [params.gustSpeedKnots] - Gust speed in knots (deployable: stow if exceeds max)
  * @param {boolean} params.isSailing - Whether vessel is sailing (affects deployable yield)
+ * @param {boolean} [params.skipStowGate] - Skip the stow gates (detected track:
+ *   the generator is actually up, so it produces even when the ideal track
+ *   would stow it)
  * @returns {number} Predicted yield in watt-hours for the hour
  */
 function predictWindHour({
@@ -126,6 +137,7 @@ function predictWindHour({
   gustSpeedKnots,
   isSailing = false,
   navState = "unknown",
+  skipStowGate = false,
 }) {
   if (generator.type !== "wind") {
     return 0;
@@ -134,12 +146,13 @@ function predictWindHour({
   const maxWind = generator.maxWindKnots ?? 30;
 
   // Apply wind speed limit
-  if (windSpeedKnots > maxWind) {
+  if (!skipStowGate && windSpeedKnots > maxWind) {
     return 0; // Exceeds limit, would be stowed
   }
 
   // Deployable wind generators: stow if gusts exceed the max limit
   if (
+    !skipStowGate &&
     generator.deployable &&
     gustSpeedKnots != null &&
     gustSpeedKnots >= maxWind
@@ -1325,10 +1338,25 @@ class PredictionEngine {
         });
         idealSolarYieldWh += arrayYield;
 
-        // Detected track: 0 yield if deployable array detected as stowed
+        // Detected track models what each array actually produces given its
+        // detected state: stowed -> no yield; actually deployed -> yield
+        // without the ideal track's gust stow gate (it is out there
+        // producing); unknown -> fall back to the gated estimate
         const detectedState = detectedDeployStates?.get(array.id);
         if (array.type === "deployable" && detectedState === "stowed") {
           detectedSolarYieldWh += 0;
+        } else if (
+          array.type === "deployable" &&
+          detectedState === "deployed"
+        ) {
+          detectedSolarYieldWh += predictSolarHour({
+            array,
+            sunPosition: sunPos,
+            ghi,
+            windGustKnots,
+            efficiency,
+            skipStowGate: true,
+          });
         } else {
           detectedSolarYieldWh += arrayYield;
         }
@@ -1368,10 +1396,25 @@ class PredictionEngine {
         }
         mechanicalYieldWh += genYield;
 
-        // Detected track: 0 yield if deployable generator detected as stowed
+        // Detected track models what each generator actually produces:
+        // stowed -> no yield; actually up (deployed, or a fixed mount that
+        // cannot be stowed) -> yield without the ideal track's stow gates;
+        // unknown -> fall back to the gated estimate
         const detectedState = detectedDeployStates?.get(generator.id);
         if (generator.deployable && detectedState === "stowed") {
           detectedMechanicalYieldWh += 0;
+        } else if (
+          generator.type === "wind" &&
+          (!generator.deployable || detectedState === "deployed")
+        ) {
+          detectedMechanicalYieldWh += predictWindHour({
+            generator,
+            windSpeedKnots,
+            gustSpeedKnots: windGustKnots,
+            isSailing,
+            navState,
+            skipStowGate: true,
+          });
         } else {
           detectedMechanicalYieldWh += genYield;
         }

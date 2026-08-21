@@ -104,7 +104,7 @@ $$GHI_{\text{forecast}} = GHI_{\text{clear}} \cdot \left(1 - 0.75 \cdot C^{3.4}\
 
 Before updating the model, the telemetry tick must pass these booleans. If any are `true`, the tick is dropped:
 
-* `engine.rpm > 0`
+* Any engine running: `propulsion.*.state == 'started'` or `propulsion.*.revolutions > 0` (per-instance, mirroring signalk-autostate's detection — state is preferred, revolutions covers engines without state instrumentation; multi-engine vessels scan all instances)
 * `battery.soc >= 0.80`
 * `ac.shorePower.connected == true`
 * `controller.mode != 'bulk'` (If mode data is available)
@@ -176,6 +176,7 @@ If the rolling energy balance projects the SoC will drop below `config.battery.m
 * `environment.wind.angleApparent`, `environment.wind.speedApparent`
 * `environment.forecast.time.*.cloudCover` & `*.wind.speedGust`
 * `electrical.solar.*.panelPower`, `electrical.batteries.*.capacity.stateOfCharge`
+* `propulsion.*.state`, `propulsion.*.revolutions` (engine running detection for the learning gate)
 
 ### 6.2 Published Deltas (Outputs)
 

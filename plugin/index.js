@@ -26,6 +26,54 @@ const { sunPosition } = require("./solar.js");
 const { formatWh } = require("./format.js");
 
 /**
+ * Matches propulsion instance paths, e.g. `propulsion.main.state`.
+ * Instance names follow the signalk-autostate convention (letters/digits).
+ */
+const PROPULSION_STATE_RE = /^propulsion\.([A-Za-z0-9]+)\.state$/;
+const PROPULSION_REVOLUTIONS_RE = /^propulsion\.([A-Za-z0-9]+)\.revolutions$/;
+
+/**
+ * Detects whether any engine is running from per-instance propulsion
+ * values, mirroring signalk-autostate's detection: an engine counts as
+ * running when its `state` is `started`, or when `revolutions` > 0 (not
+ * all engines instrument state). Multi-engine vessels (catamarans, larger
+ * power boats) are handled by scanning all instances.
+ *
+ * @param {Map<string, unknown>} pathValues - Path → value map (delta state)
+ * @returns {boolean|null} true if any engine runs, false if all stopped, null if unknown
+ */
+function detectEngineRunning(pathValues) {
+  let anyRunning = false;
+  let anySignal = false;
+
+  for (const [path, value] of pathValues) {
+    if (value == null) {
+      continue;
+    }
+    const stateMatch = PROPULSION_STATE_RE.exec(path);
+    if (stateMatch) {
+      anySignal = true;
+      if (value === "started") {
+        anyRunning = true;
+      }
+      continue;
+    }
+    const revMatch = PROPULSION_REVOLUTIONS_RE.exec(path);
+    if (revMatch) {
+      const rpm = toNumber(value);
+      if (rpm != null) {
+        anySignal = true;
+        if (rpm > 0) {
+          anyRunning = true;
+        }
+      }
+    }
+  }
+
+  return anySignal ? anyRunning : null;
+}
+
+/**
  * Default configuration values.
  */
 const DEFAULT_CONFIG = {
@@ -68,6 +116,8 @@ const SUBSCRIPTION_PATHS = [
   "electrical.batteries.house.capacity.stateOfCharge",
   "electrical.venus.dcPower",
   "electrical.venus.acPower",
+  "propulsion.*.state",
+  "propulsion.*.revolutions",
 ];
 
 /**
@@ -862,9 +912,7 @@ module.exports = (app) => {
 
         // Build sanitization gate readings (prefer delta state, fall back to app.getSelfPath)
         const readings = {
-          engineRpm:
-            deltaState.get("propulsion.engine.revolutions") ||
-            app.getSelfPath("propulsion.engine.revolutions"),
+          engineRunning: detectEngineRunning(deltaState),
           batterySoc:
             deltaState.get(
               pluginConfig.battery?.socPath ||

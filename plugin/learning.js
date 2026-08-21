@@ -169,18 +169,18 @@ function emaUpdate(existingEfficiency, observedEfficiency, alpha = EMA_ALPHA) {
  * Data sanitization gate - checks if telemetry tick should be used for learning.
  *
  * @param {object} readings - Telemetry readings
- * @param {number|null} readings.engineRpm - Engine RPM
+ * @param {boolean|null} readings.engineRunning - Any engine running (started state or revolutions > 0)
  * @param {number|null} readings.batterySoc - Battery state of charge [0, 1]
  * @param {boolean|null} readings.shorePowerConnected - Shore power connected
  * @param {string|null} readings.controllerMode - Charge controller mode
  * @returns {boolean} True if tick is valid for learning
  */
 function isValidTick(readings) {
-  const { engineRpm, batterySoc, shorePowerConnected, controllerMode } =
+  const { engineRunning, batterySoc, shorePowerConnected, controllerMode } =
     readings;
 
   // Engine running - drop tick (alternator charging confounds solar reading)
-  if (engineRpm != null && engineRpm > 0) {
+  if (engineRunning === true) {
     return false;
   }
 

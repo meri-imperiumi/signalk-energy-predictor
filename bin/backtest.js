@@ -292,7 +292,7 @@ async function backtestArray({
       sunElevationRad: sunPos.altitude,
       awaRad: null,
       readings: {
-        engineRpm: 0,
+        engineRunning: false,
         batterySoc: 0.5,
         shorePowerConnected: false,
       },

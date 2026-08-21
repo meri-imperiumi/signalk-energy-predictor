@@ -122,7 +122,7 @@ test.describe("SolarMatrix", () => {
   test.describe("isValidTick", () => {
     test("passes valid tick", () => {
       const readings = {
-        engineRpm: 0,
+        engineRunning: false,
         batterySoc: 0.6,
         shorePowerConnected: false,
         controllerMode: "bulk",
@@ -132,7 +132,7 @@ test.describe("SolarMatrix", () => {
 
     test("rejects when engine is running", () => {
       const readings = {
-        engineRpm: 1500,
+        engineRunning: true,
         batterySoc: 0.6,
         shorePowerConnected: false,
       };
@@ -141,7 +141,7 @@ test.describe("SolarMatrix", () => {
 
     test("rejects when battery is full", () => {
       const readings = {
-        engineRpm: 0,
+        engineRunning: false,
         batterySoc: 0.9,
         shorePowerConnected: false,
       };
@@ -150,7 +150,7 @@ test.describe("SolarMatrix", () => {
 
     test("rejects when shore power is connected", () => {
       const readings = {
-        engineRpm: 0,
+        engineRunning: false,
         batterySoc: 0.6,
         shorePowerConnected: true,
       };
@@ -159,7 +159,7 @@ test.describe("SolarMatrix", () => {
 
     test("rejects when controller mode is not bulk", () => {
       const readings = {
-        engineRpm: 0,
+        engineRunning: false,
         batterySoc: 0.6,
         shorePowerConnected: false,
         controllerMode: "absorption",
@@ -169,7 +169,7 @@ test.describe("SolarMatrix", () => {
 
     test("passes when controller mode is null", () => {
       const readings = {
-        engineRpm: 0,
+        engineRunning: false,
         batterySoc: 0.6,
         shorePowerConnected: false,
         controllerMode: null,
@@ -207,7 +207,7 @@ test.describe("SolarMatrix", () => {
         sunElevationRad: Math.PI / 6,
         awaRad: null,
         readings: {
-          engineRpm: 0,
+          engineRunning: false,
           batterySoc: 0.6,
           shorePowerConnected: false,
         },
@@ -226,7 +226,7 @@ test.describe("SolarMatrix", () => {
         sunElevationRad: Math.PI / 6,
         awaRad: null,
         readings: {
-          engineRpm: 1500,
+          engineRunning: true,
           batterySoc: 0.6,
           shorePowerConnected: false,
         },
@@ -245,7 +245,7 @@ test.describe("SolarMatrix", () => {
         sunElevationRad: Math.PI / 6,
         awaRad: null,
         readings: {
-          engineRpm: 0,
+          engineRunning: false,
           batterySoc: 0.6,
           shorePowerConnected: false,
         },
