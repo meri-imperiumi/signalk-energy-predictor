@@ -115,12 +115,14 @@ function predictSolarHour({
  * @param {boolean} params.generator.deployable - Whether generator is deployable
  * @param {CurvePoint[]} params.generator.curve - Power curve
  * @param {number} params.windSpeedKnots - Average wind speed in knots
+ * @param {number} [params.gustSpeedKnots] - Gust speed in knots (deployable: stow if exceeds max)
  * @param {boolean} params.isSailing - Whether vessel is sailing (affects deployable yield)
  * @returns {number} Predicted yield in watt-hours for the hour
  */
 function predictWindHour({
   generator,
   windSpeedKnots,
+  gustSpeedKnots,
   isSailing = false,
   navState = "unknown",
 }) {
@@ -133,6 +135,15 @@ function predictWindHour({
   // Apply wind speed limit
   if (windSpeedKnots > maxWind) {
     return 0; // Exceeds limit, would be stowed
+  }
+
+  // Deployable wind generators: stow if gusts exceed the max limit
+  if (
+    generator.deployable &&
+    gustSpeedKnots != null &&
+    gustSpeedKnots >= maxWind
+  ) {
+    return 0; // Gusts exceed limit, would be stowed
   }
 
   // Deployable wind generators are used at anchor/moored, NOT under way
@@ -507,7 +518,13 @@ class PredictionEngine {
       for (const point of this.lastForecast) {
         if (generator.type === "wind") {
           const windSpeedKnots = point.windSpeedKnots ?? 0;
-          total += predictWindHour({ generator, windSpeedKnots, isSailing });
+          const gustSpeedKnots = point.gustSpeedKnots ?? 0;
+          total += predictWindHour({
+            generator,
+            windSpeedKnots,
+            gustSpeedKnots,
+            isSailing,
+          });
         } else if (generator.type === "hydro") {
           total += predictHydroHour({
             generator,
@@ -1015,7 +1032,9 @@ class PredictionEngine {
           mechanicalYieldWh += predictWindHour({
             generator,
             windSpeedKnots,
+            gustSpeedKnots: windGustKnots,
             isSailing,
+            navState,
           });
         } else if (generator.type === "hydro") {
           mechanicalYieldWh += predictHydroHour({

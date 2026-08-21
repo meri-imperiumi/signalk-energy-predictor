@@ -1870,6 +1870,74 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
     }
   });
 
+  test("windYieldWh is 0 in hours when gusts exceed max (deployable wind stowed)", () => {
+    const app = makeFakeApp();
+    app.setSelfPath("navigation.position", {
+      latitude: 60,
+      longitude: 18,
+    });
+    app.setSelfPath("navigation.state", "moored");
+
+    const engine = new PredictionEngine({
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [],
+      mechanicalGenerators: [
+        withCurve({
+          id: "windgen",
+          type: "wind",
+          deployable: true,
+          powerPath: "electrical.wind.power",
+          maxWindKnots: 30,
+          startupSpeedKnots: 5,
+          manufacturerCurve: "6,30,8,100,10,170,12,220,14,280",
+        }),
+      ],
+      getEfficiency: () => 0.7,
+      getSelfPath: (path) => app.getSelfPath(path),
+      app,
+    });
+
+    // Gusts exceed max (35kn) for first 3 hours, then drop to 15kn
+    // Wind always 10kn (above startup, below max)
+    const now = new Date("2026-03-20T12:00:00Z");
+    const forecast = Array.from({ length: 24 }, (_, h) => ({
+      time: new Date(now.getTime() + h * 3600000),
+      ghi: 0,
+      cloudCover: 0,
+      gustSpeedKnots: h < 3 ? 35 : 15,
+      windSpeedKnots: 10,
+      windDirectionDeg: null,
+    }));
+    const realNow = Date.now;
+    Date.now = () => now.getTime();
+    try {
+      engine.runPrediction(forecast);
+      // Hours 0-2: gusts 35kn >= max 30kn → windYieldWh should be 0
+      assert.strictEqual(
+        engine.lastPrediction[0].windYieldWh,
+        0,
+        "Hour 0 gusts exceed limit, yield should be 0",
+      );
+      assert.strictEqual(
+        engine.lastPrediction[1].windYieldWh,
+        0,
+        "Hour 1 gusts exceed limit, yield should be 0",
+      );
+      assert.strictEqual(
+        engine.lastPrediction[2].windYieldWh,
+        0,
+        "Hour 2 gusts exceed limit, yield should be 0",
+      );
+      // Hour 3: gusts drop to 15kn, wind 10kn → should generate
+      assert.ok(
+        engine.lastPrediction[3].windYieldWh > 0,
+        "Hour 3 gusts below limit, should generate",
+      );
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
   test("AdvisoryPublisher publishes recommendedStateTime", () => {
     const app = makeFakeApp();
     const pub = new AdvisoryPublisher(app, "test-plugin");
