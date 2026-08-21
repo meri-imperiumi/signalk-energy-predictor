@@ -1,0 +1,14 @@
+name: SignalK Plugin CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+jobs:
+  test:
+    uses: SignalK/signalk-server/.github/workflows/plugin-ci.yml@master
+    with:
+      enable-armv7: false
+      enable-signalk-integration: true
