@@ -8,6 +8,7 @@
  */
 
 const { sunPosition, nextSunrise, lastSunset } = require("./solar.js");
+const { formatWh } = require("./format.js");
 
 /**
  * Prediction horizon in hours
@@ -878,7 +879,7 @@ class PredictionEngine {
           const nightMax = nightBlockMax[h] ?? 0;
           if (nightMax >= gustLimit) {
             state = "stowed";
-            reason = `night gusts up to ${Math.round(nightMax)}kn ≥ limit ${gustLimit}kn`;
+            reason = `forecast night gusts up to ${Math.round(nightMax)}kn ≥ limit ${gustLimit}kn`;
           } else {
             // No night gust risk: keep the previous state until sunrise
             state = prevState.get(array.id) ?? "deployed";
@@ -886,10 +887,10 @@ class PredictionEngine {
           }
         } else if (info.gust >= gustLimit) {
           state = "stowed";
-          reason = `gusts ${Math.round(info.gust)}kn ≥ limit ${gustLimit}kn`;
+          reason = `forecast gusts ${Math.round(info.gust)}kn ≥ limit ${gustLimit}kn`;
         } else {
           state = "deployed";
-          reason = `gusts ${Math.round(info.gust)}kn < limit ${gustLimit}kn`;
+          reason = `forecast gusts ${Math.round(info.gust)}kn < limit ${gustLimit}kn`;
         }
         states.set(array.id, { state, reason });
         prevState.set(array.id, state);
@@ -972,13 +973,13 @@ class PredictionEngine {
           reason = "vessel under way";
         } else if (gustKnots >= maxWindKnots) {
           idealState = "stowed";
-          reason = `gusts ${Math.round(gustKnots)}kn ≥ limit ${maxWindKnots}kn`;
+          reason = `forecast gusts ${Math.round(gustKnots)}kn ≥ limit ${maxWindKnots}kn`;
         } else if (windKnots >= minDeployWind) {
           idealState = "deployed";
-          reason = `wind ${Math.round(windKnots)}kn ≥ startup ${minDeployWind}kn`;
+          reason = `forecast wind ${Math.round(windKnots)}kn ≥ startup ${minDeployWind}kn`;
         } else {
           idealState = "stowed";
-          reason = `wind ${Math.round(windKnots)}kn < startup ${minDeployWind}kn`;
+          reason = `forecast wind ${Math.round(windKnots)}kn < startup ${minDeployWind}kn`;
         }
       } else if (generator.type === "hydro") {
         const minSpeed = generator.minSpeedKnots ?? 3;
@@ -1052,7 +1053,7 @@ class PredictionEngine {
           name,
           type: "solar-deployable",
           recommendedState: "stowed",
-          reason: "Stow - vessel under way",
+          reason: "vessel under way",
           recommendedSide: null,
           recommendedSideTime: null,
         });
@@ -1062,7 +1063,7 @@ class PredictionEngine {
           name,
           type: "solar-deployable",
           recommendedState: "stowed",
-          reason: `Stow - gusts ${Math.round(maxGust)}kn exceed limit of ${gustLimit}kn`,
+          reason: `forecast gusts ${Math.round(maxGust)}kn exceed limit of ${gustLimit}kn`,
           currentGustKnots: maxGust,
           limitKnots: gustLimit,
           recommendedSide: null,
@@ -1073,8 +1074,8 @@ class PredictionEngine {
         const pointing = this.getPointingRecommendation(array);
         let reason =
           maxGust > 0
-            ? `Deploy - gusts ${Math.round(maxGust)}kn below limit of ${gustLimit}kn`
-            : "Deploy - no significant gusts forecast";
+            ? `forecast gusts ${Math.round(maxGust)}kn below limit of ${gustLimit}kn`
+            : "no significant gusts forecast";
         if (pointing) {
           if (pointing.side) {
             reason += `. ${pointing.reason}`;
@@ -1114,8 +1115,8 @@ class PredictionEngine {
             type: "hydro",
             recommendedState: "stowed",
             reason: underway
-              ? `Stow - vessel ${navState}, hydro requires sailing`
-              : "Stow - vessel not sailing",
+              ? `vessel ${navState}, hydro requires sailing`
+              : "vessel not sailing",
           });
         } else if (speedThroughWater >= maxSpeed) {
           recommendations.push({
@@ -1123,7 +1124,7 @@ class PredictionEngine {
             name,
             type: "hydro",
             recommendedState: "stowed",
-            reason: `Stow - boat speed ${speedThroughWater.toFixed(1)}kn exceeds limit of ${maxSpeed}kn`,
+            reason: `boat speed ${speedThroughWater.toFixed(1)}kn exceeds limit of ${maxSpeed}kn`,
             currentSpeedKnots: speedThroughWater,
             limitKnots: maxSpeed,
           });
@@ -1133,7 +1134,7 @@ class PredictionEngine {
             name,
             type: "hydro",
             recommendedState: "deployed",
-            reason: `Deploy - sailing at ${speedThroughWater.toFixed(1)}kn (min ${minSpeed}kn, max ${maxSpeed}kn)`,
+            reason: `sailing at ${speedThroughWater.toFixed(1)}kn (min ${minSpeed}kn, max ${maxSpeed}kn)`,
             currentSpeedKnots: speedThroughWater,
             limitKnots: maxSpeed,
           });
@@ -1143,7 +1144,7 @@ class PredictionEngine {
             name,
             type: "hydro",
             recommendedState: "stowed",
-            reason: `Stow - sailing too slow (${speedThroughWater.toFixed(1)}kn < ${minSpeed}kn)`,
+            reason: `sailing too slow (${speedThroughWater.toFixed(1)}kn < ${minSpeed}kn)`,
             currentSpeedKnots: speedThroughWater,
             limitKnots: minSpeed,
           });
@@ -1159,7 +1160,7 @@ class PredictionEngine {
             name,
             type: "wind",
             recommendedState: "stowed",
-            reason: "Stow - vessel under way",
+            reason: "vessel under way",
           });
         } else if (maxGust >= maxWindKnots) {
           recommendations.push({
@@ -1167,7 +1168,7 @@ class PredictionEngine {
             name,
             type: "wind",
             recommendedState: "stowed",
-            reason: `Stow - gusts ${Math.round(maxGust)}kn exceed limit of ${maxWindKnots}kn`,
+            reason: `forecast gusts ${Math.round(maxGust)}kn exceed limit of ${maxWindKnots}kn`,
             currentGustKnots: maxGust,
             limitKnots: maxWindKnots,
           });
@@ -1177,7 +1178,7 @@ class PredictionEngine {
             name,
             type: "wind",
             recommendedState: "deployed",
-            reason: `Deploy - wind ${Math.round(maxWind)}kn (gusts ${Math.round(maxGust)}kn, limit ${maxWindKnots}kn)`,
+            reason: `forecast wind ${Math.round(maxWind)}kn (gusts ${Math.round(maxGust)}kn)`,
             currentGustKnots: maxGust,
             limitKnots: maxWindKnots,
           });
@@ -1187,7 +1188,7 @@ class PredictionEngine {
             name,
             type: "wind",
             recommendedState: "stowed",
-            reason: `Stow - wind too low (${Math.round(maxWind)}kn < ${minDeployWind}kn)`,
+            reason: `forecast wind too low (${Math.round(maxWind)}kn < ${minDeployWind}kn)`,
           });
         }
       }
@@ -1578,7 +1579,7 @@ class PredictionEngine {
         if (remainingSolar >= deficit * 0.8) {
           return {
             hour: i,
-            reason: `Deficit covered by hour ${i}, ${Math.round(remainingSolar)}Wh solar remaining`,
+            reason: `Deficit covered by hour ${i}, ${formatWh(remainingSolar)} solar remaining`,
           };
         }
       }

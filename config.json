@@ -237,6 +237,22 @@
           "minimum": 10,
           "maximum": 1440
         },
+        "minIntervalSeconds": {
+          "type": "number",
+          "title": "Minimum Learning Interval",
+          "description": "Minimum time between learning cycles (seconds). Solar power deltas arriving within the interval are accumulated into the running average",
+          "default": 60,
+          "minimum": 5,
+          "maximum": 3600
+        },
+        "averageWindowSeconds": {
+          "type": "number",
+          "title": "Power Averaging Window",
+          "description": "Running-average window for solar power values fed to learning (seconds)",
+          "default": 300,
+          "minimum": 60,
+          "maximum": 1800
+        },
         "emaAlpha": {
           "type": "number",
           "title": "EMA Smoothing Factor",

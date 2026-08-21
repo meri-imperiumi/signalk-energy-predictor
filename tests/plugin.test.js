@@ -501,3 +501,193 @@ test.describe("Signal K API interactions", () => {
     await plugin.stop();
   });
 });
+
+test.describe("Solar learning regression", () => {
+  test("learning cycle survives solar power delta with GPS position", async () => {
+    // Regression: the learning debug line read sunPos.elevation, but
+    // sunPosition() returns { altitude, azimuth }. The resulting
+    // "Cannot read properties of undefined (reading 'toFixed')" threw
+    // before matrix.update(), breaking learning entirely
+    const app = new FakeSignalKApp();
+    const plugin = makePlugin(app);
+    const testDir = await mkdtemp(join(tmpdir(), "energy-learn-"));
+
+    // Position at the local-noon meridian on the equator, so the sun is
+    // well above the horizon and clear-sky GHI is positive regardless of
+    // when the test runs
+    const now = new Date();
+    const utcHours = now.getUTCHours() + now.getUTCMinutes() / 60;
+    const longitude = (12 - utcHours) * 15;
+    const latitude = 0;
+
+    const powerPath = "electrical.solar.cabin-roof.panelPower";
+    const config = {
+      battery: {
+        capacityAh: 400,
+        systemVoltage: 12,
+        minSafeSoC: 0.2,
+        socPath: "electrical.batteries.house.capacity.stateOfCharge",
+      },
+      solarArrays: [
+        {
+          id: "cabin-roof",
+          type: "fixed",
+          capacityWp: 200,
+          powerPath,
+          enabled: true,
+        },
+      ],
+      mechanicalGenerators: [],
+      learning: {
+        enabled: true,
+        saveIntervalMinutes: 60,
+        emaAlpha: 0.05,
+        defaultEfficiency: 0.7,
+      },
+      weather: {
+        openMeteoEnabled: false,
+        useLogbook: false,
+      },
+    };
+
+    app.dataPath = testDir;
+    await plugin.start(config, () => {});
+
+    app.subscriptionmanager.subscriptions.forEach(({ deltaHandler }) => {
+      deltaHandler({
+        context: app.selfId,
+        updates: [
+          {
+            values: [
+              { path: "navigation.position", value: { latitude, longitude } },
+              {
+                path: "electrical.batteries.house.capacity.stateOfCharge",
+                value: 0.5,
+              },
+              { path: "navigation.state", value: "anchored" },
+              { path: powerPath, value: 42 },
+            ],
+          },
+        ],
+      });
+    });
+
+    // Learning runs asynchronously off the delta
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    const learningErrors = (app.errors || []).filter((e) =>
+      String(e).includes("Failed to process delta for learning"),
+    );
+    assert.deepStrictEqual(learningErrors, []);
+
+    // The learning matrix must actually have been updated
+    const matrix = plugin.__getInternals().solarMatrices.get("cabin-roof");
+    assert.ok(matrix, "matrix exists for array");
+    assert.ok(matrix.anchored.size > 0, "learning updated a matrix bin");
+
+    await plugin.stop();
+  });
+
+  test("burst of solar deltas runs a single throttled learning cycle using the running average", async () => {
+    const app = new FakeSignalKApp();
+    const plugin = makePlugin(app);
+    const testDir = await mkdtemp(join(tmpdir(), "energy-burst-"));
+
+    // Position at the local-noon meridian on the equator so the sun is up
+    const now = new Date();
+    const utcHours = now.getUTCHours() + now.getUTCMinutes() / 60;
+    const longitude = (12 - utcHours) * 15;
+    const latitude = 0;
+
+    const powerPath = "electrical.solar.cabin-roof.panelPower";
+    const config = {
+      battery: {
+        capacityAh: 400,
+        systemVoltage: 12,
+        minSafeSoC: 0.2,
+        socPath: "electrical.batteries.house.capacity.stateOfCharge",
+      },
+      solarArrays: [
+        {
+          id: "cabin-roof",
+          type: "fixed",
+          capacityWp: 200,
+          powerPath,
+          enabled: true,
+        },
+      ],
+      mechanicalGenerators: [],
+      learning: {
+        enabled: true,
+        minIntervalSeconds: 60,
+        averageWindowSeconds: 300,
+      },
+      weather: {
+        openMeteoEnabled: false,
+        useLogbook: false,
+      },
+    };
+
+    app.dataPath = testDir;
+    await plugin.start(config, () => {});
+    assert.strictEqual(plugin.__getInternals().learningCycleCount, 0);
+
+    // Burst of fast-changing readings - learning must not run per delta
+    const emit = (value) => {
+      app.subscriptionmanager.subscriptions.forEach(({ deltaHandler }) => {
+        deltaHandler({
+          context: app.selfId,
+          updates: [
+            {
+              values: [
+                { path: "navigation.position", value: { latitude, longitude } },
+                {
+                  path: "electrical.batteries.house.capacity.stateOfCharge",
+                  value: 0.5,
+                },
+                { path: "navigation.state", value: "anchored" },
+                { path: powerPath, value },
+              ],
+            },
+          ],
+        });
+      });
+    };
+    emit(40);
+    emit(20);
+    emit(40);
+
+    await new Promise((resolve) => setTimeout(resolve, 300));
+
+    const internals = plugin.__getInternals();
+    assert.strictEqual(
+      internals.learningCycleCount,
+      1,
+      "burst of deltas should produce exactly one learning cycle",
+    );
+
+    // The cycle must have used the running average (40+20+40)/3 = 33.33W,
+    // not the instantaneous last value 40W: verify via the EMA bin value.
+    const { sunPosition, maxIrradiance } = require("../plugin/solar.js");
+    const { anchoredKey, theoreticalPower } = require("../plugin/learning.js");
+    const sunPos = sunPosition(new Date(), latitude, longitude);
+    const ghi = maxIrradiance(sunPos.altitude);
+    const avgPower = 100 / 3;
+    const eta = Math.min(
+      1,
+      Math.max(0, avgPower / theoreticalPower(200, ghi, sunPos.altitude)),
+    );
+    const expectedBin = 0.05 * eta + 0.95 * 0.7;
+
+    const matrix = internals.solarMatrices.get("cabin-roof");
+    assert.ok(matrix);
+    const key = anchoredKey(sunPos.azimuth, sunPos.altitude);
+    assert.ok(matrix.anchored.has(key), "sun bin updated");
+    assert.ok(
+      Math.abs(matrix.anchored.get(key) - expectedBin) < 0.01,
+      `bin ${matrix.anchored.get(key)} should match EMA of averaged power (expected ~${expectedBin.toFixed(3)})`,
+    );
+
+    await plugin.stop();
+  });
+});

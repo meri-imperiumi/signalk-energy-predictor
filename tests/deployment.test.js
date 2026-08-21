@@ -246,6 +246,9 @@ test.describe("Deployment recommendations: wind generators", () => {
       .getDeploymentRecommendations()
       .find((r) => r.id === "windgen");
     assert.strictEqual(rec.recommendedState, "deployed");
+    // Values are forecast-derived and labeled as such, without a
+    // "Deploy - " prefix (the action lives in recommendedState)
+    assert.strictEqual(rec.reason, "forecast wind 12kn (gusts 15kn)");
   });
 
   test("stows wind generator when wind too low", () => {
@@ -550,6 +553,75 @@ test.describe("Missed yield calculation", () => {
     assert.match(notif.value.message, /850Wh in 24h/);
   });
 
+  test("notification message joins action with comma and formats kWh", () => {
+    const app = makeFakeApp();
+    app.selfId = "self";
+    const pub = new AdvisoryPublisher(app, "test-plugin");
+    const recs = [
+      {
+        id: "windgen",
+        name: "Superwind 350",
+        type: "wind",
+        recommendedState: "deployed",
+        reason: "forecast wind 19kn (gusts 24kn)",
+        missedYieldWh: 3470,
+      },
+    ];
+    const currentStates = new Map([["windgen", "stowed"]]);
+
+    pub.publishDeploymentStates(recs, currentStates);
+
+    const notifCalls = app.handleMessageCalls
+      .filter(
+        (c) =>
+          c.msg.updates &&
+          c.msg.updates[0].values.some((v) =>
+            v.path.startsWith("notifications."),
+          ),
+      )
+      .flatMap((c) => c.msg.updates[0].values);
+    const notif = notifCalls.find((v) => v.path.startsWith("notifications."));
+    assert.ok(notif);
+    assert.strictEqual(
+      notif.value.message,
+      "Superwind 350: Deploy now, forecast wind 19kn (gusts 24kn) (3.5kWh in 24h)",
+    );
+  });
+
+  test("notification message for stow uses comma join", () => {
+    const app = makeFakeApp();
+    app.selfId = "self";
+    const pub = new AdvisoryPublisher(app, "test-plugin");
+    const recs = [
+      {
+        id: "flinsail",
+        name: "FLINsail",
+        type: "solar-deployable",
+        recommendedState: "stowed",
+        reason: "forecast gusts 24kn exceed limit of 20kn",
+      },
+    ];
+    const currentStates = new Map([["flinsail", "deployed"]]);
+
+    pub.publishDeploymentStates(recs, currentStates);
+
+    const notifCalls = app.handleMessageCalls
+      .filter(
+        (c) =>
+          c.msg.updates &&
+          c.msg.updates[0].values.some((v) =>
+            v.path.startsWith("notifications."),
+          ),
+      )
+      .flatMap((c) => c.msg.updates[0].values);
+    const notif = notifCalls.find((v) => v.path.startsWith("notifications."));
+    assert.ok(notif);
+    assert.strictEqual(
+      notif.value.message,
+      "FLINsail: Stow now, forecast gusts 24kn exceed limit of 20kn",
+    );
+  });
+
   test("missedYieldWh is published as a delta value", () => {
     const app = makeFakeApp();
     app.selfId = "self";
@@ -697,6 +769,40 @@ test.describe("AdvisoryPublisher deployment states", () => {
       v.path.startsWith("notifications."),
     );
     assert.strictEqual(notif.value.state, "normal");
+  });
+
+  test("normal notification includes potential yield for deployed recommendation", () => {
+    const { app, pub } = makePublisher();
+    const recs = [
+      {
+        id: "windgen",
+        name: "Superwind 350",
+        type: "wind",
+        recommendedState: "deployed",
+        reason: "forecast wind 19kn (gusts 24kn)",
+        missedYieldWh: 3470,
+      },
+    ];
+    const currentStates = new Map([["windgen", "deployed"]]);
+
+    pub.publishDeploymentStates(recs, currentStates);
+
+    const notifCalls = app.handleMessageCalls.filter(
+      (c) =>
+        c.msg.updates &&
+        c.msg.updates[0].values.some((v) =>
+          v.path.startsWith("notifications."),
+        ),
+    );
+    const notif = notifCalls[0].msg.updates[0].values.find((v) =>
+      v.path.startsWith("notifications."),
+    );
+    assert.ok(notif);
+    assert.strictEqual(notif.value.state, "normal");
+    assert.strictEqual(
+      notif.value.message,
+      "Superwind 350: forecast wind 19kn (gusts 24kn) (3.5kWh in 24h)",
+    );
   });
 
   test("publishes null detectedState when current state unknown", () => {

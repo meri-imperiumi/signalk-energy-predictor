@@ -23,6 +23,7 @@ const {
   validateConfig,
 } = require("./schema.js");
 const { sunPosition } = require("./solar.js");
+const { formatWh } = require("./format.js");
 
 /**
  * Default configuration values.
@@ -299,7 +300,7 @@ module.exports = (app) => {
           (sum, p) => sum + p.idealSolarYieldWh + p.idealWindYieldWh,
           0,
         );
-        status += ` 24h: ${Math.round(totalYield24h)}Wh`;
+        status += ` 24h: ${formatWh(totalYield24h)}`;
       }
 
       // Add weather source
@@ -581,6 +582,20 @@ module.exports = (app) => {
   const WIND_SAMPLE_INTERVAL_MS = 30 * 1000; // 30 seconds
 
   /**
+   * Rolling solar power samples per path for running averages.
+   * @type {Map<string, {value: number, time: number}[]>}
+   */
+  const solarPowerHistory = new Map();
+  const DEFAULT_LEARNING_INTERVAL_MS = 60 * 1000;
+  const DEFAULT_POWER_AVERAGE_WINDOW_MS = 5 * 60 * 1000;
+
+  let lastLearningRun = 0;
+  let learningRunning = false;
+  let learningPending = false;
+  let learningTimer = null;
+  let learningCycleCount = 0;
+
+  /**
    * Processes a delta update.
    * Reads values from the delta and stores them in deltaState for later use.
    * Only triggers learning when solar power values are received.
@@ -634,6 +649,22 @@ module.exports = (app) => {
             // Track if this is a solar power path we care about
             if (solarPowerPaths.has(v.path)) {
               solarPowerDelta.push(v.path);
+
+              // Record sample for running average (learning uses the
+              // averaged value instead of the instantaneous reading)
+              const powerW = toNumber(v.value);
+              if (powerW != null) {
+                const sampleTime = update.timestamp
+                  ? new Date(update.timestamp).getTime()
+                  : Date.now();
+                const samples = solarPowerHistory.get(v.path) || [];
+                samples.push({ value: powerW, time: sampleTime });
+                const cutoff = sampleTime - DEFAULT_POWER_AVERAGE_WINDOW_MS;
+                while (samples.length > 0 && samples[0].time < cutoff) {
+                  samples.shift();
+                }
+                solarPowerHistory.set(v.path, samples);
+              }
             }
 
             // Track wind speed history for wind generator spin-up detection
@@ -678,9 +709,75 @@ module.exports = (app) => {
         return;
       }
 
-      app.debug(
-        `Learning triggered by solar power delta: ${JSON.stringify(solarPowerDelta)}`,
-      );
+      scheduleLearning();
+    } catch (error) {
+      app.error(`Failed to process delta for learning: ${error.message}`);
+    }
+  }
+
+  /**
+   * Schedules a learning cycle, throttled to the configured minimum
+   * interval. Deltas arriving while a cycle is in progress or within the
+   * throttle window set the pending flag so a trailing cycle runs with the
+   * latest averaged values.
+   *
+   * @returns {void}
+   */
+  function scheduleLearning() {
+    const learning = pluginConfig?.learning || DEFAULT_CONFIG.learning;
+    const minIntervalMs =
+      (learning.minIntervalSeconds ?? DEFAULT_LEARNING_INTERVAL_MS / 1000) *
+      1000;
+
+    if (learningTimer != null) {
+      // A cycle is already scheduled; it will pick up the latest samples
+      learningPending = true;
+      return;
+    }
+
+    const wait = Math.max(0, lastLearningRun + minIntervalMs - Date.now());
+    learningTimer = setTimeout(() => {
+      learningTimer = null;
+      runLearningCycle().catch((error) => {
+        app.error(`Learning cycle error: ${error.message}`);
+      });
+    }, wait);
+  }
+
+  /**
+   * Runs a single learning cycle, guarding against concurrent runs.
+   *
+   * @returns {Promise<void>}
+   */
+  async function runLearningCycle() {
+    if (learningRunning) {
+      learningPending = true;
+      return;
+    }
+    learningRunning = true;
+    lastLearningRun = Date.now();
+    try {
+      await processSolarLearning();
+    } catch (error) {
+      app.error(`Failed to process delta for learning: ${error.message}`);
+    } finally {
+      learningRunning = false;
+      if (learningPending) {
+        learningPending = false;
+        scheduleLearning();
+      }
+    }
+  }
+
+  /**
+   * Runs one learning pass over all configured solar arrays using the
+   * running-average power values.
+   *
+   * @returns {Promise<void>}
+   */
+  async function processSolarLearning() {
+    try {
+      app.debug("Learning cycle starting...");
 
       // Get current GHI (will use cached forecast if available)
       const currentGHI = await ingestionFSM.getCurrentGHI();
@@ -717,10 +814,21 @@ module.exports = (app) => {
           continue;
         }
 
-        // Read current power output from delta state
-        const powerReading =
-          deltaState.get(powerPath) || app.getSelfPath(powerPath);
-        const actualPowerW = toNumber(powerReading);
+        // Use running average of recent samples instead of the
+        // instantaneous reading (cloud transients and fast MPPT swings
+        // would otherwise dominate the EMA update)
+        const samples = solarPowerHistory.get(powerPath) || [];
+        const windowMs =
+          (pluginConfig?.learning?.averageWindowSeconds ??
+            DEFAULT_POWER_AVERAGE_WINDOW_MS / 1000) * 1000;
+        const windowSamples = samples.filter((s) => s.time >= Date.now() - windowMs);
+        const actualPowerW =
+          windowSamples.length > 0
+            ? windowSamples.reduce((sum, s) => sum + s.value, 0) /
+              windowSamples.length
+            : toNumber(
+                deltaState.get(powerPath) || app.getSelfPath(powerPath),
+              );
 
         if (actualPowerW == null || actualPowerW <= 0) {
           app.debug(
@@ -743,7 +851,7 @@ module.exports = (app) => {
         const { sunPosition } = await import("./solar.js");
         const sunPos = sunPosition(new Date(), pos.latitude, pos.longitude);
         app.debug(
-          `Array ${array.id}: sun at ${sunPos.azimuth.toFixed(1)}° azimuth, ${sunPos.elevation.toFixed(1)}° elevation`,
+          `Array ${array.id}: sun at ${sunPos.azimuth.toFixed(1)}° azimuth, ${sunPos.altitude.toFixed(1)}° altitude`,
         );
 
         // Get matrix
@@ -792,8 +900,9 @@ module.exports = (app) => {
       if (updatedArrays > 0) {
         app.debug(`Learning cycle complete: updated ${updatedArrays} arrays`);
       }
+      learningCycleCount++;
     } catch (error) {
-      app.error(`Failed to process delta for learning: ${error.message}`);
+      app.error(`Failed to process learning cycle: ${error.message}`);
     }
   }
 
@@ -878,6 +987,15 @@ module.exports = (app) => {
 
       // Populate solar power paths set for delta filtering
       solarPowerPaths.clear();
+      solarPowerHistory.clear();
+      lastLearningRun = 0;
+      learningRunning = false;
+      learningPending = false;
+      learningCycleCount = 0;
+      if (learningTimer != null) {
+        clearTimeout(learningTimer);
+        learningTimer = null;
+      }
       for (const array of getActiveSolarArrays(config)) {
         if (array.powerPath) {
           solarPowerPaths.add(array.powerPath);
@@ -975,6 +1093,11 @@ module.exports = (app) => {
         saveIntervalId = null;
       }
 
+      if (learningTimer != null) {
+        clearTimeout(learningTimer);
+        learningTimer = null;
+      }
+
       // Unsubscribe from deltas
       for (const unsubscribe of unsubscribes) {
         unsubscribe();
@@ -1020,7 +1143,11 @@ module.exports = (app) => {
     ingestionFSM,
     predictionEngine,
     advisoryPublisher,
+    solarMatrices,
     runPredictionCycle,
+    get learningCycleCount() {
+      return learningCycleCount;
+    },
   });
 
   // Export dependencies for testing

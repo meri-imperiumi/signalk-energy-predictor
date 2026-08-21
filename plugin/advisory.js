@@ -8,6 +8,8 @@
 
 /** @typedef {import("@signalk/server-api").ServerAPI} ServerAPI */
 
+const { formatWh } = require("./format.js");
+
 /**
  * FLINsail deployment advisory states.
  * @enum {string}
@@ -235,23 +237,30 @@ class AdvisoryPublisher {
       const needsChange =
         currentState !== null && currentState !== rec.recommendedState;
 
+      // Potential yield when deployed - shown both for deploy prompts and
+      // normal-state informational messages
+      const yieldSuffix =
+        rec.recommendedState === "deployed" && rec.missedYieldWh > 0
+          ? ` (${formatWh(rec.missedYieldWh)} in 24h)`
+          : "";
+
       if (needsChange) {
         const action = rec.recommendedState === "deployed" ? "Deploy" : "Stow";
         const state =
           rec.recommendedState === "deployed"
             ? DeployState.WARN
             : DeployState.ALERT;
-        let message = `${rec.name}: ${action} now - ${rec.reason}`;
-        if (rec.recommendedState === "deployed" && rec.missedYieldWh > 0) {
-          message += ` (${rec.missedYieldWh}Wh in 24h)`;
-        }
-        this.publishNotification(`deploy_${rec.id}`, state, message);
+        this.publishNotification(
+          `deploy_${rec.id}`,
+          state,
+          `${rec.name}: ${action} now, ${rec.reason}${yieldSuffix}`,
+        );
       } else {
         // State matches or unknown - clear any existing notification
         this.publishNotification(
           `deploy_${rec.id}`,
           DeployState.NORMAL,
-          `${rec.name}: ${rec.reason}`,
+          `${rec.name}: ${rec.reason}${yieldSuffix}`,
         );
       }
     }
