@@ -7,11 +7,7 @@
  * @file prediction.js
  */
 
-const {
-  sunPosition,
-  maxIrradiance,
-  irradianceFromCloudCover,
-} = require("./solar.js");
+const { sunPosition, nextSunrise } = require("./solar.js");
 
 /**
  * Prediction horizon in hours
@@ -256,6 +252,41 @@ function toNumber(v) {
 const MS_TO_KN = 1.94384;
 
 /**
+ * Normalizes an angle to [-π, π).
+ * @param {number} a - Angle in radians
+ * @returns {number} Normalized angle
+ */
+function normalizeAngle(a) {
+  let r = a;
+  while (r >= Math.PI) r -= 2 * Math.PI;
+  while (r < -Math.PI) r += 2 * Math.PI;
+  return r;
+}
+
+/**
+ * Formats a bearing (radians) as a compass bearing string (e.g. "090°").
+ * @param {number} rad - Bearing in radians
+ * @returns {string} Bearing in degrees, 3-digit
+ */
+function formatBearing(rad) {
+  const deg = ((rad * 180) / Math.PI + 360) % 360;
+  return `${Math.round(deg).toString().padStart(3, "0")}°`;
+}
+
+/**
+ * Formats a Date as a 24-hour time string (HH:MM).
+ * @param {Date} date - Date to format
+ * @returns {string} Formatted time
+ */
+function formatTime(date) {
+  return date.toLocaleTimeString("en-GB", {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+}
+
+/**
  * Converts a Signal K speed value (m/s) to knots.
  * Handles plain numbers and {value: number} objects.
  * @param {number|object|null} v - Speed in m/s
@@ -344,6 +375,22 @@ class PredictionEngine {
    */
   getSpeedThroughWater() {
     return toKnots(this.getSelfPath("navigation.speedThroughWater"));
+  }
+
+  /**
+   * Gets the current true heading in radians.
+   * Signal K heading is in radians (0 = north, positive clockwise).
+   * @returns {number|null} Heading in radians, or null if unavailable
+   */
+  getHeadingTrue() {
+    const h = this.getSelfPath("navigation.headingTrue");
+    const val = toNumber(h);
+    if (val == null || isNaN(val)) return null;
+    // Normalize to [-π, π)
+    let heading = val;
+    while (heading >= Math.PI) heading -= 2 * Math.PI;
+    while (heading < -Math.PI) heading += 2 * Math.PI;
+    return heading;
   }
 
   /**
@@ -476,6 +523,126 @@ class PredictionEngine {
   }
 
   /**
+   * Computes a pointing recommendation (port/starboard) for a deployable solar array.
+   *
+   * During daytime (sun above horizon), side is based on the sun's current
+   * azimuth relative to the boat's heading. After sunset, it targets the next
+   * sunrise so the crew can set the sail overnight for first light.
+   *
+   * For the morning case, if the boat is anchored/moored the predicted heading
+   * at sunrise is estimated from the forecast wind direction (boats point into
+   * the wind). Falls back to current heading with a caveat if no wind direction
+   * forecast is available.
+   *
+   * @param {object} _array - Solar array config (must be type "deployable")
+   * @returns {{side: string|null, targetTime: string|null, reason: string|null}|null}
+   */
+  getPointingRecommendation(_array) {
+    const pos = this.getSelfPath("navigation.position");
+    const lat = pos?.latitude;
+    const lon = pos?.longitude;
+    if (lat == null || lon == null) {
+      return { side: null, targetTime: null, reason: "No GPS position" };
+    }
+
+    const now = new Date(Date.now());
+    const sunPos = sunPosition(now, lat, lon);
+
+    // Threshold: altitude > ~1° → daytime; ≤ 0° → morning; (0°, 1°] ambiguous → day
+    const DAYTIME_THRESHOLD = 0.0175; // ~1 degree in radians
+
+    // Sun above ~1° → clear daytime; ≤ 0° → morning; (0°, 1°] ambiguous → day
+    if (sunPos.altitude > DAYTIME_THRESHOLD) {
+      // Daytime: use current heading
+      const heading = this.getHeadingTrue();
+      if (heading == null) {
+        return {
+          side: null,
+          targetTime: null,
+          reason: "No heading — cannot determine side",
+        };
+      }
+      const rel = normalizeAngle(sunPos.azimuth - heading);
+      const side = rel > 0 ? "starboard" : rel < 0 ? "port" : null;
+      if (side == null) {
+        return {
+          side: null,
+          targetTime: now.toISOString(),
+          reason: "Sun near dead ahead/astern — no side preference",
+        };
+      }
+      return {
+        side,
+        targetTime: now.toISOString(),
+        reason: `Point ${side} — sun at ${formatBearing(sunPos.azimuth)}`,
+      };
+    }
+
+    // Morning: compute next sunrise
+    const sunrise = nextSunrise(now, lat, lon);
+    if (!sunrise) {
+      return {
+        side: null,
+        targetTime: null,
+        reason: "No sunrise in near future",
+      };
+    }
+    const sunrisePos = sunPosition(sunrise, lat, lon);
+
+    // For anchored/moored boats, predict heading from forecast wind direction
+    let predictedHeading = this.getForecastWindDirectionAt(sunrise);
+    let caveat = "";
+    if (predictedHeading == null) {
+      predictedHeading = this.getHeadingTrue();
+      caveat = " (assuming current heading holds)";
+    }
+    if (predictedHeading == null) {
+      return {
+        side: null,
+        targetTime: sunrise.toISOString(),
+        reason: `No heading — cannot determine side for morning (sunrise ${formatTime(sunrise)})`,
+      };
+    }
+
+    const rel = normalizeAngle(sunrisePos.azimuth - predictedHeading);
+    const side = rel > 0 ? "starboard" : rel < 0 ? "port" : null;
+    if (side == null) {
+      return {
+        side: null,
+        targetTime: sunrise.toISOString(),
+        reason: `Sun rises near dead ahead/astern — no side preference (sunrise ${formatTime(sunrise)})`,
+      };
+    }
+    return {
+      side,
+      targetTime: sunrise.toISOString(),
+      reason: `Point ${side} for morning — sun rises ${formatTime(sunrise)} at ${formatBearing(sunrisePos.azimuth)}${caveat}`,
+    };
+  }
+
+  /**
+   * Gets the forecast wind direction (radians, true-north) nearest the given time.
+   * @param {Date} time - Target time
+   * @returns {number|null} Wind direction in radians, or null if not available
+   */
+  getForecastWindDirectionAt(time) {
+    if (this.lastForecast.length === 0) return null;
+    const nearest = this.lastForecast.reduce((best, p) => {
+      const dt = Math.abs(
+        (p.time instanceof Date ? p.time : new Date(p.time)).getTime() -
+          time.getTime(),
+      );
+      if (!best || dt < best.dt) {
+        return { dt, point: p };
+      }
+      return best;
+    }, null);
+    const dirDeg = nearest?.point?.windDirectionDeg;
+    if (dirDeg == null) return null;
+    return (dirDeg * Math.PI) / 180; // degrees → radians
+  }
+
+  /**
    * Computes deployment recommendations for all deployable systems (FLINsail + generators).
    * Each recommendation says whether the device should be deployed or stowed, and why.
    *
@@ -505,6 +672,8 @@ class PredictionEngine {
           type: "solar-deployable",
           recommendedState: "stowed",
           reason: "Stow - vessel under way",
+          recommendedSide: null,
+          recommendedSideTime: null,
         });
       } else if (maxGust >= gustLimit) {
         recommendations.push({
@@ -515,19 +684,33 @@ class PredictionEngine {
           reason: `Stow - gusts ${Math.round(maxGust)}kn exceed limit of ${gustLimit}kn`,
           currentGustKnots: maxGust,
           limitKnots: gustLimit,
+          recommendedSide: null,
+          recommendedSideTime: null,
         });
       } else {
+        // Deployed - compute pointing recommendation (port/starboard)
+        const pointing = this.getPointingRecommendation(array);
+        let reason =
+          maxGust > 0
+            ? `Deploy - gusts ${Math.round(maxGust)}kn below limit of ${gustLimit}kn`
+            : "Deploy - no significant gusts forecast";
+        if (pointing) {
+          if (pointing.side) {
+            reason += `. ${pointing.reason}`;
+          } else if (pointing.reason) {
+            reason += `. ${pointing.reason}`;
+          }
+        }
         recommendations.push({
           id: array.id,
           name,
           type: "solar-deployable",
           recommendedState: "deployed",
-          reason:
-            maxGust > 0
-              ? `Deploy - gusts ${Math.round(maxGust)}kn below limit of ${gustLimit}kn`
-              : "Deploy - no significant gusts forecast",
+          reason,
           currentGustKnots: maxGust,
           limitKnots: gustLimit,
+          recommendedSide: pointing?.side ?? null,
+          recommendedSideTime: pointing?.targetTime ?? null,
         });
       }
     }

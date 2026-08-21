@@ -95,8 +95,22 @@ function oktasToFraction(oktas) {
   return Math.max(0, Math.min(8, oktas)) / 8;
 }
 
+/**
+ * Calculates the next sunrise time after the given date.
+ *
+ * @param {Date} date - Starting date (typically now or sunset)
+ * @param {number} latitude - Latitude in degrees (positive north)
+ * @param {number} longitude - Longitude in degrees (positive east)
+ * @returns {Date|null} Next sunrise time, or null if no sunrise in near future (polar regions)
+ */
+function nextSunrise(date, latitude, longitude) {
+  const times = SunCalc.getTimes(date, latitude, longitude);
+  return times.sunrise && times.sunrise > date ? times.sunrise : null;
+}
+
 module.exports = {
   sunPosition,
+  nextSunrise,
   maxIrradiance,
   irradianceFromCloudCover,
   oktasToFraction,

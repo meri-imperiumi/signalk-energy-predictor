@@ -220,6 +220,13 @@ class AdvisoryPublisher {
       updates[`${PREDICTION_BASE}.deployment.${rec.id}.reason`] = rec.reason;
       updates[`${PREDICTION_BASE}.deployment.${rec.id}.missedYieldWh`] =
         rec.missedYieldWh ?? 0;
+      // Pointing recommendation only applies to deployable solar arrays
+      if (rec.type === "solar-deployable") {
+        updates[`${PREDICTION_BASE}.deployment.${rec.id}.recommendedSide`] =
+          rec.recommendedSide ?? null;
+        updates[`${PREDICTION_BASE}.deployment.${rec.id}.recommendedSideTime`] =
+          rec.recommendedSideTime ?? null;
+      }
 
       // Check current state to decide if notification is needed
       const currentState = currentStates.get(rec.id) ?? null;

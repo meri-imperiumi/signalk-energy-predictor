@@ -1390,6 +1390,278 @@ test.describe("Detected state inference from navigation state", () => {
   });
 });
 
+test.describe("FLINsail pointing recommendation (port/starboard)", () => {
+  test("sun to starboard → recommendedSide starboard", () => {
+    const app = makeFakeApp();
+    // Position at midday, sun due east (azimuth 90° = π/2)
+    // Heading north (0°) → sun is to starboard
+    app.setSelfPath("navigation.position", {
+      latitude: 0,
+      longitude: 0,
+    });
+    app.setSelfPath("navigation.headingTrue", 0); // facing north
+    app.setSelfPath("navigation.state", "moored");
+
+    const engine = new PredictionEngine({
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [
+        {
+          id: "flinsail",
+          type: "deployable",
+          capacityWp: 300,
+          gustLimitKnots: 20,
+          powerPath: "electrical.solar.flinsail.power",
+        },
+      ],
+      mechanicalGenerators: [],
+      getEfficiency: () => 0.7,
+      getSelfPath: (path) => app.getSelfPath(path),
+      app,
+    });
+
+    // Override sunPosition via a known time: use equinox noon at equator,
+    // sun is nearly overhead. Instead, mock by setting a time where azimuth is known.
+    // We use a real date and position where we can predict the result.
+    // At lat=0, lon=0, on 2026-03-20 06:00 UTC, sun is near due east (azimuth ~90°).
+    // But altitude is near 0 at sunrise, which triggers morning mode.
+    // Let's use 09:00 UTC: sun is to the east, altitude well above horizon.
+    const forecast = Array.from({ length: 24 }, (_, h) => ({
+      time: new Date(`2026-03-20T${h.toString().padStart(2, "0")}:00:00Z`),
+      ghi: 500,
+      cloudCover: 0,
+      gustSpeedKnots: 0,
+      windSpeedKnots: 0,
+      windDirectionDeg: null,
+    }));
+    // Patch Date.now to return our test time
+    const realNow = Date.now;
+    Date.now = () => new Date("2026-03-20T09:00:00Z").getTime();
+    try {
+      engine.runPrediction(forecast);
+      const recs = engine.getDeploymentRecommendations();
+      const rec = recs.find((r) => r.id === "flinsail");
+      assert.strictEqual(rec.recommendedState, "deployed");
+      assert.strictEqual(rec.recommendedSide, "starboard");
+      assert.ok(rec.recommendedSideTime);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test("sun to port → recommendedSide port", () => {
+    const app = makeFakeApp();
+    app.setSelfPath("navigation.position", {
+      latitude: 0,
+      longitude: 0,
+    });
+    // Heading north (0°), sun azimuth ~270° (west) → port
+    app.setSelfPath("navigation.headingTrue", 0);
+    app.setSelfPath("navigation.state", "moored");
+
+    const engine = new PredictionEngine({
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [
+        {
+          id: "flinsail",
+          type: "deployable",
+          capacityWp: 300,
+          gustLimitKnots: 20,
+          powerPath: "electrical.solar.flinsail.power",
+        },
+      ],
+      mechanicalGenerators: [],
+      getEfficiency: () => 0.7,
+      getSelfPath: (path) => app.getSelfPath(path),
+      app,
+    });
+
+    // At 15:00 UTC at equator, sun is to the west (azimuth ~270°)
+    const forecast = Array.from({ length: 24 }, (_, h) => ({
+      time: new Date(`2026-03-20T${h.toString().padStart(2, "0")}:00:00Z`),
+      ghi: 500,
+      cloudCover: 0,
+      gustSpeedKnots: 0,
+      windSpeedKnots: 0,
+      windDirectionDeg: null,
+    }));
+    const realNow = Date.now;
+    Date.now = () => new Date("2026-03-20T15:00:00Z").getTime();
+    try {
+      engine.runPrediction(forecast);
+      const recs = engine.getDeploymentRecommendations();
+      const rec = recs.find((r) => r.id === "flinsail");
+      assert.strictEqual(rec.recommendedState, "deployed");
+      assert.strictEqual(rec.recommendedSide, "port");
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test("stowed (underway) → recommendedSide null", () => {
+    const app = makeFakeApp();
+    app.setSelfPath("navigation.position", {
+      latitude: 60,
+      longitude: 18,
+    });
+    app.setSelfPath("navigation.state", "sailing");
+    const engine = makePredictionEngine({
+      solarArrays: [
+        {
+          id: "flinsail",
+          type: "deployable",
+          capacityWp: 300,
+          gustLimitKnots: 20,
+          powerPath: "electrical.solar.flinsail.power",
+        },
+      ],
+      navState: "sailing",
+      app,
+    });
+    engine.runPrediction(makeForecastWithGusts(0, 0));
+    const rec = engine
+      .getDeploymentRecommendations()
+      .find((r) => r.id === "flinsail");
+    assert.strictEqual(rec.recommendedState, "stowed");
+    assert.strictEqual(rec.recommendedSide, null);
+    assert.strictEqual(rec.recommendedSideTime, null);
+  });
+
+  test("heading missing → recommendedSide null with reason", () => {
+    const app = makeFakeApp();
+    app.setSelfPath("navigation.position", {
+      latitude: 0,
+      longitude: 0,
+    });
+    // No heading set → null
+    app.setSelfPath("navigation.state", "moored");
+
+    const engine = new PredictionEngine({
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [
+        {
+          id: "flinsail",
+          type: "deployable",
+          capacityWp: 300,
+          gustLimitKnots: 20,
+          powerPath: "electrical.solar.flinsail.power",
+        },
+      ],
+      mechanicalGenerators: [],
+      getEfficiency: () => 0.7,
+      getSelfPath: (path) => app.getSelfPath(path),
+      app,
+    });
+
+    const forecast = Array.from({ length: 24 }, (_, h) => ({
+      time: new Date(`2026-03-20T${h.toString().padStart(2, "0")}:00:00Z`),
+      ghi: 500,
+      cloudCover: 0,
+      gustSpeedKnots: 0,
+      windSpeedKnots: 0,
+      windDirectionDeg: null,
+    }));
+    const realNow = Date.now;
+    Date.now = () => new Date("2026-03-20T09:00:00Z").getTime();
+    try {
+      engine.runPrediction(forecast);
+      const recs = engine.getDeploymentRecommendations();
+      const rec = recs.find((r) => r.id === "flinsail");
+      assert.strictEqual(rec.recommendedState, "deployed");
+      assert.strictEqual(rec.recommendedSide, null);
+      assert.match(rec.reason, /No heading/);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test("AdvisoryPublisher publishes recommendedSide and recommendedSideTime", () => {
+    const app = makeFakeApp();
+    const pub = new AdvisoryPublisher(app, "test-plugin");
+    const targetTime = new Date("2026-03-20T09:00:00Z").toISOString();
+    pub.publishDeploymentStates(
+      [
+        {
+          id: "flinsail",
+          name: "FLINsail",
+          type: "solar-deployable",
+          recommendedState: "deployed",
+          reason: "Deploy - no gusts. Point starboard",
+          recommendedSide: "starboard",
+          recommendedSideTime: targetTime,
+          missedYieldWh: 0,
+        },
+      ],
+      new Map([["flinsail", "stowed"]]),
+    );
+
+    const deltas = app.handleMessageCalls
+      .filter((c) => c.msg.updates)
+      .flatMap((c) => c.msg.updates[0].values);
+    const side = deltas.find(
+      (v) =>
+        v.path ===
+        "electrical.energy.prediction.deployment.flinsail.recommendedSide",
+    );
+    const target = deltas.find(
+      (v) =>
+        v.path ===
+        "electrical.energy.prediction.deployment.flinsail.recommendedSideTime",
+    );
+    assert.ok(side, "recommendedSide should be published");
+    assert.strictEqual(side.value, "starboard");
+    assert.ok(target, "recommendedSideTime should be published");
+    assert.strictEqual(target.value, targetTime);
+  });
+
+  test("AdvisoryPublisher does NOT publish pointing for wind/hydro generators", () => {
+    const app = makeFakeApp();
+    const pub = new AdvisoryPublisher(app, "test-plugin");
+    pub.publishDeploymentStates(
+      [
+        {
+          id: "sailinggen",
+          name: "Sailing Generator",
+          type: "wind",
+          recommendedState: "deployed",
+          reason: "Deploy - wind sufficient",
+          missedYieldWh: 0,
+        },
+        {
+          id: "hydrogen",
+          name: "Hydro Generator",
+          type: "hydro",
+          recommendedState: "stowed",
+          reason: "Stow - not sailing",
+          missedYieldWh: 0,
+        },
+      ],
+      new Map(),
+    );
+
+    const deltas = app.handleMessageCalls
+      .filter((c) => c.msg.updates)
+      .flatMap((c) => c.msg.updates[0].values);
+    const windSide = deltas.find(
+      (v) =>
+        v.path ===
+        "electrical.energy.prediction.deployment.sailinggen.recommendedSide",
+    );
+    const windTarget = deltas.find(
+      (v) =>
+        v.path ===
+        "electrical.energy.prediction.deployment.sailinggen.recommendedSideTime",
+    );
+    const hydroSide = deltas.find(
+      (v) =>
+        v.path ===
+        "electrical.energy.prediction.deployment.hydrogen.recommendedSide",
+    );
+    assert.strictEqual(windSide, undefined);
+    assert.strictEqual(windTarget, undefined);
+    assert.strictEqual(hydroSide, undefined);
+  });
+});
+
 test.describe("24-hour clock in engine run advisory", () => {
   test("uses 24-hour format in notification message", () => {
     const app = makeFakeApp();

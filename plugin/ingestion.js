@@ -42,7 +42,7 @@ const Tier = {
 
 /**
  * Weather forecast data point.
- * @typedef {{time: Date, ghi: number, cloudCover: number|null, gustSpeedKnots: number|null, windSpeedKnots: number|null}} ForecastPoint
+ * @typedef {{time: Date, ghi: number, cloudCover: number|null, gustSpeedKnots: number|null, windSpeedKnots: number|null, windDirectionDeg: number|null}} ForecastPoint
  */
 
 /**
@@ -68,7 +68,7 @@ async function fetchOpenMeteo(latitude, longitude) {
   url.searchParams.set("longitude", longitude.toString());
   url.searchParams.set(
     "hourly",
-    "shortwave_radiation,wind_gusts_10m,wind_speed_10m",
+    "shortwave_radiation,wind_gusts_10m,wind_speed_10m,wind_direction_10m",
   );
   url.searchParams.set("forecast_hours", FORECAST_HOURS.toString());
   url.searchParams.set("timezone", "UTC");
@@ -103,6 +103,7 @@ async function fetchOpenMeteo(latitude, longitude) {
         data.hourly.wind_speed_10m?.[i] != null
           ? data.hourly.wind_speed_10m[i] * 0.539957 // km/h to knots
           : null,
+      windDirectionDeg: data.hourly.wind_direction_10m?.[i] ?? null,
     }));
   } finally {
     clearTimeout(timeoutId);
@@ -149,6 +150,9 @@ async function fetchSignalKWeather(app, latitude, longitude) {
         ghi: null,
         cloudCover: point.outside?.cloudCover ?? null,
         gustSpeedKnots: point.wind?.gust ? point.wind.gust * 1.94384 : null, // m/s to knots
+        windDirectionDeg: point.wind?.directionTrue
+          ? (point.wind.directionTrue * 180) / Math.PI // radians to degrees
+          : null,
       }));
   } finally {
     clearTimeout(timeoutId);
@@ -246,6 +250,7 @@ function generateClearSkyForecast(startTime, hours, latitude, longitude) {
       ghi: maxIrradiance(altitude),
       cloudCover: 0,
       gustSpeedKnots: null,
+      windDirectionDeg: null,
     });
   }
 
