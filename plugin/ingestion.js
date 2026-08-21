@@ -149,13 +149,18 @@ async function fetchSignalKWeather(app, latitude, longitude) {
         time: new Date(point.date),
         ghi: null,
         cloudCover: point.outside?.cloudCover ?? null,
-        gustSpeedKnots: point.wind?.gust ? point.wind.gust * 1.94384 : null, // m/s to knots
-        windSpeedKnots: point.wind?.speed
-          ? point.wind.speed * 1.94384 // m/s to knots
-          : null,
-        windDirectionDeg: point.wind?.directionTrue
-          ? (point.wind.directionTrue * 180) / Math.PI // radians to degrees
-          : null,
+        gustSpeedKnots:
+          point.wind?.gust != null
+            ? point.wind.gust * 1.94384 // m/s to knots
+            : null,
+        windSpeedKnots:
+          point.wind?.speedTrue != null
+            ? point.wind.speedTrue * 1.94384 // m/s to knots
+            : null,
+        windDirectionDeg:
+          point.wind?.directionTrue != null
+            ? (point.wind.directionTrue * 180) / Math.PI // radians to degrees
+            : null,
       }));
   } finally {
     clearTimeout(timeoutId);

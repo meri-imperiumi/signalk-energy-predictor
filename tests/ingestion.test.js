@@ -106,6 +106,59 @@ test.describe("Ingestion fallback chain", () => {
     }
   });
 
+  test("Signal K Weather API fields map to forecast points", async () => {
+    const fsm = makeFSM();
+    const origFetch = globalThis.fetch;
+    // WeatherData uses wind.speedTrue (m/s), wind.gust, wind.directionTrue (rad)
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u.includes("open-meteo")) throw new Error("network down");
+      if (u.includes("/signalk/v2/api/weather")) {
+        return {
+          ok: true,
+          json: async () => [
+            {
+              date: new Date(Date.now() + 3600000).toISOString(),
+              type: "point",
+              wind: {
+                speedTrue: 10, // m/s
+                directionTrue: Math.PI, // 180 deg
+                gust: 15, // m/s
+              },
+              outside: { cloudCover: 0.5 },
+            },
+            {
+              date: new Date(Date.now() + 7200000).toISOString(),
+              type: "point",
+              wind: { speedTrue: 0 }, // calm must not become null
+            },
+          ],
+        };
+      }
+      throw new Error("network down");
+    };
+
+    try {
+      const forecast = await fsm.fetchForecast();
+      assert.strictEqual(fsm.currentTier, Tier.SIGNAL_K_WEATHER);
+      assert.strictEqual(forecast.length, 2);
+
+      const [first, calm] = forecast;
+      assert.ok(Math.abs(first.windSpeedKnots - 10 * 1.94384) < 0.01);
+      assert.ok(Math.abs(first.gustSpeedKnots - 15 * 1.94384) < 0.01);
+      assert.ok(Math.abs(first.windDirectionDeg - 180) < 0.01);
+      assert.strictEqual(first.cloudCover, 0.5);
+      // Cloud cover must yield a synthesized GHI
+      assert.ok(first.ghi != null);
+
+      // Calm wind: 0 m/s is a valid reading, not missing data
+      assert.strictEqual(calm.windSpeedKnots, 0);
+      assert.strictEqual(calm.gustSpeedKnots, null);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
   test("logbook without observations falls through to Clear Sky", async () => {
     const fsm = makeFSM();
     const origFetch = globalThis.fetch;
