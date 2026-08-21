@@ -220,6 +220,8 @@ class AdvisoryPublisher {
       updates[`${PREDICTION_BASE}.deployment.${rec.id}.reason`] = rec.reason;
       updates[`${PREDICTION_BASE}.deployment.${rec.id}.missedYieldWh`] =
         rec.missedYieldWh ?? 0;
+      updates[`${PREDICTION_BASE}.deployment.${rec.id}.recommendedStateTime`] =
+        rec.recommendedStateTime ?? null;
       // Pointing recommendation only applies to deployable solar arrays
       if (rec.type === "solar-deployable") {
         updates[`${PREDICTION_BASE}.deployment.${rec.id}.recommendedSide`] =

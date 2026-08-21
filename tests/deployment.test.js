@@ -1660,6 +1660,248 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
     assert.strictEqual(windTarget, undefined);
     assert.strictEqual(hydroSide, undefined);
   });
+
+  test("FLINsail recommendedStateTime: stow now, deploy when gusts drop", () => {
+    const app = makeFakeApp();
+    app.setSelfPath("navigation.position", {
+      latitude: 60,
+      longitude: 18,
+    });
+    app.setSelfPath("navigation.state", "moored");
+
+    const engine = new PredictionEngine({
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [
+        {
+          id: "flinsail",
+          type: "deployable",
+          capacityWp: 300,
+          gustLimitKnots: 20,
+          powerPath: "electrical.solar.flinsail.power",
+        },
+      ],
+      mechanicalGenerators: [],
+      getEfficiency: () => 0.7,
+      getSelfPath: (path) => app.getSelfPath(path),
+      app,
+    });
+
+    // Forecast: first 5 hours gusts 25kn (above limit), then drops to 10kn
+    const now = new Date("2026-03-20T12:00:00Z");
+    const forecast = Array.from({ length: 24 }, (_, h) => ({
+      time: new Date(now.getTime() + h * 3600000),
+      ghi: 500,
+      cloudCover: 0,
+      gustSpeedKnots: h < 5 ? 25 : 10,
+      windSpeedKnots: 10,
+      windDirectionDeg: null,
+    }));
+    const realNow = Date.now;
+    Date.now = () => now.getTime();
+    try {
+      engine.runPrediction(forecast);
+      const rec = engine
+        .getDeploymentRecommendations()
+        .find((r) => r.id === "flinsail");
+      assert.strictEqual(rec.recommendedState, "stowed");
+      // State should change at hour 5 (when gusts drop to 10kn)
+      assert.ok(rec.recommendedStateTime);
+      const changeTime = new Date(rec.recommendedStateTime);
+      assert.strictEqual(
+        changeTime.getTime(),
+        new Date(now.getTime() + 5 * 3600000).getTime(),
+      );
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test("FLINsail recommendedStateTime: null when state stays same", () => {
+    const app = makeFakeApp();
+    app.setSelfPath("navigation.position", {
+      latitude: 60,
+      longitude: 18,
+    });
+    app.setSelfPath("navigation.state", "moored");
+
+    const engine = new PredictionEngine({
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [
+        {
+          id: "flinsail",
+          type: "deployable",
+          capacityWp: 300,
+          gustLimitKnots: 20,
+          powerPath: "electrical.solar.flinsail.power",
+        },
+      ],
+      mechanicalGenerators: [],
+      getEfficiency: () => 0.7,
+      getSelfPath: (path) => app.getSelfPath(path),
+      app,
+    });
+
+    // Forecast: gusts always below limit → stays deployed
+    const now = new Date("2026-03-20T12:00:00Z");
+    const forecast = Array.from({ length: 24 }, (_, h) => ({
+      time: new Date(now.getTime() + h * 3600000),
+      ghi: 500,
+      cloudCover: 0,
+      gustSpeedKnots: 10,
+      windSpeedKnots: 10,
+      windDirectionDeg: null,
+    }));
+    const realNow = Date.now;
+    Date.now = () => now.getTime();
+    try {
+      engine.runPrediction(forecast);
+      const rec = engine
+        .getDeploymentRecommendations()
+        .find((r) => r.id === "flinsail");
+      assert.strictEqual(rec.recommendedState, "deployed");
+      assert.strictEqual(rec.recommendedStateTime, null);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test("wind generator recommendedStateTime: stow now (gusts), deploy when gusts drop", () => {
+    const app = makeFakeApp();
+    app.setSelfPath("navigation.position", {
+      latitude: 60,
+      longitude: 18,
+    });
+    app.setSelfPath("navigation.state", "moored");
+
+    const engine = new PredictionEngine({
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [],
+      mechanicalGenerators: [
+        withCurve({
+          id: "windgen",
+          type: "wind",
+          deployable: true,
+          powerPath: "electrical.wind.power",
+          maxWindKnots: 30,
+          startupSpeedKnots: 5,
+        }),
+      ],
+      getEfficiency: () => 0.7,
+      getSelfPath: (path) => app.getSelfPath(path),
+      app,
+    });
+
+    // Gusts exceed max (35kn) for first 3 hours, then drop to 15kn (below 30 limit)
+    // Wind always 8kn (above startup 5)
+    const now = new Date("2026-03-20T12:00:00Z");
+    const forecast = Array.from({ length: 24 }, (_, h) => ({
+      time: new Date(now.getTime() + h * 3600000),
+      ghi: 500,
+      cloudCover: 0,
+      gustSpeedKnots: h < 3 ? 35 : 15,
+      windSpeedKnots: 8,
+      windDirectionDeg: null,
+    }));
+    const realNow = Date.now;
+    Date.now = () => now.getTime();
+    try {
+      engine.runPrediction(forecast);
+      const rec = engine
+        .getDeploymentRecommendations()
+        .find((r) => r.id === "windgen");
+      assert.strictEqual(rec.recommendedState, "stowed");
+      assert.ok(rec.recommendedStateTime);
+      const changeTime = new Date(rec.recommendedStateTime);
+      assert.strictEqual(
+        changeTime.getTime(),
+        new Date(now.getTime() + 3 * 3600000).getTime(),
+      );
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test("hydro recommendedStateTime: null (depends on boat speed, not forecast)", () => {
+    const app = makeFakeApp();
+    app.setSelfPath("navigation.position", {
+      latitude: 60,
+      longitude: 18,
+    });
+    app.setSelfPath("navigation.state", "moored");
+
+    const engine = new PredictionEngine({
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [],
+      mechanicalGenerators: [
+        withCurve({
+          id: "hydrogen",
+          type: "hydro",
+          deployable: true,
+          powerPath: "electrical.hydro.power",
+          minSpeedKnots: 3,
+          maxSpeedKnots: 12,
+        }),
+      ],
+      getEfficiency: () => 0.7,
+      getSelfPath: (path) => app.getSelfPath(path),
+      app,
+    });
+
+    const now = new Date("2026-03-20T12:00:00Z");
+    const forecast = Array.from({ length: 24 }, (_, h) => ({
+      time: new Date(now.getTime() + h * 3600000),
+      ghi: 500,
+      cloudCover: 0,
+      gustSpeedKnots: 0,
+      windSpeedKnots: 0,
+      windDirectionDeg: null,
+    }));
+    const realNow = Date.now;
+    Date.now = () => now.getTime();
+    try {
+      engine.runPrediction(forecast);
+      const rec = engine
+        .getDeploymentRecommendations()
+        .find((r) => r.id === "hydrogen");
+      assert.strictEqual(rec.recommendedState, "stowed");
+      assert.strictEqual(rec.recommendedStateTime, null);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test("AdvisoryPublisher publishes recommendedStateTime", () => {
+    const app = makeFakeApp();
+    const pub = new AdvisoryPublisher(app, "test-plugin");
+    const stateTime = new Date("2026-03-20T17:00:00Z").toISOString();
+    pub.publishDeploymentStates(
+      [
+        {
+          id: "flinsail",
+          name: "FLINsail",
+          type: "solar-deployable",
+          recommendedState: "stowed",
+          reason: "Stow - gusts 25kn exceed limit of 20kn",
+          recommendedSide: null,
+          recommendedSideTime: null,
+          recommendedStateTime: stateTime,
+          missedYieldWh: 0,
+        },
+      ],
+      new Map(),
+    );
+
+    const deltas = app.handleMessageCalls
+      .filter((c) => c.msg.updates)
+      .flatMap((c) => c.msg.updates[0].values);
+    const stateTimeDelta = deltas.find(
+      (v) =>
+        v.path ===
+        "electrical.energy.prediction.deployment.flinsail.recommendedStateTime",
+    );
+    assert.ok(stateTimeDelta, "recommendedStateTime should be published");
+    assert.strictEqual(stateTimeDelta.value, stateTime);
+  });
 });
 
 test.describe("24-hour clock in engine run advisory", () => {

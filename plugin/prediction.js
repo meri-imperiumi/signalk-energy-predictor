@@ -643,6 +643,80 @@ class PredictionEngine {
   }
 
   /**
+   * Scans the forecast for when a deployable device's recommendation would flip.
+   *
+   * For FLINsail and wind generators, the deciding factor is forecast gusts vs
+   * the gust/wind limit. For wind generators deployed, we also watch for wind
+   * dropping below startup speed. Returns the first forecast time when the
+   * state would differ from the current recommendation, or null if it stays
+   * the same through the forecast window.
+   *
+   * Not applicable to hydro generators (depends on boat speed, not forecast)
+   * or underway/not-sailing cases (depends on nav state, not forecast).
+   *
+   * @param {string} id - Device ID
+   * @param {string} currentState - Current recommended state ("deployed"/"stowed")
+   * @returns {string|null} ISO timestamp when state would change, or null
+   */
+  getRecommendedStateChangeTime(id, currentState) {
+    if (this.lastForecast.length === 0) return null;
+
+    const array = this.solarArrays.find((a) => a.id === id);
+    const generator = this.mechanicalGenerators.find((g) => g.id === id);
+
+    // FLINsail (deployable solar): gust limit is the deciding factor
+    if (array && array.type === "deployable") {
+      const gustLimit = array.gustLimitKnots ?? 20;
+      for (const point of this.lastForecast) {
+        const gust = point.gustSpeedKnots ?? 0;
+        const wouldStow = gust >= gustLimit;
+        const wouldDeploy = !wouldStow;
+        if (currentState === "deployed" && wouldStow) {
+          return this.toISOString(point.time);
+        }
+        if (currentState === "stowed" && wouldDeploy) {
+          return this.toISOString(point.time);
+        }
+      }
+      return null;
+    }
+
+    // Wind generators: gust limit (stow) and startup speed (too low to deploy)
+    if (generator && generator.type === "wind") {
+      const maxWindKnots = generator.maxWindKnots ?? 30;
+      const minDeployWind = generator.startupSpeedKnots ?? 5;
+      for (const point of this.lastForecast) {
+        const gust = point.gustSpeedKnots ?? 0;
+        const wind = point.windSpeedKnots ?? 0;
+        if (currentState === "deployed") {
+          // Would stow if gusts exceed limit
+          if (gust >= maxWindKnots) {
+            return this.toISOString(point.time);
+          }
+        } else if (currentState === "stowed") {
+          // Would deploy if wind ≥ startup and gusts < limit
+          if (wind >= minDeployWind && gust < maxWindKnots) {
+            return this.toISOString(point.time);
+          }
+        }
+      }
+      return null;
+    }
+
+    return null;
+  }
+
+  /**
+   * Converts a Date or date-like value to ISO string.
+   * @param {Date|string|number} time - Time value
+   * @returns {string|null} ISO string, or null if invalid
+   */
+  toISOString(time) {
+    const d = time instanceof Date ? time : new Date(time);
+    return Number.isNaN(d.getTime()) ? null : d.toISOString();
+  }
+
+  /**
    * Computes deployment recommendations for all deployable systems (FLINsail + generators).
    * Each recommendation says whether the device should be deployed or stowed, and why.
    *
@@ -818,6 +892,10 @@ class PredictionEngine {
         rec.recommendedState === "deployed"
           ? this.getPotentialYieldWh(rec.id)
           : 0,
+      recommendedStateTime: this.getRecommendedStateChangeTime(
+        rec.id,
+        rec.recommendedState,
+      ),
     }));
   }
 
@@ -876,7 +954,7 @@ class PredictionEngine {
       );
     }
 
-    const startTime = new Date();
+    const startTime = new Date(Date.now());
     this.app?.debug?.(`  prediction[0]: ${startTime.toISOString()}`);
 
     for (let h = 0; h < PREDICTION_HOURS; h++) {
