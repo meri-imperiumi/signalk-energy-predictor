@@ -314,16 +314,6 @@ class PredictionEngine {
   }
 
   /**
-   * Gets the current navigation state.
-   *
-   * @returns {string} Navigation state
-   */
-  getNavState() {
-    const state = this.getSelfPath("navigation.state");
-    return state || "unknown";
-  }
-
-  /**
    * Gets the current apparent wind angle.
    *
    * @returns {number|null} AWA in radians
@@ -339,6 +329,227 @@ class PredictionEngine {
    */
   getSpeedThroughWater() {
     return toNumber(this.getSelfPath("navigation.speedThroughWater"));
+  }
+
+  /**
+   * Gets the current navigation state.
+   * @returns {string} One of: sailing, motoring, anchored, moored, under way, unknown
+   */
+  getNavState() {
+    const state = this.getSelfPath("navigation.state");
+    return state || "unknown";
+  }
+
+  /**
+   * Determines if the vessel is under way (sailing, motoring, or under way).
+   * @returns {boolean}
+   */
+  isUnderway() {
+    const state = this.getNavState();
+    return ["sailing", "motoring", "under way"].includes(state);
+  }
+
+  /**
+   * Gets the current gust speed from forecast (first forecast point near now).
+   * @returns {number|null} Gust speed in knots
+   */
+  getCurrentGustKnots() {
+    if (this.lastPrediction.length === 0) return null;
+    const now = new Date();
+    const current = this.lastPrediction.find(
+      (p) => Math.abs(p.time.getTime() - now.getTime()) < 1800000,
+    );
+    return current?.gustSpeedKnots ?? null;
+  }
+
+  /**
+   * Gets the current wind speed from forecast (first forecast point near now).
+   * @returns {number|null} Wind speed in knots
+   */
+  getCurrentWindKnots() {
+    if (this.lastPrediction.length === 0) return null;
+    const now = new Date();
+    const current = this.lastPrediction.find(
+      (p) => Math.abs(p.time.getTime() - now.getTime()) < 1800000,
+    );
+    return current?.windSpeedKnots ?? null;
+  }
+
+  /**
+   * Gets the maximum forecast gust over the prediction window.
+   * @returns {number} Max gust in knots
+   */
+  getMaxForecastGust() {
+    return this.lastPrediction.reduce((max, p) => {
+      return Math.max(max, p.gustSpeedKnots ?? 0);
+    }, 0);
+  }
+
+  /**
+   * Gets the maximum forecast wind speed over the prediction window.
+   * @returns {number} Max wind speed in knots
+   */
+  getMaxForecastWind() {
+    return this.lastPrediction.reduce((max, p) => {
+      return Math.max(max, p.windSpeedKnots ?? 0);
+    }, 0);
+  }
+
+  /**
+   * Computes deployment recommendations for all deployable systems (FLINsail + generators).
+   * Each recommendation says whether the device should be deployed or stowed, and why.
+   *
+   * @returns {Array<{id: string, name: string, type: string, recommendedState: string, reason: string, currentGustKnots?: number, currentSpeedKnots?: number, limitKnots?: number}>}
+   */
+  getDeploymentRecommendations() {
+    const recommendations = [];
+    const navState = this.getNavState();
+    const underway = this.isUnderway();
+    const isSailing = navState === "sailing";
+    const speedThroughWater = this.getSpeedThroughWater() ?? 0;
+    const maxGust = this.getMaxForecastGust();
+    const maxWind = this.getMaxForecastWind();
+
+    // FLINsail (deployable solar arrays)
+    for (const array of this.solarArrays) {
+      if (array.type !== "deployable") continue;
+
+      const name = this.getDisplayName(array);
+      const gustLimit = array.gustLimitKnots ?? 20;
+
+      if (underway) {
+        // FLINsail is always stowed when underway
+        recommendations.push({
+          id: array.id,
+          name,
+          type: "solar-deployable",
+          recommendedState: "stowed",
+          reason: "Stow - vessel under way",
+        });
+      } else if (maxGust >= gustLimit) {
+        recommendations.push({
+          id: array.id,
+          name,
+          type: "solar-deployable",
+          recommendedState: "stowed",
+          reason: `Stow - gusts ${Math.round(maxGust)}kn exceed limit of ${gustLimit}kn`,
+          currentGustKnots: maxGust,
+          limitKnots: gustLimit,
+        });
+      } else {
+        recommendations.push({
+          id: array.id,
+          name,
+          type: "solar-deployable",
+          recommendedState: "deployed",
+          reason:
+            maxGust > 0
+              ? `Deploy - gusts ${Math.round(maxGust)}kn below limit of ${gustLimit}kn`
+              : "Deploy - no significant gusts forecast",
+          currentGustKnots: maxGust,
+          limitKnots: gustLimit,
+        });
+      }
+    }
+
+    // Mechanical generators
+    for (const generator of this.mechanicalGenerators) {
+      if (!generator.deployable) continue;
+
+      const name = this.getDisplayName(generator);
+
+      if (generator.type === "hydro") {
+        const minSpeed = generator.minSpeedKnots ?? 3;
+        const maxSpeed = generator.maxSpeedKnots ?? 12;
+
+        if (!isSailing) {
+          // Hydro can only be deployed when sailing (not motoring)
+          recommendations.push({
+            id: generator.id,
+            name,
+            type: "hydro",
+            recommendedState: "stowed",
+            reason: underway
+              ? `Stow - vessel ${navState}, hydro requires sailing`
+              : "Stow - vessel not sailing",
+          });
+        } else if (speedThroughWater >= maxSpeed) {
+          recommendations.push({
+            id: generator.id,
+            name,
+            type: "hydro",
+            recommendedState: "stowed",
+            reason: `Stow - boat speed ${speedThroughWater.toFixed(1)}kn exceeds limit of ${maxSpeed}kn`,
+            currentSpeedKnots: speedThroughWater,
+            limitKnots: maxSpeed,
+          });
+        } else if (speedThroughWater >= minSpeed) {
+          recommendations.push({
+            id: generator.id,
+            name,
+            type: "hydro",
+            recommendedState: "deployed",
+            reason: `Deploy - sailing at ${speedThroughWater.toFixed(1)}kn (min ${minSpeed}kn, max ${maxSpeed}kn)`,
+            currentSpeedKnots: speedThroughWater,
+            limitKnots: maxSpeed,
+          });
+        } else {
+          recommendations.push({
+            id: generator.id,
+            name,
+            type: "hydro",
+            recommendedState: "stowed",
+            reason: `Stow - sailing too slow (${speedThroughWater.toFixed(1)}kn < ${minSpeed}kn)`,
+            currentSpeedKnots: speedThroughWater,
+            limitKnots: minSpeed,
+          });
+        }
+      } else if (generator.type === "wind") {
+        const maxWindKnots = generator.maxWindKnots ?? 30;
+        const minDeployWind = 5;
+
+        if (underway) {
+          // Wind generators stowed when under way (like FLINsail)
+          recommendations.push({
+            id: generator.id,
+            name,
+            type: "wind",
+            recommendedState: "stowed",
+            reason: "Stow - vessel under way",
+          });
+        } else if (maxGust >= maxWindKnots) {
+          recommendations.push({
+            id: generator.id,
+            name,
+            type: "wind",
+            recommendedState: "stowed",
+            reason: `Stow - gusts ${Math.round(maxGust)}kn exceed limit of ${maxWindKnots}kn`,
+            currentGustKnots: maxGust,
+            limitKnots: maxWindKnots,
+          });
+        } else if (maxWind >= minDeployWind) {
+          recommendations.push({
+            id: generator.id,
+            name,
+            type: "wind",
+            recommendedState: "deployed",
+            reason: `Deploy - wind ${Math.round(maxWind)}kn (gusts ${Math.round(maxGust)}kn, limit ${maxWindKnots}kn)`,
+            currentGustKnots: maxGust,
+            limitKnots: maxWindKnots,
+          });
+        } else {
+          recommendations.push({
+            id: generator.id,
+            name,
+            type: "wind",
+            recommendedState: "stowed",
+            reason: `Stow - wind too low (${Math.round(maxWind)}kn < ${minDeployWind}kn)`,
+          });
+        }
+      }
+    }
+
+    return recommendations;
   }
 
   /**
@@ -480,6 +691,8 @@ class PredictionEngine {
         houseLoadWh: averageLoad,
         netWh,
         soc: runningSoC,
+        gustSpeedKnots: windGustKnots || 0,
+        windSpeedKnots: windSpeedKnots || 0,
       });
     }
 
@@ -637,146 +850,6 @@ class PredictionEngine {
         end: windowEnd,
       },
     };
-  }
-
-  /**
-   * Finds deployment opportunities for deployable generators.
-   *
-   * @returns {Array<{generatorId: string, generatorName: string, type: string, hour: number, reason: string}>} Deployment recommendations
-   */
-  findDeploymentOpportunities() {
-    const opportunities = [];
-    const isSailing = this.getNavState() === "sailing";
-    const currentSpeed = this.getSpeedThroughWater() ?? 0;
-
-    for (const generator of this.mechanicalGenerators) {
-      if (!generator.deployable) {
-        continue;
-      }
-
-      const name = this.getDisplayName(generator);
-
-      if (generator.type === "hydro") {
-        const minSpeedKnots = generator.minSpeedKnots ?? 3;
-        const maxSpeedKnots = generator.maxSpeedKnots ?? 12;
-
-        if (isSailing && currentSpeed >= minSpeedKnots) {
-          // Check if approaching max speed limit
-          if (currentSpeed >= maxSpeedKnots) {
-            opportunities.push({
-              generatorId: generator.id,
-              generatorName: name,
-              type: "hydro",
-              hour: 0,
-              reason: `Stow hydro - boat speed ${currentSpeed.toFixed(1)}kn exceeds limit of ${maxSpeedKnots}kn`,
-              action: "stow",
-              currentSpeed,
-              maxSpeedKnots,
-            });
-          } else {
-            // Check if hydro would be beneficial
-            const firstBenefitHour = this.lastPrediction.findIndex(
-              (p) => p.windYieldWh > 50,
-            ); // Hydro contributes to windYieldWh
-            if (firstBenefitHour >= 0) {
-              opportunities.push({
-                generatorId: generator.id,
-                generatorName: name,
-                type: "hydro",
-                hour: firstBenefitHour,
-                reason: `Deploy hydro - sailing at ${currentSpeed.toFixed(1)}kn (min ${minSpeedKnots}kn, max ${maxSpeedKnots}kn)`,
-                currentSpeed,
-                minSpeedKnots,
-                maxSpeedKnots,
-              });
-            }
-          }
-        } else if (!isSailing && currentSpeed < minSpeedKnots) {
-          // Not sailing - hydro can't help
-          const navState = this.getNavState();
-          const reason =
-            navState === "anchored" || navState === "moored"
-              ? "Hydro generator stowed - vessel at anchor"
-              : navState === "under way" || navState === "motoring"
-                ? `Hydro not applicable - vessel not sailing fast enough (${currentSpeed.toFixed(1)}kn < ${minSpeedKnots}kn)`
-                : "Hydro not applicable - vessel not sailing fast enough";
-          opportunities.push({
-            generatorId: generator.id,
-            generatorName: name,
-            type: "hydro",
-            hour: 0,
-            reason,
-            action: "info",
-            currentSpeed,
-            minSpeedKnots,
-          });
-        }
-      } else if (generator.type === "wind") {
-        // Wind generators are used at anchor/moored, stowed when under way
-        // Deploy when wind is favorable (above minimum but below max)
-        const currentWindSpeed =
-          toNumber(this.getSelfPath("environment.wind.speedOverGround")) ?? 0;
-        const currentGust =
-          toNumber(this.getSelfPath("environment.wind.gust")) ??
-          currentWindSpeed;
-        const maxWindKnots = generator.maxWindKnots ?? 30;
-        const minDeployWind = 5; // Minimum wind to make deployment worthwhile
-
-        // Find forecast wind speeds
-        let maxForecastWind = 0;
-        let maxForecastGust = 0;
-        for (const p of this.lastPrediction) {
-          // Use current wind as proxy for forecast (wind forecast integration needed)
-          maxForecastWind = Math.max(maxForecastWind, currentWindSpeed);
-          maxForecastGust = Math.max(maxForecastGust, currentGust);
-        }
-
-        if (maxForecastGust >= maxWindKnots) {
-          // Exceeds limit, stow immediately
-          opportunities.push({
-            generatorId: generator.id,
-            generatorName: name,
-            type: "wind",
-            hour: 0,
-            reason: `Gusts ${maxForecastGust.toFixed(1)}kn exceed limit of ${maxWindKnots}kn`,
-            action: "stow",
-            currentSpeed: maxForecastGust,
-            maxWindKnots,
-          });
-        } else if (
-          maxForecastWind >= minDeployWind &&
-          maxForecastWind < maxWindKnots * 0.7
-        ) {
-          // Favorable wind conditions, recommend deployment
-          const hour = this.lastPrediction.findIndex((p) => p.windYieldWh > 50);
-          if (hour >= 0) {
-            opportunities.push({
-              generatorId: generator.id,
-              generatorName: name,
-              type: "wind",
-              hour,
-              reason: `Wind ${maxForecastWind.toFixed(1)}kn (within safe range ${minDeployWind}-${maxWindKnots}kn)`,
-              currentSpeed: maxForecastWind,
-              maxWindKnots,
-            });
-          }
-        } else if (maxForecastWind >= maxWindKnots * 0.7) {
-          // Approaching limit, warn to stow soon
-          opportunities.push({
-            generatorId: generator.id,
-            generatorName: name,
-            type: "wind",
-            hour: 0,
-            reason: `Wind approaching limit (${maxForecastWind.toFixed(1)}kn, limit ${maxWindKnots}kn), consider stowing`,
-            action: "stow",
-            currentSpeed: maxForecastWind,
-            maxWindKnots,
-          });
-        }
-      }
-    }
-
-    return opportunities;
   }
 
   /**

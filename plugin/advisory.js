@@ -200,6 +200,57 @@ class AdvisoryPublisher {
   }
 
   /**
+   * Publishes deployment state recommendations for all deployable systems.
+   * Publishes the recommended state as a delta value, and sends a notification
+   * only if the current state differs from the recommended state.
+   *
+   * @param {Array<{id: string, name: string, type: string, recommendedState: string, reason: string}>} recommendations - Deployment recommendations
+   * @param {Map<string, string|null>} currentStates - Map of device ID to current state (deployed/stowed/null)
+   * @returns {void}
+   */
+  publishDeploymentStates(recommendations, currentStates) {
+    const updates = {};
+
+    for (const rec of recommendations) {
+      // Publish the recommended state as a delta value
+      updates[`${PREDICTION_BASE}.deployment.${rec.id}.recommendedState`] =
+        rec.recommendedState;
+      updates[`${PREDICTION_BASE}.deployment.${rec.id}.detectedState`] =
+        currentStates.get(rec.id) ?? null;
+      updates[`${PREDICTION_BASE}.deployment.${rec.id}.reason`] = rec.reason;
+
+      // Check current state to decide if notification is needed
+      const currentState = currentStates.get(rec.id) ?? null;
+      const needsChange =
+        currentState !== null && currentState !== rec.recommendedState;
+
+      if (needsChange) {
+        const action = rec.recommendedState === "deployed" ? "Deploy" : "Stow";
+        const state =
+          rec.recommendedState === "deployed"
+            ? DeployState.WARN
+            : DeployState.ALERT;
+        this.publishNotification(
+          `deploy_${rec.id}`,
+          state,
+          `${rec.name}: ${action} now - ${rec.reason}`,
+        );
+      } else {
+        // State matches or unknown - clear any existing notification
+        this.publishNotification(
+          `deploy_${rec.id}`,
+          DeployState.NORMAL,
+          `${rec.name}: ${rec.reason}`,
+        );
+      }
+    }
+
+    if (Object.keys(updates).length > 0) {
+      this.publishDelta(updates);
+    }
+  }
+
+  /**
    * Publishes time to full/empty predictions.
    *
    * @param {Date|null} timeToFull - Time when battery will be full
@@ -215,38 +266,6 @@ class AdvisoryPublisher {
         ? timeToEmpty.toISOString()
         : null,
     });
-  }
-
-  /**
-   * Publishes FLINsail stowage advisory based on wind gust forecast.
-   *
-   * @param {boolean} shouldStow - Whether the array should be stowed
-   * @param {string} arrayName - Name of the deployable array
-   * @param {number} gustSpeedKnots - Current gust speed
-   * @param {number} gustLimitKnots - Gust limit
-   * @returns {void}
-   */
-  publishFLINsailAdvisory(
-    shouldStow,
-    arrayName,
-    gustSpeedKnots,
-    gustLimitKnots,
-  ) {
-    const type = AdvisoryType.STOW_NOW;
-    let message;
-    if (shouldStow) {
-      message = `${arrayName}: Stow immediately - wind gusts at ${Math.round(gustSpeedKnots)}kn exceed limit of ${gustLimitKnots}kn`;
-    } else if (gustSpeedKnots == null || gustSpeedKnots <= 0) {
-      message = `${arrayName}: No stowage needed - no wind gusts detected`;
-    } else {
-      message = `${arrayName}: No stowage needed - gusts ${Math.round(gustSpeedKnots)}kn below limit of ${gustLimitKnots}kn`;
-    }
-
-    this.publishNotification(
-      type,
-      shouldStow ? DeployState.ALERT : DeployState.NORMAL,
-      message,
-    );
   }
 
   /**
@@ -281,13 +300,15 @@ class AdvisoryPublisher {
 
     if (runTime) {
       const hours = Math.round(runTime.hours * 10) / 10;
-      const start = runTime.optimalWindow.start.toLocaleTimeString([], {
-        hour: "2-digit",
-        minute: "2-digit",
-      });
       const end = runTime.optimalWindow.end.toLocaleTimeString([], {
         hour: "2-digit",
         minute: "2-digit",
+        hour12: false,
+      });
+      const start = runTime.optimalWindow.start.toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
       });
       const message = `Run engine for ${hours}h between ${start}-${end} to avoid low battery`;
       this.publishNotification(type, DeployState.WARN, message);
@@ -301,139 +322,6 @@ class AdvisoryPublisher {
   }
 
   /**
-   * Publishes deployment advisories for mechanical generators with debouncing.
-   *
-   * @param {Array<{generatorId: string, generatorName: string, type: string, hour: number, reason: string, action?: string, currentSpeed?: number, maxWindKnots?: number, maxSpeedKnots?: number, minSpeedKnots?: number}>} opportunities - Deployment opportunities
-   * @returns {void}
-   */
-  publishDeploymentAdvisories(opportunities) {
-    const deployType = AdvisoryType.DEPLOY_NOW;
-    const stowType = AdvisoryType.STOW_SOON;
-    const infoType = AdvisoryType.DEPLOY_INFO;
-
-    for (const opp of opportunities) {
-      const key = `${opp.type}_${opp.generatorId}`;
-      const currentState =
-        this.activeNotifications.get(key)?.state !== DeployState.NORMAL;
-
-      if (opp.action === "stow") {
-        // Use hysteresis for stow decisions: stow at max, clear at max - 5
-        const maxWind = opp.maxWindKnots ?? 30;
-        const isOverLimit =
-          opp.currentSpeed != null &&
-          this.applyHysteresis(
-            opp.currentSpeed,
-            maxWind,
-            maxWind - 5,
-            currentState,
-          );
-
-        if (isOverLimit) {
-          this.publishNotification(
-            `${stowType}_${opp.generatorId}`,
-            DeployState.ALERT,
-            `${opp.generatorName}: ${opp.reason}`,
-          );
-        } else {
-          this.publishNotification(
-            `${stowType}_${opp.generatorId}`,
-            DeployState.NORMAL,
-            "",
-          );
-        }
-      } else if (opp.action === "info") {
-        this.publishNotification(
-          `${infoType}_${opp.generatorId}`,
-          DeployState.NORMAL,
-          opp.reason,
-        );
-      } else if (opp.reason && opp.currentSpeed != null) {
-        // Deploy advisory with hysteresis
-        if (opp.type === "hydro") {
-          const minSpeed = opp.minSpeedKnots ?? 3;
-          const shouldDeploy = this.applyHysteresis(
-            opp.currentSpeed,
-            minSpeed,
-            minSpeed - 1,
-            currentState,
-          );
-
-          if (shouldDeploy) {
-            this.publishNotification(
-              `${deployType}_${opp.generatorId}`,
-              DeployState.WARN,
-              `${opp.generatorName}: ${opp.reason}`,
-            );
-          } else {
-            this.publishNotification(
-              `${deployType}_${opp.generatorId}`,
-              DeployState.NORMAL,
-              "",
-            );
-          }
-        } else if (opp.type === "wind") {
-          const maxWind = opp.maxWindKnots ?? 30;
-          const isOverLimit = this.applyHysteresis(
-            opp.currentSpeed,
-            maxWind,
-            maxWind - 5,
-            currentState,
-          );
-
-          if (isOverLimit) {
-            this.publishNotification(
-              `${stowType}_${opp.generatorId}`,
-              DeployState.ALERT,
-              `${opp.generatorName}: Stow - wind ${opp.currentSpeed.toFixed(1)}kn exceeds limit of ${maxWind}kn`,
-            );
-          } else {
-            const deployThreshold = maxWind * 0.7; // Deploy when below 70% of max
-            const shouldDeploy = this.applyHysteresis(
-              opp.currentSpeed,
-              deployThreshold,
-              deployThreshold - 2,
-              currentState,
-            );
-
-            if (shouldDeploy && currentState) {
-              // Clear stow notification
-              this.publishNotification(
-                `${stowType}_${opp.generatorId}`,
-                DeployState.NORMAL,
-                "",
-              );
-            } else if (shouldDeploy) {
-              this.publishNotification(
-                `${deployType}_${opp.generatorId}`,
-                DeployState.WARN,
-                `${opp.generatorName}: ${opp.reason}`,
-              );
-            } else {
-              this.publishNotification(
-                `${deployType}_${opp.generatorId}`,
-                DeployState.NORMAL,
-                "",
-              );
-            }
-          }
-        }
-      } else if (opp.reason) {
-        this.publishNotification(
-          `${deployType}_${opp.generatorId}`,
-          DeployState.WARN,
-          `${opp.generatorName}: ${opp.reason}`,
-        );
-      } else {
-        this.publishNotification(
-          `${deployType}_${opp.generatorId}`,
-          DeployState.NORMAL,
-          "",
-        );
-      }
-    }
-  }
-
-  /**
    * Publishes all advisories based on prediction results.
    *
    * @param {object} params
@@ -442,10 +330,8 @@ class AdvisoryPublisher {
    * @param {Date|null} params.timeToEmpty - Time when battery will be depleted
    * @param {{hour: number, reason: string}|null} params.stowageOpportunity - Mechanical stowage opportunity
    * @param {{hours: number, optimalWindow: {start: Date, end: Date}}|null} params.engineRunTime - Engine run time
-   * @param {boolean} params.flinSailStowNeeded - Whether FLINsail should be stowed
-   * @param {string} params.flinSailName - FLINsail array name
-   * @param {number} params.currentGustKnots - Current gust speed
-   * @param {number} params.gustLimitKnots - FLINsail gust limit
+   * @param {Array<{id: string, name: string, type: string, recommendedState: string, reason: string}>} params.deploymentRecommendations - Deployment recommendations
+   * @param {Map<string, string|null>} params.currentDeployStates - Map of device ID to current state
    * @returns {void}
    */
   publishAll({
@@ -454,11 +340,8 @@ class AdvisoryPublisher {
     timeToEmpty,
     stowageOpportunity,
     engineRunTime,
-    flinSailStowNeeded,
-    flinSailName,
-    currentGustKnots,
-    gustLimitKnots,
-    deploymentOpportunities = [],
+    deploymentRecommendations = [],
+    currentDeployStates = new Map(),
   }) {
     this.app.debug(
       `Publishing advisories for ${hourlyForecast.length} forecast hours`,
@@ -468,16 +351,11 @@ class AdvisoryPublisher {
     this.publishHourlyForecast(hourlyForecast);
     this.publishTimePredictions(timeToFull, timeToEmpty);
 
-    // Publish FLINsail advisory
-    this.publishFLINsailAdvisory(
-      flinSailStowNeeded,
-      flinSailName,
-      currentGustKnots,
-      gustLimitKnots,
+    // Publish deployment state recommendations and notifications
+    this.publishDeploymentStates(
+      deploymentRecommendations,
+      currentDeployStates,
     );
-
-    // Publish deployment advisories for mechanical generators
-    this.publishDeploymentAdvisories(deploymentOpportunities);
 
     // Publish drag reduction advisory
     this.publishDragReductionAdvisory(stowageOpportunity);

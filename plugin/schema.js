@@ -106,6 +106,12 @@ function buildPluginSchema() {
               description:
                 "Signal K path for charge controller mode (optional, for sanitization)",
             },
+            deployStatePath: {
+              type: "string",
+              title: "Deploy State Path",
+              description:
+                "Signal K path for current deploy/stow state (optional). Used to detect if change is needed.",
+            },
             gustLimitKnots: {
               type: "number",
               title: "Gust Limit",
@@ -223,6 +229,12 @@ function buildPluginSchema() {
               type: "string",
               title: "Power Path",
               description: "Signal K path for power output reading (watts)",
+            },
+            deployStatePath: {
+              type: "string",
+              title: "Deploy State Path",
+              description:
+                "Signal K path for current deploy/stow state (optional). Used to detect if change is needed.",
             },
             manufacturerCurve: {
               type: "string",

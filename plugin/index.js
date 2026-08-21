@@ -13,7 +13,7 @@
 const { IngestionFSM, Tier } = require("./ingestion.js");
 const { SolarMatrix } = require("./learning.js");
 const matrixModule = require("./matrix.js");
-const { PredictionEngine } = require("./prediction.js");
+const { PredictionEngine, toNumber } = require("./prediction.js");
 const { AdvisoryPublisher } = require("./advisory.js");
 const {
   buildPluginSchema,
@@ -124,6 +124,25 @@ module.exports = (app) => {
 
   /** @type {{lastPrediction: object, lastForecastTime: Date|null, sourceInfo: object}|null} */
   const statusCache = null;
+
+  /**
+   * Normalizes a deploy state value to "deployed" or "stowed" or null.
+   * Handles various Signal K value formats (string, object with .value).
+   * @param {unknown} val
+   * @returns {string|null}
+   */
+  function normalizeDeployState(val) {
+    if (val == null) return null;
+    if (typeof val === "object" && typeof val.value === "string")
+      val = val.value;
+    if (typeof val === "string") {
+      const lower = val.toLowerCase();
+      if (lower === "deployed" || lower === "deploy") return "deployed";
+      if (lower === "stowed" || lower === "stow" || lower === "retracted")
+        return "stowed";
+    }
+    return null;
+  }
 
   /**
    * Gets active solar arrays from configuration.
@@ -354,28 +373,60 @@ module.exports = (app) => {
       const timeToFull = predictionEngine.getTimeToFull();
       const timeToEmpty = predictionEngine.getTimeToEmpty();
       const stowageOpportunity = predictionEngine.findStowageOpportunity();
-      const deploymentOpportunities =
-        predictionEngine.findDeploymentOpportunities();
 
       const engineRunTime = predictionEngine.calculateEngineRunTime(
         pluginConfig.battery?.engineAlternatorWatts || 100,
       );
 
-      // Check FLINsail risk
-      const flinSailArray = getActiveSolarArrays(pluginConfig).find(
-        (a) => a.type === "deployable",
-      );
-      const currentGHI = await ingestionFSM.getCurrentGHI();
-      const flinSailStowNeeded =
-        flinSailArray &&
-        flinSailArray.gustLimitKnots != null &&
-        currentGHI.gustSpeedKnots != null &&
-        currentGHI.gustSpeedKnots >= flinSailArray.gustLimitKnots;
+      // Get unified deployment recommendations for all deployable systems
+      const deploymentRecommendations =
+        predictionEngine.getDeploymentRecommendations();
 
-      if (flinSailStowNeeded) {
-        app.debug(
-          `FLINsail stow needed: gusts ${currentGHI.gustSpeedKnots.toFixed(1)}kn >= limit ${flinSailArray.gustLimitKnots}kt`,
-        );
+      // Build map of current deploy states from deltaState
+      const navState = deltaState.get("navigation.state");
+      const underway =
+        navState === "sailing" ||
+        navState === "motoring" ||
+        navState === "under way";
+
+      const currentDeployStates = new Map();
+      for (const array of getActiveSolarArrays(pluginConfig)) {
+        if (array.deployStatePath) {
+          const val = deltaState.get(array.deployStatePath);
+          currentDeployStates.set(array.id, normalizeDeployState(val));
+        }
+        // For deployable solar arrays, infer from power output during daytime
+        if (array.type === "deployable" && array.powerPath) {
+          const powerVal = toNumber(deltaState.get(array.powerPath));
+          if (powerVal != null && powerVal > 0) {
+            currentDeployStates.set(array.id, "deployed");
+          }
+        }
+        // FLINsail always stowed when underway
+        if (array.type === "deployable" && underway) {
+          currentDeployStates.set(array.id, "stowed");
+        }
+      }
+      for (const gen of getActiveGenerators(pluginConfig)) {
+        if (gen.deployStatePath) {
+          const val = deltaState.get(gen.deployStatePath);
+          currentDeployStates.set(gen.id, normalizeDeployState(val));
+        }
+        // For deployable generators, infer from power output
+        if (gen.deployable && gen.powerPath) {
+          const powerVal = toNumber(deltaState.get(gen.powerPath));
+          if (powerVal != null && powerVal > 0) {
+            currentDeployStates.set(gen.id, "deployed");
+          }
+        }
+        // Hydro is stowed when not sailing
+        if (gen.deployable && gen.type === "hydro" && navState !== "sailing") {
+          currentDeployStates.set(gen.id, "stowed");
+        }
+        // Wind generators stowed when underway (like FLINsail)
+        if (gen.deployable && gen.type === "wind" && underway) {
+          currentDeployStates.set(gen.id, "stowed");
+        }
       }
 
       // Publish all advisories
@@ -386,11 +437,8 @@ module.exports = (app) => {
         timeToEmpty,
         stowageOpportunity,
         engineRunTime,
-        flinSailStowNeeded,
-        flinSailName: flinSailArray ? getDisplayName(flinSailArray) : "",
-        currentGustKnots: currentGHI.gustSpeedKnots ?? null,
-        gustLimitKnots: flinSailArray?.gustLimitKnots ?? 20,
-        deploymentOpportunities,
+        deploymentRecommendations,
+        currentDeployStates,
       });
       app.debug(`Advisories published successfully`);
 
@@ -643,9 +691,23 @@ module.exports = (app) => {
    * @returns {void}
    */
   function subscribeToDeltas() {
+    // Collect deploy state paths from configured devices
+    const deployStatePaths = [];
+    for (const array of getActiveSolarArrays(pluginConfig)) {
+      if (array.deployStatePath) {
+        deployStatePaths.push(array.deployStatePath);
+      }
+    }
+    for (const gen of getActiveGenerators(pluginConfig)) {
+      if (gen.deployStatePath) {
+        deployStatePaths.push(gen.deployStatePath);
+      }
+    }
+
+    const allPaths = [...SUBSCRIPTION_PATHS, ...deployStatePaths];
     const subscription = {
       context: "vessels.self",
-      subscribe: SUBSCRIPTION_PATHS.map((path) => ({ path })),
+      subscribe: allPaths.map((path) => ({ path })),
     };
 
     app.subscriptionmanager.subscribe(
