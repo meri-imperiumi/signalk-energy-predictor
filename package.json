@@ -5,7 +5,8 @@
   "main": "plugin/index.js",
   "scripts": {
     "lint": "npx @biomejs/biome check --use-editorconfig=true plugin/",
-    "format": "npx @biomejs/biome check --use-editorconfig=true --write plugin/ tests/ bin/",
+    "format": "npx @biomejs/biome check --use-editorconfig=true --write plugin/ tests/ bin/ public/",
+    "lint": "npx @biomejs/biome check --use-editorconfig=true plugin/ public/",
     "test": "node --test --test-force-exit \"tests/*.test.js\"",
     "backtest": "node bin/backtest.js"
   },
@@ -15,7 +16,8 @@
   },
   "keywords": [
     "signalk",
-    "signalk-node-server-plugin"
+    "signalk-node-server-plugin",
+    "signalk-webapp"
   ],
   "author": "Henri Bergius <henri.bergius@iki.fi>",
   "license": "EUPL-1.2",
@@ -26,6 +28,7 @@
   "signalk-plugin-enabled-by-default": false,
   "signalk": {
     "displayName": "Energy Predictor",
+    "appIcon": "./icon.png",
     "externalSchema": "config.json"
   },
   "engines": {

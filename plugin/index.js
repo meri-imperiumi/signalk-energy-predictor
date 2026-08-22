@@ -25,6 +25,8 @@ const {
 const { sunPosition } = require("./solar.js");
 const { formatWh } = require("./format.js");
 const { Recorder } = require("./recorder.js");
+const { registerApiRoutes } = require("./api.js");
+const openApiSpec = require("../schema/openapi.json");
 
 /**
  * Matches propulsion instance paths, e.g. `propulsion.main.state`.
@@ -130,6 +132,7 @@ const deps = {
   PredictionEngine,
   AdvisoryPublisher,
   Recorder,
+  registerApiRoutes,
   loadMatrices: matrixModule.loadAllMatrices,
   saveMatrices: matrixModule.saveMatrices,
   loadLoadProfile: matrixModule.loadLoadProfile,
@@ -265,7 +268,7 @@ module.exports = (app) => {
    */
   async function initializeMatrices(config) {
     const arrays = getActiveSolarArrays(config);
-    const dataDir = app.getDataPath?.() || ".";
+    const dataDir = app.getDataDirPath();
 
     // Load existing matrices
     const existing = await deps.loadMatrices(dataDir);
@@ -297,7 +300,7 @@ module.exports = (app) => {
    * @returns {Promise<void>}
    */
   async function initializeLoadProfile() {
-    const dataDir = app.getDataPath?.() || ".";
+    const dataDir = app.getDataDirPath();
 
     try {
       if (predictionEngine?.loadProfile) {
@@ -380,12 +383,12 @@ module.exports = (app) => {
           status += ` Generating: ${genParts.join(", ")}`;
         }
 
-        // Add 24h forecast summary
-        const totalYield24h = predictionEngine.lastPrediction.reduce(
+        // Add forecast horizon summary
+        const totalYield = predictionEngine.lastPrediction.reduce(
           (sum, p) => sum + p.idealSolarYieldWh + p.idealWindYieldWh,
           0,
         );
-        status += ` 24h: ${formatWh(totalYield24h)}`;
+        status += ` ${predictionEngine.predictionHours}h: ${formatWh(totalYield)}`;
       }
 
       // Add weather source
@@ -645,7 +648,7 @@ module.exports = (app) => {
    * @returns {Promise<void>}
    */
   async function saveMatricesToDisk() {
-    const dataDir = app.getDataPath?.() || ".";
+    const dataDir = app.getDataDirPath();
 
     try {
       const matrices = [];
@@ -1204,11 +1207,13 @@ module.exports = (app) => {
       );
 
       // Initialize components
-      ingestionFSM = new deps.IngestionFSM(app);
+      ingestionFSM = new deps.IngestionFSM(app, {
+        forecastHours: config.weather?.forecastHours,
+      });
       advisoryPublisher = new deps.AdvisoryPublisher(app, plugin.id);
 
       // Initialize recorder
-      const dataDir = app.getDataPath?.() || ".";
+      const dataDir = app.getDataDirPath();
       const recordingConfig = config.recording || {};
       recorder = new deps.Recorder(app, dataDir, recordingConfig);
       recorder.startPruneInterval();
@@ -1232,6 +1237,7 @@ module.exports = (app) => {
         getDisplayName,
         app,
         loadProfileConfig: config.loadProfile || {},
+        predictionHours: config.weather?.forecastHours,
       });
 
       await initializeLoadProfile();
@@ -1367,6 +1373,31 @@ module.exports = (app) => {
      */
     schema() {
       return buildPluginSchema();
+    },
+
+    /**
+     * Registers REST API routes under the plugin router root
+     * (`/plugins/<id>/api/...`).
+     *
+     * @param {object} router - Express router
+     * @returns {void}
+     */
+    registerWithRouter(router) {
+      deps.registerApiRoutes(router, {
+        app,
+        getConfig: () => pluginConfig,
+        dataDir: app.getDataDirPath(),
+      });
+      app.debug("REST API routes registered");
+    },
+
+    /**
+     * Returns the plugin's OpenAPI specification.
+     *
+     * @returns {object} OpenAPI 3 document
+     */
+    getOpenApi() {
+      return openApiSpec;
     },
   };
 

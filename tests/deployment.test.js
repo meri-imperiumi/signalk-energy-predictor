@@ -868,7 +868,7 @@ test.describe("Detected state inference from navigation state", () => {
       getSelfPath(p) {
         return this.pathValues.get(p);
       }
-      getDataPath() {
+      getDataDirPath() {
         return this.dataPath;
       }
       debug() {}
@@ -978,7 +978,7 @@ test.describe("Detected state inference from navigation state", () => {
       getSelfPath(p) {
         return this.pathValues.get(p);
       }
-      getDataPath() {
+      getDataDirPath() {
         return this.dataPath;
       }
       debug() {}
@@ -1080,7 +1080,7 @@ test.describe("Detected state inference from navigation state", () => {
       getSelfPath(p) {
         return this.pathValues.get(p);
       }
-      getDataPath() {
+      getDataDirPath() {
         return this.dataPath;
       }
       debug() {}
@@ -1187,7 +1187,7 @@ test.describe("Detected state inference from navigation state", () => {
       getSelfPath(p) {
         return this.pathValues.get(p);
       }
-      getDataPath() {
+      getDataDirPath() {
         return this.dataPath;
       }
       debug() {}
@@ -1308,7 +1308,7 @@ test.describe("Detected state inference from navigation state", () => {
       getSelfPath(p) {
         return this.pathValues.get(p);
       }
-      getDataPath() {
+      getDataDirPath() {
         return this.dataPath;
       }
       debug() {}
@@ -1414,7 +1414,7 @@ test.describe("Detected state inference from navigation state", () => {
       getSelfPath(p) {
         return this.pathValues.get(p);
       }
-      getDataPath() {
+      getDataDirPath() {
         return this.dataPath;
       }
       debug() {}

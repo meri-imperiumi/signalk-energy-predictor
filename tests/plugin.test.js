@@ -84,7 +84,7 @@ class FakeSignalKApp extends EventEmitter {
     this.emit("delta", { path, value });
   }
 
-  getDataPath() {
+  getDataDirPath() {
     return this.dataPath;
   }
 

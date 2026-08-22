@@ -1,0 +1,200 @@
+:root {
+  --bg-color: #12141d;
+  --panel-bg: #1b1e2b;
+  --text-color: #e8eaf0;
+  --muted-color: #8a90a3;
+  --border-color: #2a2f42;
+  --accent-color: #4f7cff;
+  --solar-color: #f5b942;
+  --wind-color: #4fc3f7;
+  --hydro-color: #26c6aa;
+  --load-color: #ef5b7b;
+  --soc-color: #9ccc65;
+  --gust-wind-color: #b39ddb;
+  --predicted-opacity: 0.55;
+}
+
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family:
+    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  background-color: var(--bg-color);
+  color: var(--text-color);
+  line-height: 1.5;
+  padding: 16px;
+}
+
+ep-app {
+  display: block;
+  max-width: 1100px;
+  margin: 0 auto;
+}
+
+.ep-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.ep-header h1 {
+  font-size: 1.4rem;
+  font-weight: 600;
+}
+
+.ep-error {
+  color: var(--load-color);
+  font-size: 0.9rem;
+  min-height: 1.4em;
+}
+
+/* Reserved for the future status panel (work doc #8 v1 non-goal) */
+.ep-status-panel {
+  display: none;
+}
+
+ep-window-selector {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+ep-window-selector button {
+  background: var(--panel-bg);
+  color: var(--text-color);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 6px 12px;
+  cursor: pointer;
+  font-size: 0.9rem;
+}
+
+ep-window-selector button[aria-pressed="true"] {
+  background: var(--accent-color);
+  border-color: var(--accent-color);
+}
+
+ep-window-selector button.nav {
+  padding: 6px 10px;
+}
+
+ep-window-selector input[type="date"] {
+  background: var(--panel-bg);
+  color: var(--text-color);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 5px 8px;
+  font-size: 0.9rem;
+}
+
+ep-headline-figures {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+ep-headline-figures .figure {
+  background: var(--panel-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+ep-headline-figures .figure .label {
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--muted-color);
+}
+
+ep-headline-figures .figure .value {
+  font-size: 1.25rem;
+  font-weight: 600;
+}
+
+ep-headline-figures .figure .sub {
+  font-size: 0.8rem;
+  color: var(--muted-color);
+}
+
+ep-timeline-chart {
+  display: block;
+  background: var(--panel-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 8px;
+}
+
+.ep-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 6px 8px;
+  font-size: 0.85rem;
+}
+
+.ep-legend button {
+  background: none;
+  border: none;
+  color: var(--muted-color);
+  cursor: pointer;
+  padding: 2px 4px;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.ep-legend button.off {
+  opacity: 0.4;
+  text-decoration: line-through;
+}
+
+.ep-legend .swatch {
+  width: 12px;
+  height: 12px;
+  border-radius: 3px;
+  display: inline-block;
+}
+
+.ep-legend .swatch.predicted {
+  opacity: var(--predicted-opacity);
+}
+
+.ep-chart-svg text {
+  fill: var(--muted-color);
+  font-size: 11px;
+}
+
+.ep-tooltip {
+  position: absolute;
+  pointer-events: none;
+  background: var(--bg-color);
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 0.8rem;
+  white-space: nowrap;
+  display: none;
+  z-index: 10;
+}
+
+.ep-tooltip .time {
+  color: var(--muted-color);
+  margin-bottom: 2px;
+}
+
+.ep-loading {
+  color: var(--muted-color);
+  padding: 24px;
+  text-align: center;
+}

@@ -87,7 +87,7 @@ class FakeSignalKApp extends require("node:events") {
     this.emit("delta", { path, value });
   }
 
-  getDataPath() {
+  getDataDirPath() {
     return this.dataPath;
   }
 
@@ -197,9 +197,9 @@ test.describe("API Surface Tests", () => {
       "app.setSelfPath must be a function",
     );
     assert.strictEqual(
-      typeof app.getDataPath,
+      typeof app.getDataDirPath,
       "function",
-      "app.getDataPath must be a function",
+      "app.getDataDirPath must be a function",
     );
     assert.strictEqual(
       typeof app.debug,

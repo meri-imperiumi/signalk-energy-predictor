@@ -38,9 +38,13 @@ const OPEN_METEO_MAX_ATTEMPTS = 3;
 const OPEN_METEO_RETRY_DELAY_MS = 1000;
 
 /**
- * Number of forecast hours to request
+ * Default number of forecast hours to request. Override via the FSM's
+ * `forecastHours` option (from the `weather.forecastHours` config).
  */
 const FORECAST_HOURS = 48;
+
+/** Maximum configurable forecast horizon in hours (matches schema) */
+const MAX_FORECAST_HOURS = 168;
 
 /**
  * Current tier in the fallback FSM.
@@ -135,7 +139,7 @@ function parseOpenMeteoResponse(data) {
  * @param {number} longitude - Longitude in degrees
  * @returns {Promise<ForecastPoint[]>} Array of forecast points
  */
-async function fetchOpenMeteoOnce(latitude, longitude) {
+async function fetchOpenMeteoOnce(latitude, longitude, hours = FORECAST_HOURS) {
   const url = new URL("https://api.open-meteo.com/v1/forecast");
   url.searchParams.set("latitude", latitude.toString());
   url.searchParams.set("longitude", longitude.toString());
@@ -143,7 +147,7 @@ async function fetchOpenMeteoOnce(latitude, longitude) {
     "hourly",
     "shortwave_radiation,wind_gusts_10m,wind_speed_10m,wind_direction_10m",
   );
-  url.searchParams.set("forecast_hours", FORECAST_HOURS.toString());
+  url.searchParams.set("forecast_hours", hours.toString());
   url.searchParams.set("timezone", "UTC");
 
   const controller = new AbortController();
@@ -206,12 +210,16 @@ function isOpenMeteoRetryable(error) {
 async function fetchOpenMeteo(
   latitude,
   longitude,
-  { retryDelayMs = OPEN_METEO_RETRY_DELAY_MS, onRetry } = {},
+  {
+    retryDelayMs = OPEN_METEO_RETRY_DELAY_MS,
+    onRetry,
+    hours = FORECAST_HOURS,
+  } = {},
 ) {
   let lastError;
   for (let attempt = 1; attempt <= OPEN_METEO_MAX_ATTEMPTS; attempt++) {
     try {
-      return await fetchOpenMeteoOnce(latitude, longitude);
+      return await fetchOpenMeteoOnce(latitude, longitude, hours);
     } catch (error) {
       lastError = error;
       if (attempt === OPEN_METEO_MAX_ATTEMPTS || !isOpenMeteoRetryable(error)) {
@@ -407,9 +415,13 @@ class IngestionFSM {
   /**
    * @param {ServerAPI} app - Signal K server API
    */
-  constructor(app) {
+  constructor(app, { forecastHours } = {}) {
     this.app = app;
     this.currentTier = Tier.OPEN_METEO;
+    this.forecastHours = Math.min(
+      MAX_FORECAST_HOURS,
+      Math.max(FORECAST_HOURS, forecastHours ?? FORECAST_HOURS),
+    );
     this.lastForecast = [];
     this.lastFetchTime = null;
     this.lastFetchAttempt = null; // Timestamp of last fetch attempt (even if failed)
@@ -474,6 +486,7 @@ class IngestionFSM {
         // No network pre-check: just try. The fetch has its own timeout,
         // and a pre-check (e.g. dns.google) can wrongly skip a reachable API.
         return await fetchOpenMeteo(latitude, longitude, {
+          hours: this.forecastHours,
           onRetry: (error, attempt) =>
             this.app.debug(
               `Open-Meteo attempt ${attempt} failed: ${error.message}, retrying`,
@@ -509,7 +522,7 @@ class IngestionFSM {
 
         const points = [];
         const nowMs = Date.now();
-        for (let i = 0; i < FORECAST_HOURS; i++) {
+        for (let i = 0; i < this.forecastHours; i++) {
           const time = new Date(nowMs + i * 3600000);
           const { altitude } = sunPosition(time, latitude, longitude);
           points.push({
@@ -528,7 +541,7 @@ class IngestionFSM {
         this.app.debug("Clear Sky: generating forecast");
         return generateClearSkyForecast(
           new Date(),
-          FORECAST_HOURS,
+          this.forecastHours,
           latitude,
           longitude,
         );
@@ -620,7 +633,7 @@ class IngestionFSM {
     this.lastFetchTime = new Date();
     this.lastForecast = generateClearSkyForecast(
       new Date(),
-      FORECAST_HOURS,
+      this.forecastHours,
       this.position.latitude,
       this.position.longitude,
     );
@@ -745,4 +758,6 @@ module.exports = {
   generateClearSkyForecast,
   synthesizeGHI,
   OPEN_METEO_MAX_ATTEMPTS,
+  FORECAST_HOURS,
+  MAX_FORECAST_HOURS,
 };

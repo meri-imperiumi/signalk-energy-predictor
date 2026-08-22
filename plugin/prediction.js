@@ -12,9 +12,13 @@ const { formatWh } = require("./format.js");
 const SunCalc = require("suncalc");
 
 /**
- * Prediction horizon in hours
+ * Default prediction horizon in hours. Override via the engine's
+ * `predictionHours` option (from the `weather.forecastHours` config).
  */
 const PREDICTION_HOURS = 24;
+
+/** Maximum configurable prediction horizon in hours (matches schema) */
+const MAX_PREDICTION_HOURS = 168;
 
 /**
  * House load smoothing window in hours
@@ -700,6 +704,8 @@ class PredictionEngine {
    * @param {object[]} params.mechanicalGenerators - Wind/hydro generator configurations
    * @param {(arrayId: string, isSailing: boolean, azimuth: number, elevation: number, awa?: number) => number} getEfficiency - Function to get efficiency from learning matrix
    * @param {(path: string) => unknown} getSelfPath - Function to read Signal K values
+   * @param {number} [params.predictionHours] - Prediction horizon in hours
+   *   (24–168; from `weather.forecastHours`, defaults to 24)
    */
   constructor({
     battery,
@@ -710,6 +716,7 @@ class PredictionEngine {
     getDisplayName,
     app,
     loadProfileConfig,
+    predictionHours,
   }) {
     this.battery = battery;
     this.solarArrays = solarArrays;
@@ -719,6 +726,11 @@ class PredictionEngine {
     this.getDisplayName =
       getDisplayName || ((config) => config.name || config.id);
     this.app = app;
+
+    this.predictionHours = Math.min(
+      MAX_PREDICTION_HOURS,
+      Math.max(PREDICTION_HOURS, predictionHours ?? PREDICTION_HOURS),
+    );
 
     this.capacityWh = battery.capacityAh * battery.systemVoltage;
     this.loadProfile = new LoadProfile({
@@ -1560,6 +1572,7 @@ class PredictionEngine {
 
     return recommendations.map((rec) => ({
       ...rec,
+      horizonHours: this.predictionHours,
       missedYieldWh:
         rec.recommendedState === "deployed"
           ? this.getPotentialYieldWh(rec.id)
@@ -1650,12 +1663,12 @@ class PredictionEngine {
       latitude,
       longitude,
       startTime,
-      PREDICTION_HOURS,
+      this.predictionHours,
       underway,
     );
     this.app?.debug?.(`  prediction[0]: ${startTime.toISOString()}`);
 
-    for (let h = 0; h < PREDICTION_HOURS; h++) {
+    for (let h = 0; h < this.predictionHours; h++) {
       const time = new Date(startTime.getTime() + h * 3600000);
 
       // Find corresponding forecast point
@@ -2079,6 +2092,7 @@ module.exports = {
   predictWindHour,
   predictHydroHour,
   PREDICTION_HOURS,
+  MAX_PREDICTION_HOURS,
   toNumber,
   toKnots,
   MS_TO_KN,

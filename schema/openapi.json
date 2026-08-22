@@ -1,0 +1,418 @@
+{
+  "openapi": "3.0.3",
+  "info": {
+    "title": "Signal K Energy Predictor",
+    "description": "Recorded energy predictions and measured values for predicted-vs-actual review. All endpoints are read-only and take ISO-8601 `from`/`to` query parameters; window length is capped at 92 days.",
+    "version": "0.1.0"
+  },
+  "tags": [
+    {
+      "name": "predictions",
+      "description": "Recorded prediction cycles"
+    },
+    {
+      "name": "actuals",
+      "description": "Measured energy values"
+    },
+    {
+      "name": "environment",
+      "description": "Recorded environmental context"
+    },
+    {
+      "name": "summary",
+      "description": "Headline figures for a window"
+    }
+  ],
+  "parameters": {
+    "From": {
+      "name": "from",
+      "in": "query",
+      "required": true,
+      "description": "Window start (inclusive), ISO-8601",
+      "schema": {
+        "type": "string",
+        "format": "date-time",
+        "example": "2026-08-22T00:00:00Z"
+      }
+    },
+    "To": {
+      "name": "to",
+      "in": "query",
+      "required": true,
+      "description": "Window end (inclusive), ISO-8601",
+      "schema": {
+        "type": "string",
+        "format": "date-time",
+        "example": "2026-08-23T00:00:00Z"
+      }
+    }
+  },
+  "paths": {
+    "/api/predictions": {
+      "get": {
+        "tags": ["predictions"],
+        "summary": "Recorded prediction cycles",
+        "description": "Windows of two days or less return raw cycles whose 24h horizon overlaps the window (timestamp, weather tier, full hourly forecast, actions). Longer windows return daily predicted totals per source, built from the freshest prediction available for each hour.",
+        "parameters": [
+          { "$ref": "#/parameters/From" },
+          { "$ref": "#/parameters/To" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Predictions for the window",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    { "$ref": "#/components/schemas/RawPredictions" },
+                    { "$ref": "#/components/schemas/DailyPredictions" }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid or oversized window",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/actuals": {
+      "get": {
+        "tags": ["actuals"],
+        "summary": "Measured series with totals",
+        "description": "Per-source power series downsampled server-side: raw 5-minute samples for windows up to two days, 15-minute averages up to sixteen days, hourly averages beyond. Totals are trapezoidal W→Wh integrations; gaps between samples are not interpolated.",
+        "parameters": [
+          { "$ref": "#/parameters/From" },
+          { "$ref": "#/parameters/To" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Actuals for the window",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Actuals" }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid or oversized window",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/environment": {
+      "get": {
+        "tags": ["environment"],
+        "summary": "Recorded environmental context",
+        "description": "Wind speed with navigation state and position, downsampled like actuals. Wind direction, cloud cover and GHI are reserved fields reported as null until the recorder persists them.",
+        "parameters": [
+          { "$ref": "#/parameters/From" },
+          { "$ref": "#/parameters/To" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Environment for the window",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Environment" }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid or oversized window",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/summary": {
+      "get": {
+        "tags": ["summary"],
+        "summary": "Headline figures for a window",
+        "description": "Consumption and yield totals and averages, SoC statistics, and prediction accuracy (freshest predicted yield vs integrated actual yield per hour)",
+        "parameters": [
+          { "$ref": "#/parameters/From" },
+          { "$ref": "#/parameters/To" }
+        ],
+        "responses": {
+          "200": {
+            "description": "Summary for the window",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Summary" }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid or oversized window",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Error" }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Error": {
+        "type": "object",
+        "properties": {
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "Window": {
+        "type": "object",
+        "properties": {
+          "from": { "type": "string", "format": "date-time" },
+          "to": { "type": "string", "format": "date-time" }
+        }
+      },
+      "ForecastHour": {
+        "type": "object",
+        "properties": {
+          "time": { "type": "string", "format": "date-time" },
+          "idealSolarYieldWh": { "type": "number" },
+          "idealWindYieldWh": {
+            "type": "number",
+            "description": "All mechanical generators (wind and hydro)"
+          },
+          "houseLoadWh": { "type": "number" },
+          "idealNetWh": { "type": "number" },
+          "idealSoC": { "type": "number" },
+          "detectedYieldWh": { "type": "number" },
+          "detectedNetWh": { "type": "number" },
+          "detectedSoC": { "type": "number" },
+          "gustSpeedKnots": { "type": "number" },
+          "windSpeedKnots": { "type": "number" },
+          "actions": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Action" }
+          }
+        }
+      },
+      "Action": {
+        "type": "object",
+        "properties": {
+          "id": { "type": "string" },
+          "type": { "type": "string" },
+          "idealState": { "type": "string", "enum": ["deployed", "stowed"] },
+          "idealAction": { "type": "string", "enum": ["deploy", "stow"] },
+          "detectedAction": {
+            "type": ["string", "null"],
+            "enum": ["deploy", "stow", "stay", null]
+          },
+          "reason": { "type": "string" },
+          "time": { "type": "string", "format": "date-time" }
+        }
+      },
+      "Cycle": {
+        "type": "object",
+        "properties": {
+          "type": {
+            "type": "string",
+            "enum": ["cycle"]
+          },
+          "timestamp": { "type": "string", "format": "date-time" },
+          "weatherTier": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 4
+          },
+          "forecast": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/ForecastHour" }
+          },
+          "actions": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Action" }
+          }
+        }
+      },
+      "RawPredictions": {
+        "type": "object",
+        "properties": {
+          "window": { "$ref": "#/components/schemas/Window" },
+          "granularity": {
+            "type": "string",
+            "enum": ["raw"]
+          },
+          "cycles": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Cycle" }
+          }
+        }
+      },
+      "DailyPrediction": {
+        "type": "object",
+        "properties": {
+          "date": { "type": "string", "format": "date" },
+          "solarWh": { "type": "number" },
+          "windWh": { "type": "number" },
+          "loadWh": { "type": "number" },
+          "netWh": { "type": "number" },
+          "hours": {
+            "type": "integer",
+            "description": "Hours with a recorded prediction"
+          }
+        }
+      },
+      "DailyPredictions": {
+        "type": "object",
+        "properties": {
+          "window": { "$ref": "#/components/schemas/Window" },
+          "granularity": {
+            "type": "string",
+            "enum": ["daily"]
+          },
+          "days": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/DailyPrediction" }
+          }
+        }
+      },
+      "ActualsPoint": {
+        "type": "object",
+        "properties": {
+          "time": { "type": "string", "format": "date-time" },
+          "solarW": { "type": "number" },
+          "windW": { "type": "number" },
+          "hydroW": { "type": "number" },
+          "houseLoadW": { "type": "number" },
+          "soc": { "type": ["number", "null"] },
+          "windSpeedKnots": { "type": ["number", "null"] },
+          "navState": { "type": ["string", "null"] }
+        }
+      },
+      "Actuals": {
+        "type": "object",
+        "properties": {
+          "window": { "$ref": "#/components/schemas/Window" },
+          "granularity": {
+            "type": "string",
+            "enum": ["5min", "15min", "60min"]
+          },
+          "points": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/ActualsPoint" }
+          },
+          "totals": {
+            "type": "object",
+            "properties": {
+              "solarWh": { "type": "number" },
+              "windWh": { "type": "number" },
+              "hydroWh": { "type": "number" },
+              "houseLoadWh": { "type": "number" }
+            }
+          },
+          "averageW": {
+            "type": "object",
+            "properties": {
+              "solar": { "type": "number" },
+              "wind": { "type": "number" },
+              "houseLoad": { "type": "number" }
+            }
+          }
+        }
+      },
+      "EnvironmentPoint": {
+        "type": "object",
+        "properties": {
+          "time": { "type": "string", "format": "date-time" },
+          "windSpeedKnots": { "type": ["number", "null"] },
+          "windDirectionDeg": { "type": ["number", "null"] },
+          "cloudCover": { "type": ["number", "null"] },
+          "ghi": { "type": ["number", "null"] },
+          "navState": { "type": ["string", "null"] },
+          "position": {
+            "type": ["object", "null"],
+            "properties": {
+              "latitude": { "type": "number" },
+              "longitude": { "type": "number" }
+            }
+          }
+        }
+      },
+      "Environment": {
+        "type": "object",
+        "properties": {
+          "window": { "$ref": "#/components/schemas/Window" },
+          "granularity": {
+            "type": "string",
+            "enum": ["5min", "15min", "60min"]
+          },
+          "points": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/EnvironmentPoint" }
+          }
+        }
+      },
+      "Summary": {
+        "type": "object",
+        "properties": {
+          "window": { "$ref": "#/components/schemas/Window" },
+          "consumption": {
+            "type": "object",
+            "properties": {
+              "totalWh": { "type": "number" },
+              "averageW": { "type": "number" }
+            }
+          },
+          "yield": {
+            "type": "object",
+            "properties": {
+              "solar": { "$ref": "#/components/schemas/YieldStats" },
+              "wind": { "$ref": "#/components/schemas/YieldStats" },
+              "hydro": { "$ref": "#/components/schemas/YieldStats" },
+              "combined": { "$ref": "#/components/schemas/YieldStats" }
+            }
+          },
+          "soc": {
+            "type": "object",
+            "properties": {
+              "min": { "type": ["number", "null"] },
+              "average": { "type": ["number", "null"] },
+              "max": { "type": ["number", "null"] }
+            }
+          },
+          "predictionAccuracy": {
+            "type": "object",
+            "properties": {
+              "hoursCompared": { "type": "integer" },
+              "meanAbsoluteErrorPercent": { "type": ["number", "null"] },
+              "totalPredictedWh": { "type": ["number", "null"] },
+              "totalActualWh": { "type": ["number", "null"] },
+              "totalErrorPercent": { "type": ["number", "null"] }
+            }
+          }
+        }
+      },
+      "YieldStats": {
+        "type": "object",
+        "properties": {
+          "totalWh": { "type": "number" },
+          "averageW": { "type": ["number", "null"] }
+        }
+      }
+    }
+  }
+}

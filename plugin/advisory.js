@@ -241,7 +241,7 @@ class AdvisoryPublisher {
       // normal-state informational messages
       const yieldSuffix =
         rec.recommendedState === "deployed" && rec.missedYieldWh > 0
-          ? ` (${formatWh(rec.missedYieldWh)} in 24h)`
+          ? ` (${formatWh(rec.missedYieldWh)} in ${rec.horizonHours ?? 24}h)`
           : "";
 
       if (needsChange) {
