@@ -24,6 +24,7 @@ const {
 } = require("./schema.js");
 const { sunPosition } = require("./solar.js");
 const { formatWh } = require("./format.js");
+const { Recorder } = require("./recorder.js");
 
 /**
  * Matches propulsion instance paths, e.g. `propulsion.main.state`.
@@ -128,6 +129,7 @@ const deps = {
   IngestionFSM,
   PredictionEngine,
   AdvisoryPublisher,
+  Recorder,
   loadMatrices: matrixModule.loadAllMatrices,
   saveMatrices: matrixModule.saveMatrices,
   validateConfig,
@@ -152,11 +154,17 @@ module.exports = (app) => {
   /** @type {AdvisoryPublisher|null} */
   let advisoryPublisher = null;
 
+  /** @type {Recorder|null} */
+  let recorder = null;
+
   /** @type {number|null} */
   let updateIntervalId = null;
 
   /** @type {number|null} */
   let saveIntervalId = null;
+
+  /** @type {number|null} */
+  let sampleIntervalId = null;
 
   /** @type {Function[]} */
   const unsubscribes = [];
@@ -584,6 +592,17 @@ module.exports = (app) => {
       });
       app.debug(`Advisories published successfully`);
 
+      // Record the prediction cycle
+      const forecastObjects = predictionEngine.getHourlyForecast();
+      const sourceInfo = ingestionFSM.getSourceInfo();
+      const weatherTier = sourceInfo.tier || 1;
+      await recorder?.recordCycle({
+        timestamp: new Date(),
+        weatherTier,
+        forecast: forecastObjects,
+        actions: hourly.flatMap((h) => h.actions || []),
+      });
+
       app.debug(`Prediction cycle complete: ${hourly.length} hours forecasted`);
 
       // Update status line
@@ -871,14 +890,14 @@ module.exports = (app) => {
         const windowMs =
           (pluginConfig?.learning?.averageWindowSeconds ??
             DEFAULT_POWER_AVERAGE_WINDOW_MS / 1000) * 1000;
-        const windowSamples = samples.filter((s) => s.time >= Date.now() - windowMs);
+        const windowSamples = samples.filter(
+          (s) => s.time >= Date.now() - windowMs,
+        );
         const actualPowerW =
           windowSamples.length > 0
             ? windowSamples.reduce((sum, s) => sum + s.value, 0) /
               windowSamples.length
-            : toNumber(
-                deltaState.get(powerPath) || app.getSelfPath(powerPath),
-              );
+            : toNumber(deltaState.get(powerPath) || app.getSelfPath(powerPath));
 
         if (actualPowerW == null || actualPowerW <= 0) {
           app.debug(
@@ -952,6 +971,102 @@ module.exports = (app) => {
     } catch (error) {
       app.error(`Failed to process learning cycle: ${error.message}`);
     }
+  }
+
+  /**
+   * Records a 5-minute sample of current measured values.
+   * Captures per-array power, per-generator power, SoC, house load, wind speed,
+   * navigation state, and position.
+   *
+   * @returns {Promise<void>}
+   */
+  async function recordSample() {
+    if (!recorder) {
+      return;
+    }
+
+    // Get per-array power readings
+    const arrays = {};
+    for (const array of getActiveSolarArrays(pluginConfig)) {
+      if (array.powerPath) {
+        const powerW = toNumber(
+          deltaState.get(array.powerPath) || app.getSelfPath(array.powerPath),
+        );
+        if (powerW != null) {
+          arrays[array.id] = powerW;
+        }
+      }
+    }
+
+    // Get per-generator power readings
+    const generators = {};
+    for (const gen of getActiveGenerators(pluginConfig)) {
+      if (gen.powerPath) {
+        const powerW = toNumber(
+          deltaState.get(gen.powerPath) || app.getSelfPath(gen.powerPath),
+        );
+        if (powerW != null) {
+          generators[gen.id] = powerW;
+        }
+      }
+    }
+
+    // Get battery SoC
+    const socPath =
+      pluginConfig?.battery?.socPath ||
+      "electrical.batteries.house.capacity.stateOfCharge";
+    let soc = deltaState.get(socPath) || app.getSelfPath(socPath);
+    // Handle Signal K object-structured values
+    if (soc && typeof soc === "object" && typeof soc.value === "number") {
+      soc = soc.value;
+    }
+    soc = toNumber(soc);
+
+    // Get house load (sum of all dcPower readings from venus)
+    const houseLoadW =
+      toNumber(
+        deltaState.get("electrical.venus.dcPower") ||
+          app.getSelfPath("electrical.venus.dcPower"),
+      ) || 0;
+
+    // Get wind speed
+    const windSpeedKnots =
+      toKnots(
+        deltaState.get("environment.wind.speedApparent") ||
+          app.getSelfPath("environment.wind.speedApparent"),
+      ) ||
+      toKnots(
+        deltaState.get("environment.wind.speedOverGround") ||
+          app.getSelfPath("environment.wind.speedOverGround"),
+      ) ||
+      toKnots(
+        deltaState.get("environment.wind.speedTrue") ||
+          app.getSelfPath("environment.wind.speedTrue"),
+      ) ||
+      null;
+
+    // Get navigation state
+    const navState =
+      deltaState.get("navigation.state") ||
+      app.getSelfPath("navigation.state") ||
+      "unknown";
+
+    // Get position
+    const position =
+      deltaState.get("navigation.position") ||
+      app.getSelfPath("navigation.position") ||
+      null;
+
+    await recorder.recordSample({
+      timestamp: new Date(),
+      arrays,
+      generators,
+      soc,
+      houseLoadW,
+      windSpeedKnots,
+      navState,
+      position,
+    });
   }
 
   /**
@@ -1057,6 +1172,15 @@ module.exports = (app) => {
       ingestionFSM = new deps.IngestionFSM(app);
       advisoryPublisher = new deps.AdvisoryPublisher(app, plugin.id);
 
+      // Initialize recorder
+      const dataDir = app.getDataPath?.() || ".";
+      const recordingConfig = config.recording || {};
+      recorder = new deps.Recorder(app, dataDir, recordingConfig);
+      recorder.startPruneInterval();
+      app.debug(
+        `Recorder initialized: enabled=${recorder.enabled}, retentionDays=${recorder.retentionDays}`,
+      );
+
       await initializeMatrices(config);
 
       // Configure prediction engine
@@ -1104,6 +1228,17 @@ module.exports = (app) => {
         });
       }, saveInterval);
 
+      // Start 5-minute sample recording interval
+      const sampleIntervalMs = 5 * 60 * 1000;
+      app.debug(
+        `Scheduling sample recording every ${sampleIntervalMs / 1000} seconds`,
+      );
+      sampleIntervalId = setInterval(() => {
+        recordSample().catch((error) => {
+          app.error(`Sample recording error: ${error.message}`);
+        });
+      }, sampleIntervalMs);
+
       // Run initial prediction
       app.debug(`Running initial prediction cycle...`);
       await runPredictionCycle();
@@ -1144,6 +1279,17 @@ module.exports = (app) => {
       if (learningTimer != null) {
         clearTimeout(learningTimer);
         learningTimer = null;
+      }
+
+      if (sampleIntervalId) {
+        clearInterval(sampleIntervalId);
+        sampleIntervalId = null;
+      }
+
+      // Stop recorder
+      if (recorder) {
+        recorder.stopPruneInterval();
+        recorder = null;
       }
 
       // Unsubscribe from deltas
@@ -1191,8 +1337,10 @@ module.exports = (app) => {
     ingestionFSM,
     predictionEngine,
     advisoryPublisher,
+    recorder,
     solarMatrices,
     runPredictionCycle,
+    recordSample,
     get learningCycleCount() {
       return learningCycleCount;
     },

@@ -751,9 +751,8 @@ test.describe("Solar learning regression", () => {
       { path: powerPath, value: 42 },
     ]);
     await new Promise((resolve) => setTimeout(resolve, 200));
-    const afterStopped = plugin
-      .__getInternals()
-      .solarMatrices.get("cabin-roof").anchored.size;
+    const afterStopped = plugin.__getInternals().solarMatrices.get("cabin-roof")
+      .anchored.size;
     assert.ok(afterStopped > 0, "stopped engines allow learning");
 
     // Now one engine started: gate must drop the tick (bin count unchanged
@@ -763,9 +762,8 @@ test.describe("Solar learning regression", () => {
       { path: powerPath, value: 45 },
     ]);
     await new Promise((resolve) => setTimeout(resolve, 200));
-    const afterStarted = plugin
-      .__getInternals()
-      .solarMatrices.get("cabin-roof").anchored.size;
+    const afterStarted = plugin.__getInternals().solarMatrices.get("cabin-roof")
+      .anchored.size;
     assert.strictEqual(
       afterStarted,
       afterStopped,

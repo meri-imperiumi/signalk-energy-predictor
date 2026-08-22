@@ -356,6 +356,29 @@ function buildPluginSchema() {
           },
         },
       },
+      recording: {
+        type: "object",
+        title: "Recording Configuration",
+        description:
+          "Store predictions and measured values for the timeline webapp",
+        properties: {
+          enabled: {
+            type: "boolean",
+            title: "Enable Recording",
+            description:
+              "Record prediction cycles and measured samples to disk",
+            default: true,
+          },
+          retentionDays: {
+            type: "number",
+            title: "Retention Days",
+            description: "Number of days to keep recordings before pruning",
+            default: 90,
+            minimum: 1,
+            maximum: 365,
+          },
+        },
+      },
     },
     required: ["battery", "solarArrays"],
   };
