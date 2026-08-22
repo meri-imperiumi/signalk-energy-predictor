@@ -312,6 +312,86 @@ test.describe("Open-Meteo fetch error handling", () => {
     );
   });
 
+  test("all-null values are rejected as a data gap without retry", async () => {
+    // Open-Meteo returns null for unavailable hours; an all-null array must
+    // not become a confident zero-wind, zero-solar forecast
+    let calls = 0;
+    await withFetch(
+      async () => {
+        calls++;
+        return {
+          ok: true,
+          json: async () => ({
+            hourly: {
+              time: ["2026-08-22T21:00", "2026-08-22T22:00"],
+              shortwave_radiation: [null, null],
+              wind_speed_10m: [null, null],
+              wind_gusts_10m: [null, null],
+            },
+          }),
+        };
+      },
+      async () => {
+        await assert.rejects(
+          fetchOpenMeteo(60.17, 24.94, { retryDelayMs: 1 }),
+          /no usable shortwave_radiation/,
+        );
+        assert.strictEqual(calls, 1);
+      },
+    );
+  });
+
+  test("partial nulls are preserved, not treated as a data gap", async () => {
+    await withFetch(
+      async () => ({
+        ok: true,
+        json: async () => ({
+          hourly: {
+            time: ["2026-08-22T21:00", "2026-08-22T22:00"],
+            shortwave_radiation: [100, null],
+            wind_speed_10m: [18, null],
+          },
+        }),
+      }),
+      async () => {
+        const points = await fetchOpenMeteo(60.17, 24.94, { retryDelayMs: 1 });
+        assert.strictEqual(points.length, 2);
+        assert.strictEqual(points[0].ghi, 100);
+        assert.strictEqual(points[1].ghi, 0); // isolated null maps to zero
+        assert.strictEqual(points[1].windSpeedKnots, null);
+      },
+    );
+  });
+
+  test("all-null Open-Meteo payload falls through to the next tier", async () => {
+    const fsm = makeFSM();
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u.includes("open-meteo")) {
+        return {
+          ok: true,
+          json: async () => ({
+            hourly: {
+              time: ["2026-08-22T21:00", "2026-08-22T22:00"],
+              shortwave_radiation: [null, null],
+            },
+          }),
+        };
+      }
+      throw new Error("network down"); // lower tiers unavailable
+    };
+
+    try {
+      const forecast = await fsm.fetchForecast();
+      // Must not stay on tier 1 serving zeros - clear sky is honest fallback
+      assert.strictEqual(fsm.currentTier, Tier.CLEAR_SKY);
+      assert.ok(forecast.some((p) => (p.ghi ?? 0) > 0));
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
   test("FSM stays on Open-Meteo tier across a transient failure", async () => {
     const fsm = makeFSM();
     let calls = 0;

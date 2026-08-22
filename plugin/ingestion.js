@@ -71,9 +71,16 @@ const Tier = {
 /**
  * Parses and validates an Open-Meteo hourly response into forecast points.
  *
+ * Open-Meteo returns `null` for hours where a variable is unavailable. That
+ * is a data gap, not a forecast: mapping it to zero would publish calm-wind,
+ * dark-sky predictions with full confidence (observed in the wild: a tier-1
+ * "success" with 0 kn wind and 0 Wh solar for all 24 h, cached for 15 min).
+ * An all-null primary variable is therefore treated as a failed fetch so the
+ * FSM falls through to the next tier.
+ *
  * @param {object} data - Parsed JSON response body
  * @returns {ForecastPoint[]} Array of forecast points
- * @throws {Error} if the payload is malformed
+ * @throws {Error} if the payload is malformed or carries no usable data
  */
 function parseOpenMeteoResponse(data) {
   const { hourly } = data || {};
@@ -90,6 +97,11 @@ function parseOpenMeteoResponse(data) {
   if (hourly.time.length !== hourly.shortwave_radiation.length) {
     throw new Error(
       `Open-Meteo hourly arrays mismatch: ${hourly.time.length} times vs ${hourly.shortwave_radiation.length} radiation values`,
+    );
+  }
+  if (!hourly.shortwave_radiation.some((v) => v != null)) {
+    throw new Error(
+      "Open-Meteo returned no usable shortwave_radiation values (all null)",
     );
   }
 
