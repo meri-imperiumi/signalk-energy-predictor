@@ -167,7 +167,48 @@ If the rolling energy balance projects the SoC will drop below `config.battery.m
 
 ---
 
-## 6. Signal K API Contracts
+## 6. State Persistence & Recovery
+
+The plugin maintains two types of learned state that **must persist across server restarts**:
+
+### 6.1 Learned State Components
+
+| Component | Description | Storage Format | Save Frequency |
+| --- | --- | --- | --- |
+| **Solar Efficiency Matrices** | Per-array EMA efficiency binned by sun position and sailing state | `solar-matrix-{id}.json` + `.matrices-manifest` | Every `learning.saveIntervalMinutes` (default: 15 min) + on plugin stop() |
+| **Load Profile** | House load EMA binned by navigation state and sun phase | `load-profile.json` | Every `learning.saveIntervalMinutes` (default: 15 min) + on plugin stop() |
+
+### 6.2 Persistence Guarantees
+
+- Learned state is loaded from disk on plugin startup, restoring all previously learned efficiencies and load profiles
+- State is saved to disk periodically (every `learning.saveIntervalMinutes`)
+- On graceful plugin shutdown (via Signal K admin UI or server stop), state is saved before termination via the `stop()` method
+- State files are written atomically using write-then-rename to prevent corruption
+- The `.matrices-manifest` file tracks which matrix files exist, enabling recovery even if individual files are missing
+
+### 6.3 Transient State (Not Persisted)
+
+The following state is intentionally NOT persisted, as it repopulates from live Signal K deltas:
+
+- `deltaState` - Current Signal K values from active subscriptions
+- `solarPowerHistory` - 5-minute rolling average window for learning smoothing
+- `windHistory` - 5-minute rolling window for wind generator detection
+- Runtime flags (`hasPosition`, `learningRunning`, etc.)
+
+**Note:** Abrupt process termination (e.g., SIGKILL, power loss, server crash) may lose learned data from the previous `saveIntervalMinutes` period. This is acceptable—the periodic saves limit data loss to a small window.
+
+### 6.4 Recovery Behavior
+
+On plugin restart:
+
+1. Existing matrices are loaded from disk; missing arrays start with new matrices using `learning.defaultEfficiency`
+2. Load profile bins are restored; missing bins fall back to rolling average until sufficient samples are collected
+3. Transient state buffers start empty and accumulate from incoming deltas
+4. No learned efficiency data is lost across restarts (within the `saveIntervalMinutes` window for unexpected shutdowns, zero loss for graceful shutdown)
+
+---
+
+## 7. Signal K API Contracts
 
 ### 6.1 Required Subscriptions (Inputs)
 

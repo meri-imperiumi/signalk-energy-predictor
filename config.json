@@ -232,9 +232,9 @@
         "saveIntervalMinutes": {
           "type": "number",
           "title": "Save Interval",
-          "description": "How often to save learning matrices to disk (minutes)",
-          "default": 60,
-          "minimum": 10,
+          "description": "How often to save learning matrices to disk (minutes). State is also saved on graceful plugin shutdown.",
+          "default": 15,
+          "minimum": 5,
           "maximum": 1440
         },
         "minIntervalSeconds": {

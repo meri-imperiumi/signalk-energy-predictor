@@ -90,7 +90,7 @@ const DEFAULT_CONFIG = {
   mechanicalGenerators: [],
   learning: {
     enabled: true,
-    saveIntervalMinutes: 60,
+    saveIntervalMinutes: 15,
     emaAlpha: 0.05,
     defaultEfficiency: 0.7,
   },
