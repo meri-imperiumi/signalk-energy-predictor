@@ -225,6 +225,46 @@ async function restoreMatrices(dataDir, backupPath) {
   return data.matrices.length;
 }
 
+/**
+ * Gets the load profile file path.
+ *
+ * @param {string} dataDir - Plugin data directory
+ * @returns {string} File path
+ */
+function loadProfilePath(dataDir) {
+  return join(dataDir, "load-profile.json");
+}
+
+/**
+ * Loads the load profile from disk.
+ *
+ * @param {string} dataDir - Plugin data directory
+ * @param {object} loadProfile - LoadProfile instance to populate
+ * @returns {Promise<boolean>} True if loaded, false if file doesn't exist
+ */
+async function loadLoadProfile(dataDir, loadProfile) {
+  const path = loadProfilePath(dataDir);
+  const data = await readJsonFile(path);
+
+  if (data) {
+    loadProfile.fromJSON(data);
+    return true;
+  }
+  return false;
+}
+
+/**
+ * Saves the load profile to disk.
+ *
+ * @param {string} dataDir - Plugin data directory
+ * @param {object} loadProfile - LoadProfile instance
+ * @returns {Promise<void>}
+ */
+async function saveLoadProfile(dataDir, loadProfile) {
+  const path = loadProfilePath(dataDir);
+  await writeJsonFile(path, loadProfile.toJSON());
+}
+
 module.exports = {
   matrixFilename,
   loadMatrix,
@@ -235,4 +275,7 @@ module.exports = {
   listSavedMatrices,
   backupMatrices,
   restoreMatrices,
+  loadProfilePath,
+  loadLoadProfile,
+  saveLoadProfile,
 };

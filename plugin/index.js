@@ -132,6 +132,8 @@ const deps = {
   Recorder,
   loadMatrices: matrixModule.loadAllMatrices,
   saveMatrices: matrixModule.saveMatrices,
+  loadLoadProfile: matrixModule.loadLoadProfile,
+  saveLoadProfile: matrixModule.saveLoadProfile,
   validateConfig,
 };
 
@@ -286,6 +288,31 @@ module.exports = (app) => {
         solarMatrices.set(id, new deps.SolarMatrix(id));
         app.debug(`Created new solar matrix for ${id}`);
       }
+    }
+  }
+
+  /**
+   * Initializes the load profile from disk.
+   *
+   * @returns {Promise<void>}
+   */
+  async function initializeLoadProfile() {
+    const dataDir = app.getDataPath?.() || ".";
+
+    try {
+      if (predictionEngine?.loadProfile) {
+        const loaded = await deps.loadLoadProfile(
+          dataDir,
+          predictionEngine.loadProfile,
+        );
+        if (loaded) {
+          app.debug(`Loaded load profile from disk`);
+        } else {
+          app.debug(`No load profile found on disk, starting fresh`);
+        }
+      }
+    } catch (error) {
+      app.error(`Failed to load load profile: ${error.message}`);
     }
   }
 
@@ -630,6 +657,14 @@ module.exports = (app) => {
       app.debug(`Saved ${matrices.length} solar matrices`);
     } catch (error) {
       app.error(`Failed to save matrices: ${error.message}`);
+    }
+
+    // Save load profile
+    try {
+      await deps.saveLoadProfile(dataDir, predictionEngine?.loadProfile);
+      app.debug(`Saved load profile`);
+    } catch (error) {
+      app.error(`Failed to save load profile: ${error.message}`);
     }
   }
 
@@ -1196,7 +1231,10 @@ module.exports = (app) => {
         getSelfPath: (path) => deltaState.get(path) ?? app.getSelfPath(path),
         getDisplayName,
         app,
+        loadProfileConfig: config.loadProfile || {},
       });
+
+      await initializeLoadProfile();
 
       // Subscribe to Signal K updates
       subscribeToDeltas();

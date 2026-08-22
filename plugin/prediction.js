@@ -9,6 +9,7 @@
 
 const { sunPosition, nextSunrise, lastSunset } = require("./solar.js");
 const { formatWh } = require("./format.js");
+const SunCalc = require("suncalc");
 
 /**
  * Prediction horizon in hours
@@ -224,39 +225,367 @@ function predictHydroHour({
 /**
  * Maintains a rolling average of house loads.
  */
+/**
+ * Sun phase classification.
+ * @enum {string}
+ */
+const SunPhase = {
+  DAWN: "dawn",
+  DAY: "day",
+  DUSK: "dusk",
+  NIGHT: "night",
+};
+
+/**
+ * State class classification.
+ * @enum {string}
+ */
+const StateClass = {
+  UNDERWAY: "underway",
+  AT_REST: "at-rest",
+};
+
+/**
+ * Load profile with sun-phase binned EMA for AC and DC loads.
+ */
 class LoadProfile {
-  constructor() {
-    this.samples = []; // Array of {time: Date, loadWh}
+  /**
+   * Creates a new LoadProfile instance.
+   *
+   * @param {object} params
+   * @param {object} [params.config] - Load profile configuration
+   * @param {boolean} [params.config.enabled=true] - Whether learning is enabled
+   * @param {number} [params.config.alpha=0.05] - EMA alpha
+   * @param {number} [params.config.minDaysPerBin=3] - Minimum days before bin is used
+   * @param {number} [params.config.outlierFactor=3] - Factor for spike gate
+   * @param {(path: string) => unknown} params.getSelfPath - Function to read Signal K values
+   * @param {object} params.app - Signal K server API (for logging)
+   */
+  constructor({ config = {}, getSelfPath, app } = {}) {
+    // Configuration
+    this.enabled = config.enabled !== false;
+    this.alpha = config.alpha ?? 0.05;
+    this.minDaysPerBin = config.minDaysPerBin ?? 3;
+    this.outlierFactor = config.outlierFactor ?? 3;
+
+    this.getSelfPath = getSelfPath;
+    this.app = app;
+
+    // 8 bins: 2 state classes × 4 sun phases
+    // Each bin tracks AC and DC separately
+    this.bins = new Map();
+    this.samplesPerBin = new Map(); // Track number of days for minSamples gate
+
+    // Current rolling average (fallback for unlearned bins)
+    this.samples = []; // {time: Date, dcLoadW: number, acLoadW: number}
   }
 
   /**
-   * Adds a load sample.
+   * Gets the bin key for a given state class and sun phase.
    *
-   * @param {number} loadWh - Load in watt-hours (instantaneous, convert if reading is watts)
+   * @param {string} stateClass - State class (underway or at-rest)
+   * @param {string} sunPhase - Sun phase (dawn, day, dusk, night)
+   * @returns {string} Bin key
    */
-  addSample(loadWh) {
-    this.samples.push({
-      time: new Date(),
-      loadWh,
-    });
+  getBinKey(stateClass, sunPhase) {
+    return `${stateClass}:${sunPhase}`;
+  }
 
-    // Keep samples within smoothing window
+  /**
+   * Gets the sun phase for a given timestamp and position.
+   *
+   * @param {Date} timestamp - Timestamp to evaluate
+   * @param {{latitude: number, longitude: number}|null} position - Position
+   * @returns {string} Sun phase
+   */
+  getSunPhase(timestamp, position) {
+    if (!position || position.latitude == null || position.longitude == null) {
+      return SunPhase.DAY; // Default to day if no position
+    }
+
+    const date = new Date(timestamp);
+    const times = SunCalc.getTimes(date, position.latitude, position.longitude);
+
+    if (!times.sunrise || !times.sunset) {
+      return SunPhase.DAY;
+    }
+
+    const sunrise = new Date(times.sunrise);
+    const sunset = new Date(times.sunset);
+
+    const dawnStart = new Date(sunrise.getTime() - 2 * 3600000);
+    const duskEnd = new Date(sunset.getTime() + 2 * 3600000);
+
+    if (timestamp >= dawnStart && timestamp < sunrise) {
+      return SunPhase.DAWN;
+    }
+    if (timestamp >= sunrise && timestamp < sunset) {
+      return SunPhase.DAY;
+    }
+    if (timestamp >= sunset && timestamp < duskEnd) {
+      return SunPhase.DUSK;
+    }
+    return SunPhase.NIGHT;
+  }
+
+  /**
+   * Gets the current state class (underway or at-rest).
+   *
+   * @returns {string} State class
+   */
+  getStateClass() {
+    const state = this.getSelfPath("navigation.state");
+    if (
+      typeof state === "string" &&
+      ["sailing", "motoring", "under way"].includes(state)
+    ) {
+      return StateClass.UNDERWAY;
+    }
+    return StateClass.AT_REST;
+  }
+
+  /**
+   * Checks if engine is currently running.
+   *
+   * @returns {boolean|null} true if any engine is running, false if all stopped, null if unknown
+   */
+  isEngineRunning() {
+    let anyRunning = false;
+    let anySignal = false;
+
+    // Check propulsion.*.state
+    for (const path of ["propulsion.main.state", "propulsion.aux.state"]) {
+      const val = this.getSelfPath(path);
+      if (val != null) {
+        anySignal = true;
+        if (val === "started") {
+          anyRunning = true;
+        }
+      }
+    }
+
+    // Check propulsion.*.revolutions
+    for (const path of [
+      "propulsion.main.revolutions",
+      "propulsion.aux.revolutions",
+    ]) {
+      const val = this.getSelfPath(path);
+      const rpm = toNumber(val);
+      if (rpm != null) {
+        anySignal = true;
+        if (rpm > 0) {
+          anyRunning = true;
+        }
+      }
+    }
+
+    return anySignal ? anyRunning : null;
+  }
+
+  /**
+   * Checks if shore power is connected.
+   *
+   * @returns {boolean}
+   */
+  isShorePowerConnected() {
+    const val = this.getSelfPath("electrical.shore.power.connected");
+    return val === true || (typeof val === "object" && val.value === true);
+  }
+
+  /**
+   * Checks if a sample should be gated out (not learned).
+   *
+   * @param {number} dcLoadW - DC load in watts
+   * @param {number} acLoadW - AC load in watts
+   * @param {string} binKey - Bin key for the sample
+   * @returns {string|null} Gate name if gated, null if should sample
+   */
+  shouldGate(dcLoadW, acLoadW, binKey) {
+    // Shore power gate
+    if (this.isShorePowerConnected()) {
+      return "shore-power";
+    }
+
+    // Engine running gate
+    if (this.isEngineRunning() === true) {
+      return "engine-running";
+    }
+
+    // Spike/outlier gate (only check if we have an EMA value)
+    const bin = this.bins.get(binKey);
+    const totalLoadW = dcLoadW + acLoadW;
+    if (bin && bin.dcEma != null) {
+      const currentEma = bin.dcEma + bin.acEma;
+      if (totalLoadW > currentEma * this.outlierFactor) {
+        return "spike-outlier";
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Tracks days sampled per bin for the minSamples gate.
+   *
+   * @param {string} binKey - Bin key
+   * @returns {void}
+   */
+  trackSampleDay(binKey) {
+    const today = new Date().toISOString().split("T")[0];
+    const key = `${binKey}:${today}`;
+    if (!this.samplesPerBin.has(key)) {
+      this.samplesPerBin.set(key, true);
+    }
+  }
+
+  /**
+   * Gets the number of distinct days a bin has samples from.
+   *
+   * @param {string} binKey - Bin key
+   * @returns {number} Number of days
+   */
+  getSampleDays(binKey) {
+    let count = 0;
+    for (const key of this.samplesPerBin.keys()) {
+      if (key.startsWith(binKey + ":")) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  /**
+   * Adds a load sample to the appropriate bin.
+   *
+   * @param {number} dcLoadW - DC load in watts
+   * @param {number} acLoadW - AC load in watts
+   * @param {{latitude: number, longitude: number}|null} position - Current position
+   * @returns {void}
+   */
+  addSample(dcLoadW, acLoadW, position) {
+    const now = new Date();
+
+    // Track in rolling average (fallback)
+    this.samples.push({
+      time: now,
+      dcLoadW,
+      acLoadW,
+    });
     const cutoff = Date.now() - LOAD_SMOOTHING_HOURS * 3600000;
     this.samples = this.samples.filter((s) => s.time.getTime() > cutoff);
+
+    if (!this.enabled) {
+      return;
+    }
+
+    // Get bin key
+    const stateClass = this.getStateClass();
+    const sunPhase = this.getSunPhase(now, position);
+    const binKey = this.getBinKey(stateClass, sunPhase);
+
+    // Check gates
+    const gate = this.shouldGate(dcLoadW, acLoadW, binKey);
+    if (gate) {
+      this.app?.debug?.(
+        `Load profile gated: ${gate}, state=${stateClass}, phase=${sunPhase}`,
+      );
+      return;
+    }
+
+    // Track sample day for minSamples gate
+    this.trackSampleDay(binKey);
+
+    // Get or create bin
+    let bin = this.bins.get(binKey);
+    if (!bin) {
+      bin = { dcEma: null, acEma: null };
+      this.bins.set(binKey, bin);
+    }
+
+    // Update EMAs
+    if (bin.dcEma == null) {
+      bin.dcEma = dcLoadW;
+      bin.acEma = acLoadW;
+    } else {
+      bin.dcEma = this.alpha * dcLoadW + (1 - this.alpha) * bin.dcEma;
+      bin.acEma = this.alpha * acLoadW + (1 - this.alpha) * bin.acEma;
+    }
+
+    this.app?.debug?.(
+      `Load profile sample: state=${stateClass}, phase=${sunPhase}, dc=${Math.round(dcLoadW)}W, ac=${Math.round(acLoadW)}W`,
+    );
   }
 
   /**
-   * Gets the average hourly load.
+   * Gets the load for a given sun phase and state class.
    *
-   * @returns {number} Average load in watt-hours per hour
+   * @param {string} sunPhase - Sun phase
+   * @param {string} stateClass - State class
+   * @returns {{dcWh: number, acWh: number}|null} Load in Wh per hour, or null if bin not ready
+   */
+  getLoad(sunPhase, stateClass) {
+    const binKey = this.getBinKey(stateClass, sunPhase);
+    const bin = this.bins.get(binKey);
+
+    // Check if bin has enough samples
+    if (
+      !bin ||
+      bin.dcEma == null ||
+      this.getSampleDays(binKey) < this.minDaysPerBin
+    ) {
+      return null; // Fall back to rolling average
+    }
+
+    // Return EMAs as Wh per hour (they're stored as W)
+    return {
+      dcWh: bin.dcEma,
+      acWh: bin.acEma,
+    };
+  }
+
+  /**
+   * Gets the average hourly load from rolling average (fallback).
+   *
+   * @returns {{dcWh: number, acWh: number}} Average load in Wh per hour
    */
   getAverageLoad() {
     if (this.samples.length === 0) {
-      return 0;
+      return { dcWh: 0, acWh: 0 };
     }
 
-    const total = this.samples.reduce((sum, s) => sum + s.loadWh, 0);
-    return total / this.samples.length;
+    const dcTotal = this.samples.reduce((sum, s) => sum + s.dcLoadW, 0);
+    const acTotal = this.samples.reduce((sum, s) => sum + s.acLoadW, 0);
+    return {
+      dcWh: dcTotal / this.samples.length,
+      acWh: acTotal / this.samples.length,
+    };
+  }
+
+  /**
+   * Serializes the load profile for persistence.
+   *
+   * @returns {object} Serialized profile
+   */
+  toJSON() {
+    return {
+      bins: Object.fromEntries(this.bins),
+      samplesPerBin: Array.from(this.samplesPerBin.keys()),
+    };
+  }
+
+  /**
+   * Loads a serialized load profile.
+   *
+   * @param {object} data - Serialized profile
+   * @returns {void}
+   */
+  fromJSON(data) {
+    if (data.bins) {
+      this.bins = new Map(Object.entries(data.bins));
+    }
+    if (data.samplesPerBin && Array.isArray(data.samplesPerBin)) {
+      this.samplesPerBin = new Set(data.samplesPerBin);
+    }
   }
 }
 
@@ -377,6 +706,7 @@ class PredictionEngine {
     getSelfPath,
     getDisplayName,
     app,
+    loadProfileConfig,
   }) {
     this.battery = battery;
     this.solarArrays = solarArrays;
@@ -388,11 +718,20 @@ class PredictionEngine {
     this.app = app;
 
     this.capacityWh = battery.capacityAh * battery.systemVoltage;
-    this.loadProfile = new LoadProfile();
+    this.loadProfile = new LoadProfile({
+      config: loadProfileConfig,
+      getSelfPath,
+      app,
+    });
     this.lastPrediction = [];
     this.lastForecast = [];
   }
 
+  /**
+   * Updates the load profile with current house load.
+   *
+   * @returns {void}
+   */
   /**
    * Updates the load profile with current house load.
    *
@@ -407,12 +746,21 @@ class PredictionEngine {
     const acPowerW = toNumber(rawAc);
 
     this.app?.debug?.(
-      `updateLoadProfile: dcPower=${JSON.stringify(rawDc)} (${dcPowerW}), acPower=${JSON.stringify(rawAc)} (${acPowerW}), samples=${this.loadProfile.samples.length}`,
+      `updateLoadProfile: dcPower=${JSON.stringify(rawDc)} (${dcPowerW}), acPower=${JSON.stringify(rawAc)} (${acPowerW})`,
     );
 
     if (dcPowerW != null || acPowerW != null) {
-      const totalConsumptionW = (dcPowerW ?? 0) + (acPowerW ?? 0);
-      this.loadProfile.addSample(totalConsumptionW);
+      const dc = Math.max(0, dcPowerW ?? 0);
+      const ac = Math.max(0, acPowerW ?? 0);
+
+      // Get current position for sun phase classification
+      const pos = this.getSelfPath("navigation.position");
+      const position =
+        pos && pos.latitude != null && pos.longitude != null
+          ? { latitude: pos.latitude, longitude: pos.longitude }
+          : null;
+
+      this.loadProfile.addSample(dc, ac, position);
     }
   }
 
@@ -1260,18 +1608,23 @@ class PredictionEngine {
     const isSailing = navState === "sailing";
     const underway = this.isUnderway();
 
+    // Determine state class for forecast hours
+    // We use current state for all forecast hours (same assumption as
+    // the rest of the engine - a route-aware version is future work)
+    const stateClass = underway ? StateClass.UNDERWAY : StateClass.AT_REST;
+
     const predictions = [];
     let runningSoC = currentSoC;
     let detectedRunningSoC = currentSoC;
     const averageLoad = this.loadProfile.getAverageLoad();
 
-    // Get current position
+    // Get current position for sun phase classification
     const pos = this.getSelfPath("navigation.position");
     const latitude = pos?.latitude ?? 0;
     const longitude = pos?.longitude ?? 0;
 
     this.app?.debug?.(
-      `runPrediction: SoC=${Math.round(currentSoC * 100)}%, load=${Math.round(averageLoad)}W, pos=${latitude.toFixed(2)},${longitude.toFixed(2)}, sailing=${isSailing}, forecast=${forecast.length}pts`,
+      `runPrediction: SoC=${Math.round(currentSoC * 100)}%, load=${Math.round(averageLoad.dcWh + averageLoad.acWh)}W, pos=${latitude.toFixed(2)},${longitude.toFixed(2)}, sailing=${isSailing}, forecast=${forecast.length}pts`,
     );
     if (forecast.length > 0) {
       this.app?.debug?.(
@@ -1420,12 +1773,28 @@ class PredictionEngine {
         }
       }
 
-      const idealNetWh = idealSolarYieldWh + mechanicalYieldWh - averageLoad;
+      // Get sun-phase aware load for this forecast hour
+      const sunPhase = this.loadProfile.getSunPhase(
+        time,
+        pos && pos.latitude != null && pos.longitude != null
+          ? { latitude: pos.latitude, longitude: pos.longitude }
+          : null,
+      );
+      const loadProfile = this.loadProfile.getLoad(sunPhase, stateClass);
+      let houseLoadW;
+      if (loadProfile) {
+        houseLoadW = loadProfile.dcWh + loadProfile.acWh;
+      } else {
+        // Fall back to rolling average
+        houseLoadW = averageLoad.dcWh + averageLoad.acWh;
+      }
+
+      const idealNetWh = idealSolarYieldWh + mechanicalYieldWh - houseLoadW;
       const socChange = idealNetWh / this.capacityWh;
       runningSoC = Math.max(0, Math.min(1, runningSoC + socChange));
 
       const detectedYieldWh = detectedSolarYieldWh + detectedMechanicalYieldWh;
-      const detectedNetWh = detectedYieldWh - averageLoad;
+      const detectedNetWh = detectedYieldWh - houseLoadW;
       const detectedSocChange = detectedNetWh / this.capacityWh;
       detectedRunningSoC = Math.max(
         0,
@@ -1461,7 +1830,7 @@ class PredictionEngine {
         time,
         idealSolarYieldWh: Math.round(idealSolarYieldWh),
         idealWindYieldWh: Math.round(mechanicalYieldWh),
-        houseLoadWh: Math.round(averageLoad),
+        houseLoadWh: Math.round(houseLoadW),
         idealNetWh: Math.round(idealNetWh),
         idealSoC: Math.round(runningSoC * 1000) / 1000,
         detectedYieldWh: Math.round(detectedYieldWh),
@@ -1700,6 +2069,8 @@ class PredictionEngine {
 module.exports = {
   PredictionEngine,
   LoadProfile,
+  SunPhase,
+  StateClass,
   interpolateWindPower,
   predictSolarHour,
   predictWindHour,

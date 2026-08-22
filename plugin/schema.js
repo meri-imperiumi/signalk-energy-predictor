@@ -379,6 +379,47 @@ function buildPluginSchema() {
           },
         },
       },
+      loadProfile: {
+        type: "object",
+        title: "Load Profile Configuration",
+        description: "Learn sun-phase-based load patterns",
+        properties: {
+          enabled: {
+            type: "boolean",
+            title: "Enable Load Profile Learning",
+            description:
+              "Learn sun-phase-based load patterns instead of using flat averages",
+            default: true,
+          },
+          alpha: {
+            type: "number",
+            title: "EMA Alpha",
+            description:
+              "Exponential moving average smoothing factor (lower = slower learning)",
+            default: 0.05,
+            minimum: 0.01,
+            maximum: 0.2,
+          },
+          minDaysPerBin: {
+            type: "number",
+            title: "Minimum Days per Bin",
+            description:
+              "Minimum number of distinct days a bin needs samples from before it's used for prediction",
+            default: 3,
+            minimum: 1,
+            maximum: 10,
+          },
+          outlierFactor: {
+            type: "number",
+            title: "Spike Gate Factor",
+            description:
+              "Samples above this factor × bin EMA are dropped as outliers",
+            default: 3,
+            minimum: 2,
+            maximum: 10,
+          },
+        },
+      },
     },
     required: ["battery", "solarArrays"],
   };
