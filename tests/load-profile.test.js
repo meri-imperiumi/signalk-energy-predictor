@@ -51,7 +51,10 @@ test.describe("LoadProfile", () => {
 
     // Just before sunrise is still dawn
     const beforeSunrise = new Date(sunrise.getTime() - 1000);
-    assert.strictEqual(loadProfile.getSunPhase(beforeSunrise, sunPos), SunPhase.DAWN);
+    assert.strictEqual(
+      loadProfile.getSunPhase(beforeSunrise, sunPos),
+      SunPhase.DAWN,
+    );
 
     // At sunrise is day
     assert.strictEqual(loadProfile.getSunPhase(sunrise, sunPos), SunPhase.DAY);
@@ -62,7 +65,10 @@ test.describe("LoadProfile", () => {
 
     // Just before sunset is still day
     const beforeSunset = new Date(sunset.getTime() - 1000);
-    assert.strictEqual(loadProfile.getSunPhase(beforeSunset, sunPos), SunPhase.DAY);
+    assert.strictEqual(
+      loadProfile.getSunPhase(beforeSunset, sunPos),
+      SunPhase.DAY,
+    );
 
     // At sunset is dusk (boundary starts at sunset)
     assert.strictEqual(loadProfile.getSunPhase(sunset, sunPos), SunPhase.DUSK);
@@ -89,8 +95,7 @@ test.describe("LoadProfile", () => {
     for (const state of underwayStates) {
       const lp = new LoadProfile({
         config: { enabled: true },
-        getSelfPath: (path) =>
-          path === "navigation.state" ? state : null,
+        getSelfPath: (path) => (path === "navigation.state" ? state : null),
         app: { debug: () => {}, error: () => {} },
       });
       assert.strictEqual(
@@ -105,8 +110,7 @@ test.describe("LoadProfile", () => {
     for (const state of restStates) {
       const lp = new LoadProfile({
         config: { enabled: true },
-        getSelfPath: (path) =>
-          path === "navigation.state" ? state : null,
+        getSelfPath: (path) => (path === "navigation.state" ? state : null),
         app: { debug: () => {}, error: () => {} },
       });
       assert.strictEqual(

@@ -6,7 +6,12 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { IngestionFSM, Tier } = require("../plugin/ingestion.js");
+const {
+  IngestionFSM,
+  Tier,
+  fetchOpenMeteo,
+  OPEN_METEO_MAX_ATTEMPTS,
+} = require("../plugin/ingestion.js");
 
 function makeApp() {
   return {
@@ -178,6 +183,155 @@ test.describe("Ingestion fallback chain", () => {
       const forecast = await fsm.fetchForecast();
       assert.strictEqual(fsm.currentTier, Tier.CLEAR_SKY);
       assert.ok(forecast.length > 0);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+});
+
+test.describe("Open-Meteo fetch error handling", () => {
+  const validPayload = {
+    hourly: {
+      time: ["2026-08-22T21:00", "2026-08-22T22:00"],
+      shortwave_radiation: [100, 50],
+      wind_speed_10m: [18, 16],
+      wind_gusts_10m: [27, 25],
+      wind_direction_10m: [90, 95],
+    },
+  };
+
+  function withFetch(impl, fn) {
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = impl;
+    return fn().finally(() => {
+      globalThis.fetch = origFetch;
+    });
+  }
+
+  test("transient network failure is retried and succeeds", async () => {
+    let calls = 0;
+    await withFetch(
+      async () => {
+        calls++;
+        if (calls < 2) {
+          throw new TypeError("fetch failed"); // fetch() rejects with TypeError on network errors
+        }
+        return { ok: true, json: async () => validPayload };
+      },
+      async () => {
+        const points = await fetchOpenMeteo(60.17, 24.94, { retryDelayMs: 1 });
+        assert.strictEqual(calls, 2);
+        assert.strictEqual(points.length, 2);
+        // km/h -> knots conversion preserved
+        assert.ok(Math.abs(points[0].windSpeedKnots - 18 * 0.539957) < 0.01);
+        assert.ok(Math.abs(points[0].gustSpeedKnots - 27 * 0.539957) < 0.01);
+        // Naive UTC timestamps parsed as UTC
+        assert.strictEqual(
+          points[0].time.toISOString(),
+          "2026-08-22T21:00:00.000Z",
+        );
+      },
+    );
+  });
+
+  test("timeout is retried", async () => {
+    let calls = 0;
+    await withFetch(
+      async () => {
+        calls++;
+        const error = new Error("This operation was aborted");
+        error.name = "AbortError";
+        throw error;
+      },
+      async () => {
+        await assert.rejects(
+          fetchOpenMeteo(60.17, 24.94, { retryDelayMs: 1 }),
+          /timed out|aborted/,
+        );
+        assert.strictEqual(calls, OPEN_METEO_MAX_ATTEMPTS);
+      },
+    );
+  });
+
+  test("server errors are retried, then surface", async () => {
+    let calls = 0;
+    await withFetch(
+      async () => {
+        calls++;
+        return { ok: false, status: 503 };
+      },
+      async () => {
+        await assert.rejects(
+          fetchOpenMeteo(60.17, 24.94, { retryDelayMs: 1 }),
+          /Open-Meteo returned 503/,
+        );
+        assert.strictEqual(calls, OPEN_METEO_MAX_ATTEMPTS);
+      },
+    );
+  });
+
+  test("client errors are not retried", async () => {
+    let calls = 0;
+    await withFetch(
+      async () => {
+        calls++;
+        return { ok: false, status: 400 };
+      },
+      async () => {
+        await assert.rejects(
+          fetchOpenMeteo(60.17, 24.94, { retryDelayMs: 1 }),
+          /Open-Meteo returned 400/,
+        );
+        assert.strictEqual(calls, 1);
+      },
+    );
+  });
+
+  test("mismatched hourly arrays are rejected without retry", async () => {
+    let calls = 0;
+    await withFetch(
+      async () => {
+        calls++;
+        return {
+          ok: true,
+          json: async () => ({
+            hourly: {
+              time: ["2026-08-22T21:00", "2026-08-22T22:00"],
+              shortwave_radiation: [100],
+            },
+          }),
+        };
+      },
+      async () => {
+        await assert.rejects(
+          fetchOpenMeteo(60.17, 24.94, { retryDelayMs: 1 }),
+          /arrays mismatch/,
+        );
+        assert.strictEqual(calls, 1);
+      },
+    );
+  });
+
+  test("FSM stays on Open-Meteo tier across a transient failure", async () => {
+    const fsm = makeFSM();
+    let calls = 0;
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      if (String(url).includes("open-meteo")) {
+        calls++;
+        if (calls < 2) {
+          throw new TypeError("fetch failed");
+        }
+        return { ok: true, json: async () => validPayload };
+      }
+      throw new Error("network down");
+    };
+
+    try {
+      const forecast = await fsm.fetchForecast();
+      assert.strictEqual(fsm.currentTier, Tier.OPEN_METEO);
+      assert.strictEqual(forecast.length, 2);
+      assert.ok(forecast.every((p) => p.windSpeedKnots != null));
     } finally {
       globalThis.fetch = origFetch;
     }

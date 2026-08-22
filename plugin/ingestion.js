@@ -25,6 +25,19 @@ const {
 const FETCH_TIMEOUT = 10000;
 
 /**
+ * Open-Meteo fetch attempts (initial try + retries) before giving up.
+ * Retrying matters: a single transient failure would otherwise drop the
+ * FSM to lower tiers, and the clear-sky fallback carries no wind data.
+ */
+const OPEN_METEO_MAX_ATTEMPTS = 3;
+
+/**
+ * Base delay between Open-Meteo retry attempts in milliseconds.
+ * Attempts back off linearly (1x, 2x, ...).
+ */
+const OPEN_METEO_RETRY_DELAY_MS = 1000;
+
+/**
  * Number of forecast hours to request
  */
 const FORECAST_HOURS = 48;
@@ -56,13 +69,61 @@ const Tier = {
  */
 
 /**
- * Fetches forecast data from Open-Meteo API.
+ * Parses and validates an Open-Meteo hourly response into forecast points.
+ *
+ * @param {object} data - Parsed JSON response body
+ * @returns {ForecastPoint[]} Array of forecast points
+ * @throws {Error} if the payload is malformed
+ */
+function parseOpenMeteoResponse(data) {
+  const { hourly } = data || {};
+  if (
+    !hourly ||
+    !Array.isArray(hourly.time) ||
+    !Array.isArray(hourly.shortwave_radiation)
+  ) {
+    throw new Error("Open-Meteo response missing hourly data");
+  }
+  if (hourly.time.length === 0) {
+    throw new Error("Open-Meteo response contains no forecast hours");
+  }
+  if (hourly.time.length !== hourly.shortwave_radiation.length) {
+    throw new Error(
+      `Open-Meteo hourly arrays mismatch: ${hourly.time.length} times vs ${hourly.shortwave_radiation.length} radiation values`,
+    );
+  }
+
+  return hourly.time.map((time, i) => {
+    // Open-Meteo returns times without timezone; force UTC
+    const date = new Date(`${time}Z`);
+    if (Number.isNaN(date.getTime())) {
+      throw new Error(`Open-Meteo returned invalid timestamp: ${time}`);
+    }
+    return {
+      time: date,
+      ghi: hourly.shortwave_radiation[i] ?? 0,
+      cloudCover: null,
+      gustSpeedKnots:
+        hourly.wind_gusts_10m?.[i] != null
+          ? hourly.wind_gusts_10m[i] * 0.539957 // km/h to knots
+          : null,
+      windSpeedKnots:
+        hourly.wind_speed_10m?.[i] != null
+          ? hourly.wind_speed_10m[i] * 0.539957 // km/h to knots
+          : null,
+      windDirectionDeg: hourly.wind_direction_10m?.[i] ?? null,
+    };
+  });
+}
+
+/**
+ * Performs a single Open-Meteo fetch attempt.
  *
  * @param {number} latitude - Latitude in degrees
  * @param {number} longitude - Longitude in degrees
  * @returns {Promise<ForecastPoint[]>} Array of forecast points
  */
-async function fetchOpenMeteo(latitude, longitude) {
+async function fetchOpenMeteoOnce(latitude, longitude) {
   const url = new URL("https://api.open-meteo.com/v1/forecast");
   url.searchParams.set("latitude", latitude.toString());
   url.searchParams.set("longitude", longitude.toString());
@@ -82,32 +143,75 @@ async function fetchOpenMeteo(latitude, longitude) {
     });
 
     if (!response.ok) {
-      throw new Error(`Open-Meteo returned ${response.status}`);
+      const error = new Error(`Open-Meteo returned ${response.status}`);
+      error.status = response.status;
+      throw error;
     }
 
     const data = await response.json();
-
-    if (!data.hourly || !data.hourly.time || !data.hourly.shortwave_radiation) {
-      throw new Error("Open-Meteo response missing hourly data");
+    return parseOpenMeteoResponse(data);
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      const timeoutError = new Error(
+        `Open-Meteo fetch timed out after ${FETCH_TIMEOUT}ms`,
+      );
+      timeoutError.timeout = true;
+      throw timeoutError;
     }
-
-    return data.hourly.time.map((time, i) => ({
-      time: new Date(time + "Z"), // Open-Meteo returns times without timezone; force UTC
-      ghi: data.hourly.shortwave_radiation[i] ?? 0,
-      cloudCover: null,
-      gustSpeedKnots:
-        data.hourly.wind_gusts_10m?.[i] != null
-          ? data.hourly.wind_gusts_10m[i] * 0.539957 // km/h to knots
-          : null,
-      windSpeedKnots:
-        data.hourly.wind_speed_10m?.[i] != null
-          ? data.hourly.wind_speed_10m[i] * 0.539957 // km/h to knots
-          : null,
-      windDirectionDeg: data.hourly.wind_direction_10m?.[i] ?? null,
-    }));
+    throw error;
   } finally {
     clearTimeout(timeoutId);
   }
+}
+
+/**
+ * Whether an Open-Meteo failure is transient and worth retrying:
+ * timeouts, network-level errors (fetch rejects with TypeError),
+ * rate limiting (429) and server errors (5xx). Client errors (4xx)
+ * and malformed payloads are permanent for our request.
+ *
+ * @param {Error & {status?: number, timeout?: boolean}} error
+ * @returns {boolean}
+ */
+function isOpenMeteoRetryable(error) {
+  if (error?.timeout === true || error?.name === "AbortError") return true;
+  if (error?.status != null) {
+    return error.status === 429 || error.status >= 500;
+  }
+  return error instanceof TypeError; // Network failure
+}
+
+/**
+ * Fetches forecast data from Open-Meteo API, retrying transient failures.
+ *
+ * @param {number} latitude - Latitude in degrees
+ * @param {number} longitude - Longitude in degrees
+ * @param {object} [options]
+ * @param {number} [options.retryDelayMs] - Base delay between attempts (tests)
+ * @param {(error: Error, attempt: number) => void} [options.onRetry] - Called before each retry
+ * @returns {Promise<ForecastPoint[]>} Array of forecast points
+ */
+async function fetchOpenMeteo(
+  latitude,
+  longitude,
+  { retryDelayMs = OPEN_METEO_RETRY_DELAY_MS, onRetry } = {},
+) {
+  let lastError;
+  for (let attempt = 1; attempt <= OPEN_METEO_MAX_ATTEMPTS; attempt++) {
+    try {
+      return await fetchOpenMeteoOnce(latitude, longitude);
+    } catch (error) {
+      lastError = error;
+      if (attempt === OPEN_METEO_MAX_ATTEMPTS || !isOpenMeteoRetryable(error)) {
+        throw error;
+      }
+      onRetry?.(error, attempt);
+      await new Promise((resolve) =>
+        setTimeout(resolve, retryDelayMs * attempt),
+      );
+    }
+  }
+  throw lastError;
 }
 
 /**
@@ -357,7 +461,12 @@ class IngestionFSM {
         this.app.debug("Open-Meteo: fetching from API");
         // No network pre-check: just try. The fetch has its own timeout,
         // and a pre-check (e.g. dns.google) can wrongly skip a reachable API.
-        return await fetchOpenMeteo(latitude, longitude);
+        return await fetchOpenMeteo(latitude, longitude, {
+          onRetry: (error, attempt) =>
+            this.app.debug(
+              `Open-Meteo attempt ${attempt} failed: ${error.message}, retrying`,
+            ),
+        });
       }
 
       case Tier.SIGNAL_K_WEATHER: {
@@ -623,4 +732,5 @@ module.exports = {
   fetchLogbookCloudCover,
   generateClearSkyForecast,
   synthesizeGHI,
+  OPEN_METEO_MAX_ATTEMPTS,
 };
