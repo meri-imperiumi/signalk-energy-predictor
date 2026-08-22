@@ -36,37 +36,47 @@ test.describe("LoadProfile", () => {
   });
 
   test("classifies sun phases based on sun position", () => {
-    // At sunrise
-    const atSunrise = new Date("2024-06-21T06:00:00Z");
+    const SunCalc = require("suncalc");
+    const testDate = new Date("2024-06-21T12:00:00Z");
     const sunPos = { latitude: 37.77, longitude: -122.42 };
 
+    // Get actual astronomical times for the test date/location
+    const times = SunCalc.getTimes(testDate, sunPos.latitude, sunPos.longitude);
+    const sunrise = new Date(times.sunrise);
+    const sunset = new Date(times.sunset);
+
     // Dawn is 2h before sunrise
-    const dawn = new Date(atSunrise.getTime() - 3600000);
+    const dawn = new Date(sunrise.getTime() - 3600000);
     assert.strictEqual(loadProfile.getSunPhase(dawn, sunPos), SunPhase.DAWN);
 
-    // Day is sunrise to sunset
-    assert.strictEqual(
-      loadProfile.getSunPhase(atSunrise, sunPos),
-      SunPhase.DAY,
-    );
+    // Just before sunrise is still dawn
+    const beforeSunrise = new Date(sunrise.getTime() - 1000);
+    assert.strictEqual(loadProfile.getSunPhase(beforeSunrise, sunPos), SunPhase.DAWN);
 
-    const noon = new Date(atSunrise.getTime() + 6 * 3600000);
+    // At sunrise is day
+    assert.strictEqual(loadProfile.getSunPhase(sunrise, sunPos), SunPhase.DAY);
+
+    // Mid-day is day
+    const noon = new Date((sunrise.getTime() + sunset.getTime()) / 2);
     assert.strictEqual(loadProfile.getSunPhase(noon, sunPos), SunPhase.DAY);
 
-    // Sunset is ~12h after sunrise (June 21)
-    const atSunset = new Date(atSunrise.getTime() + 12 * 3600000);
-    assert.strictEqual(loadProfile.getSunPhase(atSunset, sunPos), SunPhase.DAY);
+    // Just before sunset is still day
+    const beforeSunset = new Date(sunset.getTime() - 1000);
+    assert.strictEqual(loadProfile.getSunPhase(beforeSunset, sunPos), SunPhase.DAY);
+
+    // At sunset is dusk (boundary starts at sunset)
+    assert.strictEqual(loadProfile.getSunPhase(sunset, sunPos), SunPhase.DUSK);
 
     // Dusk is sunset to sunset + 2h
-    const dusk = new Date(atSunset.getTime() + 3600000);
+    const dusk = new Date(sunset.getTime() + 3600000);
     assert.strictEqual(loadProfile.getSunPhase(dusk, sunPos), SunPhase.DUSK);
 
-    // Night is after dusk
-    const night = new Date(atSunset.getTime() + 3 * 3600000);
+    // Night is after dusk (2h after sunset)
+    const night = new Date(sunset.getTime() + 3 * 3600000);
     assert.strictEqual(loadProfile.getSunPhase(night, sunPos), SunPhase.NIGHT);
 
     // Night before dawn
-    const beforeDawn = new Date(atSunrise.getTime() - 3 * 3600000);
+    const beforeDawn = new Date(sunrise.getTime() - 3 * 3600000);
     assert.strictEqual(
       loadProfile.getSunPhase(beforeDawn, sunPos),
       SunPhase.NIGHT,
@@ -74,32 +84,14 @@ test.describe("LoadProfile", () => {
   });
 
   test("classifies state class from navigation state", () => {
-    const mockGetSelfPath = (path) => {
-      const values = {
-        "navigation.state": "sailing",
-        "navigation.state.motoring": "motoring",
-        "navigation.state.underway": "under way",
-        "navigation.state.anchored": "anchored",
-        "navigation.state.moored": "moored",
-      };
-      return values[path];
-    };
-
-    const lp = new LoadProfile({
-      config: { enabled: true },
-      getSelfPath: mockGetSelfPath,
-      app: { debug: () => {}, error: () => {} },
-    });
-
-    lp.getSelfPath = mockGetSelfPath;
-
-    assert.strictEqual(lp.getStateClass(), StateClass.UNDERWAY);
-
-    // Test different states
-    const states = ["sailing", "motoring", "under way"];
-    for (const state of states) {
-      mockGetSelfPath.mockImplementation((p) => {
-        return p === "navigation.state" ? state : null;
+    // Test underway states
+    const underwayStates = ["sailing", "motoring", "under way"];
+    for (const state of underwayStates) {
+      const lp = new LoadProfile({
+        config: { enabled: true },
+        getSelfPath: (path) =>
+          path === "navigation.state" ? state : null,
+        app: { debug: () => {}, error: () => {} },
       });
       assert.strictEqual(
         lp.getStateClass(),
@@ -108,10 +100,14 @@ test.describe("LoadProfile", () => {
       );
     }
 
+    // Test at-rest states
     const restStates = ["anchored", "moored"];
     for (const state of restStates) {
-      mockGetSelfPath.mockImplementation((p) => {
-        return p === "navigation.state" ? state : null;
+      const lp = new LoadProfile({
+        config: { enabled: true },
+        getSelfPath: (path) =>
+          path === "navigation.state" ? state : null,
+        app: { debug: () => {}, error: () => {} },
       });
       assert.strictEqual(
         lp.getStateClass(),
@@ -119,6 +115,14 @@ test.describe("LoadProfile", () => {
         `state: ${state}`,
       );
     }
+
+    // Test unknown/null state defaults to at-rest
+    const lp = new LoadProfile({
+      config: { enabled: true },
+      getSelfPath: () => null,
+      app: { debug: () => {}, error: () => {} },
+    });
+    assert.strictEqual(lp.getStateClass(), StateClass.AT_REST);
   });
 
   test("returns default DAY phase when no position available", () => {
@@ -233,7 +237,7 @@ test.describe("LoadProfile", () => {
   test("serializes and deserializes", () => {
     loadProfile.bins.set("at-rest:night", { dcEma: 120, acEma: 40 });
     loadProfile.bins.set("underway:day", { dcEma: 200, acEma: 80 });
-    loadProfile.samplesPerBin.add("at-rest:night:2024-08-21");
+    loadProfile.samplesPerBin.set("at-rest:night:2024-08-21", true);
 
     const json = loadProfile.toJSON();
 
@@ -252,13 +256,13 @@ test.describe("LoadProfile", () => {
 
   test("tracks sample days per bin", () => {
     loadProfile.trackSampleDay("at-rest:day");
-    loadProfile.trackSampleDay("at-rest:day"); // Same day
+    loadProfile.trackSampleDay("at-rest:day"); // Same day, no duplicate
 
     assert.strictEqual(loadProfile.getSampleDays("at-rest:day"), 1);
 
-    // Different days
-    loadProfile.trackSampleDay("at-rest:day:2024-08-22");
-    loadProfile.trackSampleDay("at-rest:day:2024-08-23");
+    // Add historical samples by directly setting samplesPerBin
+    loadProfile.samplesPerBin.set("at-rest:day:2024-08-22", true);
+    loadProfile.samplesPerBin.set("at-rest:day:2024-08-23", true);
 
     assert.strictEqual(loadProfile.getSampleDays("at-rest:day"), 3);
   });
@@ -266,8 +270,8 @@ test.describe("LoadProfile", () => {
   test("returns null for bin with insufficient samples", () => {
     // Initialize a bin with only 2 days of samples
     loadProfile.bins.set("at-rest:day", { dcEma: 100, acEma: 50 });
-    loadProfile.samplesPerBin.add("at-rest:day:2024-08-20");
-    loadProfile.samplesPerBin.add("at-rest:day:2024-08-21");
+    loadProfile.samplesPerBin.set("at-rest:day:2024-08-20", true);
+    loadProfile.samplesPerBin.set("at-rest:day:2024-08-21", true);
 
     const load = loadProfile.getLoad(SunPhase.DAY, StateClass.AT_REST);
     assert.strictEqual(load, null); // Only 2 days, need 3
@@ -276,9 +280,9 @@ test.describe("LoadProfile", () => {
   test("returns learned bin when sufficient samples", () => {
     // Initialize a bin with 3 days of samples
     loadProfile.bins.set("at-rest:day", { dcEma: 100, acEma: 50 });
-    loadProfile.samplesPerBin.add("at-rest:day:2024-08-20");
-    loadProfile.samplesPerBin.add("at-rest:day:2024-08-21");
-    loadProfile.samplesPerBin.add("at-rest:day:2024-08-22");
+    loadProfile.samplesPerBin.set("at-rest:day:2024-08-20", true);
+    loadProfile.samplesPerBin.set("at-rest:day:2024-08-21", true);
+    loadProfile.samplesPerBin.set("at-rest:day:2024-08-22", true);
 
     const load = loadProfile.getLoad(SunPhase.DAY, StateClass.AT_REST);
     assert.deepStrictEqual(load, { dcWh: 100, acWh: 50 });

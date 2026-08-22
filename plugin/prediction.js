@@ -389,6 +389,9 @@ class LoadProfile {
    */
   isShorePowerConnected() {
     const val = this.getSelfPath("electrical.shore.power.connected");
+    if (val == null) {
+      return false;
+    }
     return val === true || (typeof val === "object" && val.value === true);
   }
 
@@ -584,7 +587,7 @@ class LoadProfile {
       this.bins = new Map(Object.entries(data.bins));
     }
     if (data.samplesPerBin && Array.isArray(data.samplesPerBin)) {
-      this.samplesPerBin = new Set(data.samplesPerBin);
+      this.samplesPerBin = new Map(data.samplesPerBin.map((k) => [k, true]));
     }
   }
 }
