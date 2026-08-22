@@ -387,9 +387,7 @@ function buildPredictions(cycles, from, to) {
     const overlapping = cycles
       .filter((c) => {
         const t = new Date(c.timestamp).getTime();
-        return (
-          t >= from.getTime() - cycleHorizonMs(c) && t <= to.getTime()
-        );
+        return t >= from.getTime() - cycleHorizonMs(c) && t <= to.getTime();
       })
       .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
     return {
@@ -690,11 +688,7 @@ async function loadRecords(readRecordings, from, to, type) {
   if (maxHorizonMs <= DEFAULT_CYCLE_HORIZON_HOURS * MS_PER_HOUR) {
     return initial;
   }
-  return readRecordings(
-    new Date(from.getTime() - maxHorizonMs),
-    to,
-    type,
-  );
+  return readRecordings(new Date(from.getTime() - maxHorizonMs), to, type);
 }
 
 /**
