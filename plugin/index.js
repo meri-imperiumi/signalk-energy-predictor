@@ -957,8 +957,9 @@ module.exports = (app) => {
 
         const { sunPosition } = await import("./solar.js");
         const sunPos = sunPosition(new Date(), pos.latitude, pos.longitude);
+        const deg = (rad) => ((rad * 180) / Math.PI).toFixed(1);
         app.debug(
-          `Array ${array.id}: sun at ${sunPos.azimuth.toFixed(1)}° azimuth, ${sunPos.altitude.toFixed(1)}° altitude`,
+          `Array ${array.id}: sun at ${deg(sunPos.azimuth)}° azimuth, ${deg(sunPos.altitude)}° altitude`,
         );
 
         // Get matrix
