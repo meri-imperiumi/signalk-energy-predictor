@@ -14,8 +14,8 @@
     "url": "git://github.com/meri-imperiumi/signalk-energy-predictor.git"
   },
   "keywords": [
-    "signalk",
     "signalk-node-server-plugin",
+    "signalk-category-utility",
     "signalk-webapp"
   ],
   "author": "Henri Bergius <henri.bergius@iki.fi>",
