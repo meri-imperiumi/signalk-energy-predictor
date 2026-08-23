@@ -1,6 +1,6 @@
 {
   "name": "@meri-imperiumi/signalk-energy-predictor",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Predictive energy management plugin for Signal K using offline-first incremental learning",
   "main": "plugin/index.js",
   "scripts": {
