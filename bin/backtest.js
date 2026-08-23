@@ -245,6 +245,11 @@ async function runPopulate(args) {
 
   printResults([...result.arrays, ...result.generators]);
   console.log(`\nSamples written to recordings: ${result.samplesWritten}`);
+  if (result.deployStatesBackfilled != null) {
+    console.log(
+      `Samples augmented with deploy states: ${result.deployStatesBackfilled}`,
+    );
+  }
   if (result.loadProfile) {
     const lp = result.loadProfile;
     console.log(

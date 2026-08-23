@@ -23,6 +23,7 @@ const {
   buildPredictions,
   buildEnvironment,
   buildSummary,
+  buildDeployStates,
   registerApiRoutes,
   resolveNavState,
   MAX_WINDOW_DAYS,
@@ -598,4 +599,149 @@ test.describe("OpenAPI spec", () => {
     assert.strictEqual(typeof plugin.getOpenApi, "function");
     assert.deepStrictEqual(plugin.getOpenApi(), openApiSpec);
   });
+});
+
+test("buildDeployStates: detected transitions with carry-forward + collapsed recommendations", () => {
+  const from = new Date("2026-06-01T00:00:00Z");
+  const to = new Date("2026-08-24T00:00:00Z");
+  // superwind stowed since June, deploys briefly in Aug. flinsail up then stowed.
+  const samples = [
+    {
+      timestamp: "2026-06-15T12:00:00.000Z",
+      deployStates: { superwind: "stowed", flinsail: "deployed" },
+    },
+    {
+      timestamp: "2026-07-15T12:00:00.000Z",
+      deployStates: { superwind: "stowed" },
+    },
+    {
+      timestamp: "2026-08-23T12:00:00.000Z",
+      deployStates: { superwind: "deployed", flinsail: "stowed" },
+    },
+    {
+      timestamp: "2026-08-23T18:00:00.000Z",
+      deployStates: { superwind: "stowed" },
+    },
+  ];
+  const cycles = [
+    {
+      timestamp: "2026-08-23T08:00:00.000Z",
+      forecast: [
+        {
+          time: "2026-08-23T08:00:00.000Z",
+          actions: [
+            {
+              id: "flinsail",
+              idealAction: "stow",
+              detectedAction: "stow",
+              reason: "gusts 22kn",
+              idealState: "stowed",
+            },
+          ],
+        },
+        {
+          time: "2026-08-23T16:00:00.000Z",
+          actions: [
+            {
+              id: "flinsail",
+              idealAction: "deploy",
+              detectedAction: "deploy",
+              reason: "gusts drop",
+              idealState: "deployed",
+            },
+          ],
+        },
+      ],
+    },
+    {
+      timestamp: "2026-08-23T08:15:00.000Z",
+      forecast: [
+        {
+          time: "2026-08-23T08:15:00.000Z",
+          actions: [
+            {
+              id: "flinsail",
+              idealAction: "stow",
+              detectedAction: "stow",
+              reason: "gusts 22kn",
+              idealState: "stowed",
+            },
+          ],
+        },
+      ],
+    },
+  ];
+  const res = buildDeployStates(samples, cycles, from, to);
+  // Detected: only transitions, carry-forward means no repeated stowed entries
+  assert.deepStrictEqual(
+    res.detected.map((d) => ({ time: d.time, id: d.id, state: d.state })),
+    [
+      { time: "2026-06-15T12:00:00.000Z", id: "superwind", state: "stowed" },
+      { time: "2026-06-15T12:00:00.000Z", id: "flinsail", state: "deployed" },
+      { time: "2026-08-23T12:00:00.000Z", id: "superwind", state: "deployed" },
+      { time: "2026-08-23T12:00:00.000Z", id: "flinsail", state: "stowed" },
+      { time: "2026-08-23T18:00:00.000Z", id: "superwind", state: "stowed" },
+    ],
+  );
+  // Recommendations: collapsed across cycles, keyed by forecast hour
+  assert.deepStrictEqual(
+    res.recommendations.map((r) => ({
+      time: new Date(r.time).toISOString(),
+      id: r.id,
+      action: r.action,
+    })),
+    [
+      { time: "2026-08-23T08:00:00.000Z", id: "flinsail", action: "stow" },
+      { time: "2026-08-23T16:00:00.000Z", id: "flinsail", action: "deploy" },
+    ],
+  );
+});
+
+test("buildDeployStates: empty inputs yield empty lists", () => {
+  const res = buildDeployStates([], [], new Date(0), new Date(1));
+  assert.deepStrictEqual(res.detected, []);
+  assert.deepStrictEqual(res.recommendations, []);
+});
+
+test("buildDeployStates: prior state from before window suppresses first-entry emission", () => {
+  // Window is Aug 13-18. A sample from Aug 12 establishes superwind as
+  // stowed, so the first in-window sample (Aug 13, also stowed) does NOT
+  // emit a spurious "None -> stowed" transition.
+  const from = new Date("2026-08-13T00:00:00Z");
+  const to = new Date("2026-08-18T00:00:00Z");
+  const samples = [
+    {
+      timestamp: "2026-08-12T23:00:00.000Z",
+      deployStates: {
+        superwind: "stowed",
+        sailinggen: "stowed",
+        flinsail: "deployed",
+      },
+    },
+    {
+      timestamp: "2026-08-13T00:00:00.000Z",
+      deployStates: {
+        superwind: "stowed",
+        sailinggen: "stowed",
+        flinsail: "deployed",
+      },
+    },
+    {
+      timestamp: "2026-08-13T17:10:00.000Z",
+      deployStates: { sailinggen: "deployed" },
+    },
+    {
+      timestamp: "2026-08-17T21:40:00.000Z",
+      deployStates: { sailinggen: "stowed" },
+    },
+  ];
+  const res = buildDeployStates(samples, [], from, to);
+  // Only the genuine in-window transitions; no "None ->" entries.
+  assert.deepStrictEqual(
+    res.detected.map((d) => ({ time: d.time, id: d.id, state: d.state })),
+    [
+      { time: "2026-08-13T17:10:00.000Z", id: "sailinggen", state: "deployed" },
+      { time: "2026-08-17T21:40:00.000Z", id: "sailinggen", state: "stowed" },
+    ],
+  );
 });

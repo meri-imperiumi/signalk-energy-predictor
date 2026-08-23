@@ -91,6 +91,8 @@ async function recordCycle(app, dataDir, cycle) {
  * @param {string} sample.navState - Navigation state
  * @param {object|null} sample.position - Position {latitude, longitude}
  * @param {number|null} [sample.stwKnots] - Speed through water in knots
+ * @param {object} [sample.deployStates] - Per-device detected deploy state
+ *        ("deployed"/"stowed") inferred from power + conditions
  * @returns {Promise<void>}
  */
 async function recordSample(app, dataDir, sample) {
@@ -108,6 +110,7 @@ async function recordSample(app, dataDir, sample) {
     navState: sample.navState,
     position: sample.position,
     stwKnots: sample.stwKnots ?? null,
+    deployStates: sample.deployStates || {},
   };
 
   const line = `${JSON.stringify(record)}\n`;

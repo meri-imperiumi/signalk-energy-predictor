@@ -1,5 +1,4 @@
 {
-  "$schema": "http://json-schema.org/draft-07/schema#",
   "type": "object",
   "title": "Energy Predictor Configuration",
   "description": "Configure battery, solar arrays, and mechanical generators for energy prediction",

@@ -8,6 +8,7 @@
  */
 
 const { SolarMatrix, theoreticalPower } = require("./learning.js");
+const fs = require("node:fs/promises");
 const { sunPosition, irradianceFromCloudCover } = require("./solar.js");
 const {
   predictWindHour,
@@ -18,6 +19,11 @@ const {
 const matrixPersistence = require("./matrix.js");
 const { parseManufacturerCurve } = require("./schema.js");
 const recorderModule = require("./recorder.js");
+const {
+  detectSolarArrayState,
+  detectGeneratorState,
+  STOW_INFERENCE_MIN_SUN_ALT_RAD,
+} = require("./deploy-state.js");
 const {
   WindProtectionStore,
   sectorFromDeg,
@@ -460,48 +466,6 @@ function pathColumns(historyData) {
     }
   }
   return columns;
-}
-
-/**
- * Fills null gaps in sticky signal columns by carrying the last known
- * value forward, in place on historyData.data.
- *
- * `navigation.state`, `propulsion.*.state`, and `navigation.position` are
- * sticky: the last reported value persists until a new one arrives. The
- * History API returns null for a resolution bucket that logged no new value,
- * so a gap would otherwise reset the state to "unknown" / drop the position.
- * Consumers downstream (matrix replay, load-profile replay, recordings
- * backfill) then read the gap as null and fall back to inference or skip —
- * misclassifying a moored vessel as anchored (deploying the wind generator)
- * or losing the sun-position fix for the hour.
- *
- * @param {object} historyData - History API /values response (mutated)
- * @param {Map<string, number>} columns - path -> column index
- * @returns {void}
- */
-function carryForwardSticky(historyData, columns) {
-  const stickyCols = [];
-  for (const [path, col] of columns) {
-    if (
-      path === "navigation.state" ||
-      path === "navigation.position" ||
-      PROPULSION_STATE_RE.test(path)
-    ) {
-      stickyCols.push(col);
-    }
-  }
-  if (stickyCols.length === 0) return;
-  const last = new Map();
-  for (const point of historyData.data || []) {
-    for (const col of stickyCols) {
-      const v = point[col];
-      if (v == null) {
-        if (last.has(col)) point[col] = last.get(col);
-      } else {
-        last.set(col, v);
-      }
-    }
-  }
 }
 
 /**
@@ -1016,11 +980,46 @@ async function populateFromHistory({
     fetchImpl,
   });
 
-  // Carry sticky signals (navigation.state, propulsion.*.state,
-  // navigation.position) forward across resolution-bucket gaps so a moored
-  // vessel is not misclassified as anchored (deploying the wind generator)
-  // and the sun-position fix is not lost mid-day.
-  carryForwardSticky(historyData, pathColumns(historyData));
+  // Vessel state map: walk history forward, carrying every value forward
+  // (sticky nav/position/propulsion AND continuous power/stw/soc/house
+  // load) so downstream consumers — matrix/generator/load/WPF replay and
+  // the sample writer — all read the same carried-forward state. Mirrors
+  // the live deltaState Map: different sensors publish at different
+  // intervals, so a bucket where a sensor didn't report keeps the
+  // last-known value. This replaces the old carryForwardSticky mutation.
+  const columns = pathColumns(historyData);
+  const navStateColumn = columns.get("navigation.state");
+  const positionColumn = columns.get("navigation.position");
+  const stwColumn = columns.get("navigation.speedThroughWater");
+  const propulsionCols = propulsionColumns(historyData);
+  const houseLoadColumn = columns.get("electrical.venus.dcPower");
+  const socColumn = columns.get(socPath);
+  const arrayColumns = new Map(
+    arrays
+      .map((a) => [a.id, columns.get(a.powerPath)])
+      .filter(([, col]) => col != null),
+  );
+  const generatorColumns = new Map(
+    generators
+      .map((g) => [g.id, columns.get(g.powerPath)])
+      .filter(([, col]) => col != null),
+  );
+  const carried = buildCarriedState(
+    historyData,
+    columns,
+    navStateColumn,
+    stwColumn,
+    propulsionCols,
+    arrayColumns,
+    generatorColumns,
+    socColumn,
+    houseLoadColumn,
+    positionColumn,
+  );
+  // Write carried nav/position/propulsion back into historyData so the
+  // replay functions (which read columns directly) see carried-forward
+  // sticky values without each one re-implementing carry-forward.
+  writeCarriedStickyBack(historyData, columns, carried);
 
   const dailyPositions = dailyPositionsFromHistory(historyData, from, to);
   const weather =
@@ -1150,12 +1149,30 @@ async function populateFromHistory({
     socPath,
     from,
     to,
+    carried,
+  });
+
+  // Backfill deploy/stow states onto existing samples that predate the
+  // deployStates field (or were gap-fill-skipped above). Live samples for
+  // the window already exist, so backfillSamples skipped them; this pass
+  // recomputes deployStates from each sample's own power/wind/nav data and
+  // rewrites the file in place. Carry-forward of the last known state
+  // across unknown gaps is applied at read time (API), so the raw
+  // per-sample inference is stored here.
+  const deployStatesBackfilled = await augmentSamplesDeployStates({
+    app: { debug() {} },
+    dataDir,
+    arrays,
+    generators,
+    from,
+    to,
   });
 
   return {
     arrays: results,
     generators: generatorResults,
     samplesWritten,
+    deployStatesBackfilled,
     loadProfile: {
       seeded: loadProfileSeeded,
       ...loadProfileStats,
@@ -1173,6 +1190,167 @@ async function populateFromHistory({
 
 /** Tolerance for considering two samples the same moment */
 const SAMPLE_MERGE_TOLERANCE_MS = 150000;
+
+/**
+ * Walks history points forward, carrying every value forward in a vessel
+ * state map (mirrors the live `deltaState` Map). Sticky signals
+ * (navigation.state, navigation.position, propulsion.*.state) and continuous
+ * measurements (array/generator power, SoC, house load, STW) all persist
+ * from the last bucket that reported them, so a bucket where a sensor
+ * didn't report still sees the last-known value — exactly like the live
+ * delta handler, where a wind generator that read 0 W stays 0 W until a
+ * new reading arrives.
+ *
+ * The carried state is what deploy-state detection reads; without it, gaps
+ * suppress the "stowed" transition (power reads null → unknown) and the
+ * carry-forward at read time (API) can't recover the lost transition.
+ *
+ * @param {object} historyData - History API /values response
+ * @param {Map<string, number>} columns - path -> column index
+ * @param {number|null} navStateColumn
+ * @param {number|null} stwColumn
+ * @param {Array} propulsionCols
+ * @param {Map<string, number|null>} arrayColumns - id -> column index
+ * @param {Map<string, number|null>} generatorColumns - id -> column index
+ * @param {number|null} socColumn
+ * @param {number|null} houseLoadColumn
+ * @param {number|null} positionColumn
+ * @returns {Array<object>} Per-point carried state, aligned with historyData.data
+ */
+function buildCarriedState(
+  historyData,
+  columns,
+  navStateColumn,
+  stwColumn,
+  propulsionCols,
+  arrayColumns,
+  generatorColumns,
+  socColumn,
+  houseLoadColumn,
+  positionColumn,
+) {
+  const points = historyData.data || [];
+  const out = [];
+  // Carry-forward accumulators
+  let lastNav = null; // last explicit navigation.state
+  let lastPos = null; // {longitude, latitude}
+  let lastStw = null; // m/s
+  let lastSoc = null;
+  let lastHouseLoad = null;
+  const lastArrayPower = new Map(); // id -> W
+  const lastGenPower = new Map(); // id -> W
+  for (const point of points) {
+    // navState: explicit wins, else carry forward, else infer from STW
+    const explicitNav = columnValue(point, navStateColumn);
+    let navState;
+    if (
+      explicitNav === "sailing" ||
+      explicitNav === "motoring" ||
+      explicitNav === "anchored" ||
+      explicitNav === "moored" ||
+      explicitNav === "docked" ||
+      explicitNav === "under way"
+    ) {
+      navState = explicitNav;
+      lastNav = explicitNav;
+    } else if (lastNav) {
+      navState = lastNav;
+    } else {
+      const r = inferNavState(
+        point,
+        navStateColumn,
+        stwColumn,
+        propulsionCols,
+        columns,
+        null,
+      );
+      navState = r.state;
+      if (r.explicit) lastNav = r.state;
+    }
+    // position: carry forward (sticky)
+    const posRaw = columnValue(point, positionColumn);
+    if (Array.isArray(posRaw) && posRaw.length >= 2) {
+      lastPos = { longitude: posRaw[0], latitude: posRaw[1] };
+    }
+    // stw: carry forward (continuous but last-known is better than null)
+    const stwRaw = columnNumber(point, stwColumn);
+    if (stwRaw != null) lastStw = stwRaw;
+    // soc, houseLoad: carry forward
+    const socRaw = columnNumber(point, socColumn);
+    if (socRaw != null) lastSoc = socRaw;
+    const houseRaw = columnNumber(point, houseLoadColumn);
+    if (houseRaw != null) lastHouseLoad = houseRaw;
+    // array/generator power: carry forward
+    const arrayPower = {};
+    for (const [id, col] of arrayColumns) {
+      const v = columnNumber(point, col);
+      if (v != null) lastArrayPower.set(id, v);
+      if (lastArrayPower.has(id)) arrayPower[id] = lastArrayPower.get(id);
+    }
+    const generatorPower = {};
+    for (const [id, col] of generatorColumns) {
+      const v = columnNumber(point, col);
+      if (v != null) lastGenPower.set(id, v);
+      if (lastGenPower.has(id)) generatorPower[id] = lastGenPower.get(id);
+    }
+    out.push({
+      navState,
+      position: lastPos,
+      stwKnots: lastStw != null ? lastStw / 0.514444 : null,
+      soc: lastSoc,
+      houseLoadW: lastHouseLoad,
+      arrayPower,
+      generatorPower,
+    });
+  }
+  return out;
+}
+
+/**
+ * Writes the carried-forward sticky signals (navigation.state,
+ * navigation.position, propulsion.*.state) back into the history data array
+ * in place, so replay functions that read columns directly see carried-
+ * forward values. Continuous measurements (power, SoC, STW) are NOT
+ * written back — replay functions read those from the raw columns and only
+ * the sample writer uses the full carried state for deploy detection.
+ *
+ * @param {object} historyData - History API /values response (mutated)
+ * @param {Map<string, number>} columns - path -> column index
+ * @param {Array<object>} carried - Per-point carried state from buildCarriedState
+ * @returns {void}
+ */
+function writeCarriedStickyBack(historyData, columns, carried) {
+  const navStateColumn = columns.get("navigation.state");
+  const positionColumn = columns.get("navigation.position");
+  const stickyPropulsionCols = [];
+  for (const [path, col] of columns) {
+    if (PROPULSION_STATE_RE.test(path)) stickyPropulsionCols.push([path, col]);
+  }
+  const points = historyData.data || [];
+  for (let i = 0; i < points.length; i++) {
+    const st = carried[i];
+    if (!st) continue;
+    if (navStateColumn != null && st.navState != null) {
+      points[i][navStateColumn] = st.navState;
+    }
+    if (positionColumn != null && st.position) {
+      points[i][positionColumn] = [st.position.longitude, st.position.latitude];
+    }
+  }
+  // Propulsion states are already carried by the same logic buildCarriedState
+  // uses for nav; but buildCarriedState doesn't track them separately. Use the
+  // simple last-known carry for propulsion state columns (they're sticky).
+  if (stickyPropulsionCols.length > 0) {
+    const last = new Map();
+    for (const point of points) {
+      for (const [, col] of stickyPropulsionCols) {
+        const v = point[col];
+        if (v != null) last.set(col, v);
+        else if (last.has(col)) point[col] = last.get(col);
+      }
+    }
+  }
+}
 
 /**
  * Writes replayed history into the recordings store as `sample` records,
@@ -1201,6 +1379,7 @@ async function backfillSamples({
   socPath,
   from,
   to,
+  carried,
 }) {
   // Existing live samples: skip any replayed tick near one of these
   const existing = await recorderModule.getRecordings(
@@ -1235,6 +1414,14 @@ async function backfillSamples({
   };
 
   const columns = pathColumns(historyData);
+
+  // `carried` is the vessel state map built once in populateFromHistory
+  // and passed in. It carries every value forward (sticky nav/position /
+  // propulsion AND continuous power/stw/soc) so each bucket's deploy-state
+  // detection sees the last-known reading when a sensor didn't report —
+  // mirroring the live deltaState map. Different sensors publish at
+  // different intervals, so a bucket where a sensor was silent keeps the
+  // last-known value. When not passed (standalone/test use), compute it.
   const navStateColumn = columns.get("navigation.state");
   const positionColumn = columns.get("navigation.position");
   const stwColumn = columns.get("navigation.speedThroughWater");
@@ -1251,46 +1438,38 @@ async function backfillSamples({
       .map((g) => [g.id, columns.get(g.powerPath)])
       .filter(([, col]) => col != null),
   );
+  const carriedState =
+    carried ||
+    buildCarriedState(
+      historyData,
+      columns,
+      navStateColumn,
+      stwColumn,
+      propulsionCols,
+      arrayColumns,
+      generatorColumns,
+      socColumn,
+      houseLoadColumn,
+      positionColumn,
+    );
 
   // Overwrite sticky fields (navState, position) on existing live samples
-  // from the history-derived carry-forward map. The live delta stream
-  // flaps these sticky signals (e.g. anchored ↔ moored); the History API
-  // :last aggregate is stable, so history wins for sticky fields even over
+  // from the carried vessel state map. The live delta stream flaps these
+  // sticky signals (e.g. anchored ↔ moored); the History API :last
+  // aggregate is stable, so history wins for sticky fields even over
   // existing live samples, while continuous measurements stay as recorded.
-  const stickyTimeline = [];
-  {
-    let carriedNav = null;
-    for (const point of historyData.data || []) {
-      const t = parseUtcTimestamp(point[0]).getTime();
-      const r = inferNavState(
-        point,
-        navStateColumn,
-        stwColumn,
-        propulsionCols,
-        columns,
-        carriedNav,
-      );
-      if (r.explicit) carriedNav = r.state;
-      const pos = columnValue(point, positionColumn);
-      stickyTimeline.push({
-        t,
-        navState: r.state,
-        position:
-          Array.isArray(pos) && pos.length >= 2
-            ? { longitude: pos[0], latitude: pos[1] }
-            : null,
-      });
-    }
-  }
-  if (stickyTimeline.length > 0) {
+  const carriedTimes = (historyData.data || []).map((p) =>
+    parseUtcTimestamp(p[0]).getTime(),
+  );
+  if (carriedState.length > 0) {
     const resolveSticky = (tsMs) => {
       // Latest history point at or before tsMs (sticky carry-forward)
       let lo = 0;
-      let hi = stickyTimeline.length - 1;
+      let hi = carriedTimes.length - 1;
       let idx = -1;
       while (lo <= hi) {
         const mid = (lo + hi) >> 1;
-        if (stickyTimeline[mid].t <= tsMs) {
+        if (carriedTimes[mid] <= tsMs) {
           idx = mid;
           lo = mid + 1;
         } else hi = mid - 1;
@@ -1298,22 +1477,14 @@ async function backfillSamples({
       if (idx < 0) {
         // Before first history point: use the earliest (state continuity)
         return {
-          navState: stickyTimeline[0].navState,
-          position: stickyTimeline[0].position,
+          navState: carriedState[0].navState,
+          position: carriedState[0].position,
         };
       }
-      const e = stickyTimeline[idx];
-      // Position carries forward from the last known non-null in the timeline
-      let pos = e.position;
-      if (!pos) {
-        for (let i = idx; i >= 0; i--) {
-          if (stickyTimeline[i].position) {
-            pos = stickyTimeline[i].position;
-            break;
-          }
-        }
-      }
-      return { navState: e.navState, position: pos };
+      return {
+        navState: carriedState[idx].navState,
+        position: carriedState[idx].position,
+      };
     };
     await recorderModule.overwriteStickyFields(
       app,
@@ -1325,9 +1496,10 @@ async function backfillSamples({
   }
 
   let written = 0;
-  /** Last explicit navigation.state, carried forward across gaps */
-  let lastExplicitNavState = null;
-  for (const point of historyData.data || []) {
+  const dataPoints = historyData.data || [];
+  for (let i = 0; i < dataPoints.length; i++) {
+    const point = dataPoints[i];
+    const st = carriedState[i];
     const time = parseUtcTimestamp(point[0]);
     if (nearLiveSample(time.getTime())) {
       continue;
@@ -1336,53 +1508,249 @@ async function backfillSamples({
     const weatherPoint = interpolateWeather(weather, time);
     const sample = {
       timestamp: time,
-      arrays: {},
-      generators: {},
-      soc: columnNumber(point, socColumn),
-      houseLoadW: columnNumber(point, houseLoadColumn),
+      arrays: st.arrayPower,
+      generators: st.generatorPower,
+      soc: st.soc,
+      houseLoadW: st.houseLoadW,
+      // Wind comes from weather interpolation (continuous), not history carry-forward
       windSpeedKnots: weatherPoint.windSpeedKnots,
-      navState: (() => {
-        const r = inferNavState(
-          point,
-          navStateColumn,
-          stwColumn,
-          propulsionCols,
-          columns,
-          lastExplicitNavState,
-        );
-        if (r.explicit) {
-          lastExplicitNavState = r.state;
-        }
-        return r.state;
-      })(),
-      position: (() => {
-        const pos = columnValue(point, positionColumn);
-        if (!Array.isArray(pos) || pos.length < 2) return null;
-        return { longitude: pos[0], latitude: pos[1] };
-      })(),
-      stwKnots: (() => {
-        const v = columnNumber(point, stwColumn);
-        return v != null ? v / 0.514444 : null;
-      })(),
+      navState: st.navState,
+      position: st.position,
+      stwKnots: st.stwKnots,
     };
-    for (const [id, col] of arrayColumns) {
-      const v = columnNumber(point, col);
-      if (v != null) {
-        sample.arrays[id] = v;
-      }
+
+    // Detect deploy/stow states for deployable devices from the carried-
+    // forward readings (same logic as live currentDeployStates, via the
+    // shared module). Because power/wind/stw/nav are carried forward, a
+    // bucket where a sensor didn't report still sees the last-known value,
+    // so a wind generator that read 0 W with adequate wind stays "stowed"
+    // across silent buckets instead of dropping to "unknown".
+    const underway =
+      sample.navState === "sailing" ||
+      sample.navState === "motoring" ||
+      sample.navState === "under way";
+    let sunUp = false;
+    if (sample.position && sample.position.latitude != null) {
+      // Only treat 0 W as "stowed" when the sun is high enough that a
+      // deployed panel would produce power. Near sunrise/sunset a deployed
+      // panel naturally reads ~0 W.
+      sunUp =
+        sunPosition(
+          time,
+          sample.position.latitude,
+          sample.position.longitude ?? 0,
+        ).altitude > STOW_INFERENCE_MIN_SUN_ALT_RAD;
     }
-    for (const [id, col] of generatorColumns) {
-      const v = columnNumber(point, col);
-      if (v != null) {
-        sample.generators[id] = v;
-      }
+    const deployStates = {};
+    for (const array of arrays) {
+      if (array.type !== "deployable") continue;
+      const powerW = sample.arrays[array.id] ?? null;
+      const state = detectSolarArrayState(array, {
+        powerW,
+        sunUp,
+        underway,
+      });
+      if (state != null) deployStates[array.id] = state;
     }
+    for (const gen of generators) {
+      if (!gen.deployable) continue;
+      const powerW = sample.generators[gen.id] ?? null;
+      const state = detectGeneratorState(gen, {
+        powerW,
+        windKnots: sample.windSpeedKnots ?? null,
+        stwKnots: sample.stwKnots,
+        navState: sample.navState,
+        underway,
+      });
+      if (state != null) deployStates[gen.id] = state;
+    }
+    sample.deployStates = deployStates;
 
     await recorderModule.recordSample(app, dataDir, sample);
     written++;
   }
 
   return written;
+}
+
+/**
+ * Augments existing sample records that lack a `deployStates` field by
+ * recomputing it from each sample's own power/wind/nav/stw/position data
+ * using the shared deploy-state detector, then rewriting the recording
+ * file in place.
+ *
+ * This backfills the detected-state field onto samples written before the
+ * field existed (and onto live samples that `backfillSamples` gap-fill
+ * skipped). It reuses the same inference as live `recordSample` and the
+ * replayed-tick path, so detected timelines are consistent across the
+ * whole window.
+ *
+ * @param {object} params
+ * @param {object} params.app - Signal K server API (for logging)
+ * @param {string} params.dataDir - Plugin data directory
+ * @param {object[]} params.arrays - Active solar array configs
+ * @param {object[]} params.generators - Active generator configs
+ * @param {Date} params.from - Window start
+ * @param {Date} params.to - Window end
+ * @returns {Promise<number>} Number of sample records augmented
+ */
+async function augmentSamplesDeployStates({
+  app,
+  dataDir,
+  arrays,
+  generators,
+  from,
+  to,
+}) {
+  const samples = await recorderModule.getRecordings(
+    dataDir,
+    from,
+    to,
+    "sample",
+  );
+  if (samples.length === 0) return 0;
+
+  // Sort all samples in time order so carry-forward is continuous across days.
+  samples.sort(
+    (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
+  );
+
+  // Walk forward carrying power/wind/stw/nav across gaps, mirroring the live
+  // deltaState map and buildCarriedState. A sensor that didn't report in a
+  // 5-min bucket keeps the last-known value, so deploy-state detection sees
+  // a wind generator that read 0 W as still 0 W (stowed) rather than unknown.
+  let lastNav = null;
+  let lastWind = null;
+  let lastStw = null;
+  const lastArrayPower = new Map();
+  const lastGenPower = new Map();
+  const computed = new Map(); // ts -> deployStates
+  for (const sample of samples) {
+    const navState = sample.navState || lastNav || "unknown";
+    if (sample.navState) lastNav = sample.navState;
+    const windKnots =
+      sample.windSpeedKnots != null ? sample.windSpeedKnots : lastWind;
+    if (sample.windSpeedKnots != null) lastWind = sample.windSpeedKnots;
+    const stwKnots = sample.stwKnots != null ? sample.stwKnots : lastStw;
+    if (sample.stwKnots != null) lastStw = sample.stwKnots;
+    const arraysPower = sample.arrays || {};
+    const gensPower = sample.generators || {};
+    for (const array of arrays) {
+      if (arraysPower[array.id] != null) {
+        lastArrayPower.set(array.id, arraysPower[array.id]);
+      }
+    }
+    for (const gen of generators) {
+      if (gensPower[gen.id] != null) {
+        lastGenPower.set(gen.id, gensPower[gen.id]);
+      }
+    }
+    const underway =
+      navState === "sailing" ||
+      navState === "motoring" ||
+      navState === "under way";
+    const pos = sample.position;
+    let sunUp = false;
+    if (pos && pos.latitude != null) {
+      // Only treat 0 W as "stowed" when the sun is high enough that a
+      // deployed panel would produce power. Near sunrise/sunset a deployed
+      // panel naturally reads ~0 W.
+      sunUp =
+        sunPosition(
+          new Date(sample.timestamp),
+          pos.latitude,
+          pos.longitude ?? 0,
+        ).altitude > STOW_INFERENCE_MIN_SUN_ALT_RAD;
+    }
+    const deployStates = {};
+    for (const array of arrays) {
+      if (array.type !== "deployable") continue;
+      const powerW = lastArrayPower.has(array.id)
+        ? lastArrayPower.get(array.id)
+        : null;
+      const state = detectSolarArrayState(array, {
+        powerW,
+        sunUp,
+        underway,
+      });
+      if (state != null) deployStates[array.id] = state;
+    }
+    for (const gen of generators) {
+      if (!gen.deployable) continue;
+      const powerW = lastGenPower.has(gen.id) ? lastGenPower.get(gen.id) : null;
+      const state = detectGeneratorState(gen, {
+        powerW,
+        windKnots,
+        stwKnots,
+        navState,
+        underway,
+      });
+      if (state != null) deployStates[gen.id] = state;
+    }
+    computed.set(new Date(sample.timestamp).getTime(), deployStates);
+  }
+
+  // Group by recording file so each file is rewritten once.
+  const byFile = new Map(); // filePath -> sample[]
+  for (const s of samples) {
+    const filePath = recorderModule.getRecordingsPath(
+      dataDir,
+      new Date(s.timestamp),
+    );
+    if (!byFile.has(filePath)) byFile.set(filePath, []);
+    byFile.get(filePath).push(s);
+  }
+
+  let augmented = 0;
+  for (const [filePath, fileSamples] of byFile) {
+    // Read all lines (including non-sample records) to rewrite the file.
+    let lines;
+    try {
+      lines = (await fs.readFile(filePath, "utf-8")).split("\n");
+    } catch (_error) {
+      continue; // file may have been pruned
+    }
+    const byTimestamp = new Map(
+      fileSamples.map((s) => [new Date(s.timestamp).getTime(), s]),
+    );
+    let changed = false;
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line.trim()) continue;
+      let record;
+      try {
+        record = JSON.parse(line);
+      } catch {
+        continue;
+      }
+      if (record.type !== "sample") continue;
+      const ts = new Date(record.timestamp).getTime();
+      if (!byTimestamp.has(ts)) continue;
+      if (record.deployStates && Object.keys(record.deployStates).length) {
+        // Already has deployStates. Recompute to stay consistent with the
+        // current detection logic (the live recording may have used an
+        // older inference — e.g. 0 W near sunset was once "stowed"). The
+        // carried-forward power at this timestamp is the same the live path
+        // saw, so the result is at least as good and uses the latest rules.
+        const fresh = computed.get(ts) || {};
+        if (JSON.stringify(fresh) !== JSON.stringify(record.deployStates)) {
+          record.deployStates = fresh;
+          changed = true;
+        }
+        continue;
+      }
+      const deployStates = computed.get(ts) || {};
+      record.deployStates = deployStates;
+      lines[i] = JSON.stringify(record);
+      changed = true;
+      augmented++;
+    }
+    if (changed) {
+      await fs.writeFile(filePath, lines.join("\n"), { encoding: "utf-8" });
+    }
+  }
+  app.debug?.(`Augmented ${augmented} samples with deployStates`);
+  return augmented;
 }
 
 /**
@@ -1703,7 +2071,7 @@ module.exports = {
   fetchHistoricalWeatherTrack,
   dailyPositionsFromHistory,
   interpolateWeather,
-  carryForwardSticky,
+  buildCarriedState,
   replayHistory,
   replayGenerators,
   replayLoadProfile,

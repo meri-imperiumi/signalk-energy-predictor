@@ -199,6 +199,28 @@ test.describe("recorder", () => {
 
       assert.strictEqual(record.position, null);
     });
+
+    test("persists deployStates in the sample record", async () => {
+      const sample = {
+        timestamp: new Date("2024-08-21T12:15:00Z"),
+        arrays: {},
+        generators: {},
+        soc: 0.7,
+        houseLoadW: 100,
+        windSpeedKnots: 10,
+        navState: "anchored",
+        position: null,
+        deployStates: { flinsail: "deployed", superwind: "stowed" },
+      };
+      await recordSample(mockApp, tempDir, sample);
+      const filePath = getRecordingsPath(tempDir, sample.timestamp);
+      const content = await fs.readFile(filePath, "utf-8");
+      const record = JSON.parse(content.trim());
+      assert.deepStrictEqual(record.deployStates, {
+        flinsail: "deployed",
+        superwind: "stowed",
+      });
+    });
   });
 
   test.describe("pruneOldRecordings", () => {

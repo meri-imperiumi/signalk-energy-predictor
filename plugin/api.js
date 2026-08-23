@@ -786,6 +786,24 @@ function registerApiRoutes(
     ).catch((error) => handleError(error, res)),
   );
 
+  // Deploy/stow state transitions (detected) and recommendations in window
+  router.get("/api/deploy-states", (req, res) => {
+    const { from, to } = parseTimeWindow(req.query);
+    // Fetch from before the window so the first sample inside the window
+    // doesn't appear as a spurious "None -> X" transition: the prior state
+    // is established from earlier samples, and only transitions within
+    // [from, to] are emitted.
+    const lookbackFrom = new Date(from.getTime() - 7 * 24 * 3600000);
+    Promise.all([
+      readRecordings(lookbackFrom, to, "sample"),
+      loadRecords(readRecordings, from, to, "cycle"),
+    ])
+      .then(([allSamples, cycles]) =>
+        res.json(buildDeployStates(allSamples, cycles, from, to)),
+      )
+      .catch((error) => handleError(error, res));
+  });
+
   // Wind Protection Factor: the live learned store (all places/sectors)
   router.get("/api/wind-protection", (_req, res) => {
     const store = getWindProtection?.();
@@ -1077,6 +1095,97 @@ function buildWindProtectionHistory(records, from, to) {
   };
 }
 
+/**
+ * Builds the /api/deploy-states response: detected deploy/stow state
+ * transitions and predictor recommendations within the window.
+ *
+ * Detected states are inferred per sample (from power output + conditions)
+ * and carried forward across unknown gaps, so a device that produced no
+ * power and had no wind evidence keeps its last known state (e.g. a wind
+ * generator stowed for repair reads 0 W in calm conditions, staying
+ * "stowed"). Only state transitions are emitted.
+ *
+ * Recommendations come from each recorded cycle's per-hour idealAction
+ * events (state changes only, already shifted to sun boundaries at
+ * night). Consecutive same-device same-action advisories from successive
+ * cycles are collapsed into the first.
+ *
+ * @param {object[]} samples - Recorded samples with deployStates
+ * @param {object[]} cycles - Recorded prediction cycles
+ * @param {Date} from - Window start
+ * @param {Date} to - Window end
+ * @returns {{window: {from: string, to: string}, detected: object[], recommendations: object[]}}
+ */
+function buildDeployStates(samples, cycles, from, to) {
+  // Detected transitions: carry forward last known state per device across
+  // unknown (null/absent) gaps, then emit only state changes. Samples before
+  // the window establish the prior state so the first in-window sample doesn't
+  // appear as a spurious "None -> X" transition; only transitions within
+  // [from, to] are emitted.
+  const fromMs = from.getTime();
+  const toMs = to.getTime();
+  const sorted = samples
+    .slice()
+    .sort(
+      (a, b) =>
+        new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
+    );
+  const lastEmitted = new Map(); // id -> last emitted state
+  const detected = [];
+  for (const s of sorted) {
+    const tMs = new Date(s.timestamp).getTime();
+    const states = s.deployStates || {};
+    for (const [id, state] of Object.entries(states)) {
+      if (state == null) continue;
+      if (lastEmitted.get(id) === state) continue;
+      lastEmitted.set(id, state);
+      // Only emit transitions that fall within the queried window.
+      if (tMs >= fromMs && tMs <= toMs) {
+        detected.push({ time: s.timestamp, id, state });
+      }
+    }
+  }
+
+  // Recommendations: from each cycle's per-hour idealAction events, keyed
+  // by the forecast hour (when the action should happen). Collapse across
+  // cycles by rounding to the hour and keeping the first, then collapse
+  // consecutive same-device same-action advisories into the first.
+  const recsByHour = new Map(); // `${hourTs}|${id}|${action}` -> ev
+  for (const cycle of cycles) {
+    for (const point of cycle.forecast || []) {
+      const t = new Date(point.time).getTime();
+      const hourTs = Math.round(t / 3600000) * 3600000;
+      for (const a of point.actions || []) {
+        if (a.idealAction !== "deploy" && a.idealAction !== "stow") continue;
+        if (a.detectedAction === "stay") continue;
+        const key = `${hourTs}|${a.id}|${a.idealAction}`;
+        if (!recsByHour.has(key)) {
+          recsByHour.set(key, {
+            time: hourTs,
+            id: a.id,
+            action: a.idealAction,
+            reason: a.reason || "",
+          });
+        }
+      }
+    }
+  }
+  // Collapse consecutive same-device same-action advisories into the first
+  const recommendations = [];
+  const lastAction = new Map(); // id -> last kept action
+  for (const ev of [...recsByHour.values()].sort((a, b) => a.time - b.time)) {
+    if (lastAction.get(ev.id) === ev.action) continue;
+    lastAction.set(ev.id, ev.action);
+    recommendations.push(ev);
+  }
+
+  return {
+    window: { from: from.toISOString(), to: to.toISOString() },
+    detected,
+    recommendations,
+  };
+}
+
 module.exports = {
   MAX_WINDOW_DAYS,
   ApiError,
@@ -1094,6 +1203,7 @@ module.exports = {
   buildSummary,
   buildRetroPredicted,
   buildWindProtectionHistory,
+  buildDeployStates,
   registerApiRoutes,
   cycleHorizonMs,
 };

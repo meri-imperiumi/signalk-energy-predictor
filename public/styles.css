@@ -198,3 +198,67 @@ ep-timeline-chart {
   padding: 24px;
   text-align: center;
 }
+
+ep-actions-list {
+  display: block;
+  background: var(--panel-bg);
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-top: 12px;
+}
+
+.ep-actions-header {
+  font-size: 0.9rem;
+  font-weight: 600;
+  margin-bottom: 6px;
+  color: var(--text-color);
+}
+
+.ep-actions-list {
+  list-style: none;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.ep-action {
+  display: flex;
+  align-items: baseline;
+  flex-wrap: wrap;
+  gap: 6px;
+  font-size: 0.85rem;
+  padding: 3px 0;
+}
+
+.ep-action-badge {
+  font-size: 0.7rem;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  padding: 1px 5px;
+  border-radius: 4px;
+  border: 1px solid var(--border-color);
+  color: var(--muted-color);
+  flex-shrink: 0;
+}
+
+.ep-action-detected .ep-action-badge {
+  color: var(--soc-color);
+  border-color: var(--soc-color);
+}
+
+.ep-action-recommended .ep-action-badge {
+  color: var(--accent-color);
+  border-color: var(--accent-color);
+}
+
+.ep-action-text {
+  color: var(--text-color);
+}
+
+.ep-action-reason {
+  color: var(--muted-color);
+  font-size: 0.8rem;
+  width: 100%;
+  padding-left: 0;
+}

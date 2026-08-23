@@ -42,8 +42,9 @@ class EpApp extends HTMLElement {
     const selector = document.createElement("ep-window-selector");
     const figures = document.createElement("ep-headline-figures");
     const chart = document.createElement("ep-timeline-chart");
+    const actions = document.createElement("ep-actions-list");
 
-    shadow.append(header, statusPanel, selector, figures, chart);
+    shadow.append(header, statusPanel, selector, figures, chart, actions);
 
     /** @type {ShadowRoot} */
     this.errorEl = error;
@@ -51,6 +52,8 @@ class EpApp extends HTMLElement {
     this.figuresEl = figures;
     /** @type {HTMLElement} */
     this.chartEl = chart;
+    /** @type {HTMLElement} */
+    this.actionsEl = actions;
 
     selector.addEventListener("ep-window-change", (e) => {
       this.onWindowChange(e.detail);
@@ -107,16 +110,18 @@ class EpApp extends HTMLElement {
     this.errorEl.textContent = "";
     this.chartEl.data = null;
     try {
-      const [summary, actuals, predictions, retroPredicted] = await Promise.all(
-        [
+      const [summary, actuals, predictions, retroPredicted, deployStates] =
+        await Promise.all([
           this.fetchApi("/api/summary", spec.from, spec.to).catch(() => null),
           this.fetchApi("/api/actuals", spec.from, spec.to),
           this.fetchApi("/api/predictions", spec.from, spec.to),
           this.fetchApi("/api/retro-predicted", spec.from, spec.to).catch(
             () => null,
           ),
-        ],
-      );
+          this.fetchApi("/api/deploy-states", spec.from, spec.to).catch(
+            () => null,
+          ),
+        ]);
       this.figuresEl.data = summary;
       this.chartEl.data = {
         mode: spec.mode,
@@ -124,6 +129,7 @@ class EpApp extends HTMLElement {
         predictions,
         retroPredicted,
       };
+      this.actionsEl.data = deployStates;
     } catch (error) {
       this.errorEl.textContent = `Failed to load data: ${error.message}`;
       this.figuresEl.data = null;
@@ -133,6 +139,7 @@ class EpApp extends HTMLElement {
         predictions: null,
         retroPredicted: null,
       };
+      this.actionsEl.data = null;
     }
   }
 }

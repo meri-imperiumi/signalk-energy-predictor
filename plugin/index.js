@@ -41,6 +41,11 @@ const {
 const { sunPosition } = require("./solar.js");
 const { formatWh } = require("./format.js");
 const { Recorder } = require("./recorder.js");
+const {
+  detectSolarArrayState,
+  detectGeneratorState,
+  STOW_INFERENCE_MIN_SUN_ALT_RAD,
+} = require("./deploy-state.js");
 const { registerApiRoutes } = require("./api.js");
 const openApiSpec = require("../schema/openapi.json");
 
@@ -616,6 +621,75 @@ module.exports = (app) => {
   }
 
   /**
+   * Seeds deltaState with the last-known sticky signals (navigation.state,
+   * navigation.position) from the most recent sample recording.
+   *
+   * On a fresh server start, deltaState is empty and signalk-autostate may
+   * not have published navigation.state yet, so the first prediction cycle
+   * would read "unknown" — producing "vessel nav state unknown" wind-gen
+   * recommendations and skipping WPF application. The last recorded sample
+   * carries the carried-forward sticky state from before the restart.
+   *
+   * Only seeds if the server (app.getSelfPath) does not already have a
+   * current value, so we never override a live reading.
+   *
+   * @returns {Promise<void>}
+   */
+  async function seedStickyStateFromRecordings() {
+    if (!recorder) return;
+    try {
+      const now = Date.now();
+      // Look back up to 2 days for the most recent sample
+      const from = new Date(now - 2 * 24 * 3600000);
+      const to = new Date(now);
+      const samples = await recorder.getRecordings(from, to, "sample");
+      if (samples.length === 0) {
+        app.debug("seedStickyState: no recent samples found, skipping seed");
+        return;
+      }
+      const last = samples[samples.length - 1];
+      // Seed navState only if the server doesn't have it
+      if (
+        last.navState &&
+        last.navState !== "unknown" &&
+        !deltaState.has("navigation.state")
+      ) {
+        const serverNav = app.getSelfPath("navigation.state");
+        const serverNavVal =
+          serverNav && typeof serverNav === "object"
+            ? serverNav.value
+            : serverNav;
+        if (!serverNavVal) {
+          deltaState.set("navigation.state", last.navState);
+          app.debug(
+            `seedStickyState: seeded navigation.state = ${last.navState} from sample at ${last.timestamp}`,
+          );
+        }
+      }
+      // Seed position only if the server doesn't have it
+      if (
+        last.position &&
+        last.position.latitude != null &&
+        !deltaState.has("navigation.position")
+      ) {
+        const serverPos = app.getSelfPath("navigation.position");
+        const serverPosVal =
+          serverPos && typeof serverPos === "object"
+            ? (serverPos.value ?? serverPos)
+            : serverPos;
+        if (!serverPosVal) {
+          deltaState.set("navigation.position", last.position);
+          app.debug(
+            `seedStickyState: seeded navigation.position from sample at ${last.timestamp}`,
+          );
+        }
+      }
+    } catch (error) {
+      app.debug(`seedStickyState: failed (${error.message})`);
+    }
+  }
+
+  /**
    * Builds and updates the plugin status line.
    *
    * @returns {void}
@@ -809,9 +883,18 @@ module.exports = (app) => {
             }
           }
         }
-        // FLINsail always stowed when underway
+        // FLINsail stowed when underway ONLY if not producing power.
+        // A deployable panel that is outputting watts IS deployed — the
+        // owner may motor 150 m to a fuel dock with panels up. Only when
+        // there is no power evidence do we infer stowed from being underway.
         if (array.type === "deployable" && underway) {
-          currentDeployStates.set(array.id, "stowed");
+          const powerVal =
+            array.powerPath != null
+              ? toNumber(deltaState.get(array.powerPath))
+              : null;
+          if (!(powerVal != null && powerVal > 0)) {
+            currentDeployStates.set(array.id, "stowed");
+          }
         }
       }
       for (const gen of getActiveGenerators(pluginConfig)) {
@@ -902,9 +985,17 @@ module.exports = (app) => {
             currentDeployStates.set(gen.id, "stowed");
           }
         }
-        // Wind generators stowed when underway (like FLINsail)
+        // Wind generators stowed when underway ONLY if not producing
+        // power. A wind generator spinning and charging while motoring
+        // (e.g. a short hop) IS deployed.
         if (gen.deployable && gen.type === "wind" && underway) {
-          currentDeployStates.set(gen.id, "stowed");
+          const powerVal =
+            gen.powerPath != null
+              ? toNumber(deltaState.get(gen.powerPath))
+              : null;
+          if (!(powerVal != null && powerVal > 0)) {
+            currentDeployStates.set(gen.id, "stowed");
+          }
         }
       }
 
@@ -1704,6 +1795,72 @@ module.exports = (app) => {
           app.getSelfPath("navigation.speedThroughWater"),
       ) || null;
 
+    // Compute detected deploy/stow states for deployable devices using the
+    // shared inference (same logic as runPredictionCycle's
+    // currentDeployStates, but per-sample for persistence). Carry-forward of
+    // the last known state across unknown gaps is applied at read time
+    // (API), not here, so the raw per-sample inference is stored.
+    const underway =
+      navState === "sailing" ||
+      navState === "motoring" ||
+      navState === "under way";
+    let sunUp = false;
+    if (position && position.latitude != null) {
+      const { sunPosition } = require("./solar.js");
+      // Only treat 0 W as "stowed" when the sun is high enough that a
+      // deployed panel would produce power. Near sunrise/sunset a deployed
+      // panel naturally reads ~0 W.
+      sunUp =
+        sunPosition(new Date(), position.latitude, position.longitude ?? 0)
+          .altitude > STOW_INFERENCE_MIN_SUN_ALT_RAD;
+    }
+    const deployStates = {};
+    for (const array of getActiveSolarArrays(pluginConfig)) {
+      if (array.type !== "deployable") continue;
+      const powerW =
+        array.powerPath != null
+          ? toNumber(
+              deltaState.get(array.powerPath) ||
+                app.getSelfPath(array.powerPath),
+            )
+          : null;
+      const deployStateRaw =
+        array.deployStatePath != null
+          ? deltaState.get(array.deployStatePath) ||
+            app.getSelfPath(array.deployStatePath)
+          : null;
+      const state = detectSolarArrayState(array, {
+        powerW,
+        deployStateRaw,
+        sunUp,
+        underway,
+      });
+      if (state != null) deployStates[array.id] = state;
+    }
+    for (const gen of getActiveGenerators(pluginConfig)) {
+      if (!gen.deployable) continue;
+      const powerW =
+        gen.powerPath != null
+          ? toNumber(
+              deltaState.get(gen.powerPath) || app.getSelfPath(gen.powerPath),
+            )
+          : null;
+      const deployStateRaw =
+        gen.deployStatePath != null
+          ? deltaState.get(gen.deployStatePath) ||
+            app.getSelfPath(gen.deployStatePath)
+          : null;
+      const state = detectGeneratorState(gen, {
+        powerW,
+        deployStateRaw,
+        windKnots: windSpeedKnots,
+        stwKnots,
+        navState,
+        underway,
+      });
+      if (state != null) deployStates[gen.id] = state;
+    }
+
     await recorder.recordSample({
       timestamp: new Date(),
       arrays,
@@ -1714,6 +1871,7 @@ module.exports = (app) => {
       navState,
       position,
       stwKnots,
+      deployStates,
     });
   }
 
@@ -1854,6 +2012,15 @@ module.exports = (app) => {
 
       await initializeLoadProfile();
       await initializeWindProtection(config);
+
+      // Seed deltaState with the last-known sticky signals (nav state,
+      // position) from the most recent recording so the first prediction
+      // cycle (10 s from now) doesn't read "unknown" before a
+      // signalk-autostate delta has arrived. Sticky signals persist until a
+      // real new value arrives, so a fresh server start would otherwise
+      // lose the carried-forward state the plugin had before the restart.
+      // app.getSelfPath may also be empty if autostate hasn't published yet.
+      await seedStickyStateFromRecordings(config);
 
       // Subscribe to Signal K updates
       subscribeToDeltas();

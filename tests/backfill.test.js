@@ -13,12 +13,12 @@ const path = require("node:path");
 const {
   fetchHistoricalWeather,
   interpolateWeather,
-  carryForwardSticky,
   replayHistory,
   replayGenerators,
   replayLoadProfile,
   replayWindProtection,
   backfillSamples,
+  buildCarriedState,
   populateFromHistory,
   historyHeaders,
   queryHistory,
@@ -109,90 +109,106 @@ function pushTick(historyData, minutes, vals) {
   historyData.data.push(row);
 }
 
-test.describe("carryForwardSticky", () => {
-  test("carries navigation.state forward across null gaps", () => {
+test.describe("buildCarriedState", () => {
+  test("carries power/wind/stw/nav forward across silent buckets", () => {
+    // History buckets where sensors publish at different intervals: the
+    // wind generator reported 0 W in bucket 1 then went silent, while nav
+    // state and STW also have gaps. Carried state must keep the last-known
+    // value so deploy-state detection sees 0 W (stowed) not null (unknown).
     const hd = {
-      values: [{ path: "navigation.state", method: "last" }],
+      values: [
+        { path: "navigation.state", method: "last" },
+        { path: "navigation.speedThroughWater", method: "avg" },
+        { path: "electrical.generators.wind.power", method: "avg" },
+      ],
       data: [
-        ["t1", "moored"],
-        ["t2", null],
-        ["t3", null],
-        ["t4", "sailing"],
-        ["t5", null],
+        ["t1", "moored", 0, 0],
+        ["t2", null, null, null],
+        ["t3", "sailing", 2.5, null],
+        ["t4", null, null, null],
       ],
     };
-    carryForwardSticky(hd, new Map([["navigation.state", 1]]));
+    const columns = new Map([
+      ["navigation.state", 1],
+      ["navigation.speedThroughWater", 2],
+      ["electrical.generators.wind.power", 3],
+    ]);
+    const arrayColumns = new Map();
+    const generatorColumns = new Map([["wind", 3]]);
+    const carried = buildCarriedState(
+      hd,
+      columns,
+      1, // navStateColumn
+      2, // stwColumn
+      [], // propulsionCols
+      arrayColumns,
+      generatorColumns,
+      null, // socColumn
+      null, // houseLoadColumn
+      null, // positionColumn
+    );
+    // navState carries forward: moored, moored, sailing, sailing
     assert.deepStrictEqual(
-      hd.data.map((r) => r[1]),
-      ["moored", "moored", "moored", "sailing", "sailing"],
+      carried.map((s) => s.navState),
+      ["moored", "moored", "sailing", "sailing"],
+    );
+    // stwKnots carries forward: 0, 0, ~4.86, ~4.86
+    assert.deepStrictEqual(
+      carried.map((s) =>
+        s.stwKnots == null ? null : Math.round(s.stwKnots * 100) / 100,
+      ),
+      [0, 0, 4.86, 4.86],
+    );
+    // generator power carries forward: 0, 0, 0, 0 (wind was silent after t1)
+    assert.deepStrictEqual(
+      carried.map((s) => s.generatorPower.wind),
+      [0, 0, 0, 0],
     );
   });
 
-  test("carries propulsion.*.state and navigation.position forward", () => {
+  test("carries navigation.position forward across gaps", () => {
     const hd = {
       values: [
-        { path: "propulsion.main.state", method: "last" },
+        { path: "navigation.state", method: "last" },
         { path: "navigation.position", method: "first" },
       ],
       data: [
-        ["t1", "started", [-159.8, -18.86]],
+        ["t1", "moored", [-159.8, -18.86]],
         ["t2", null, null],
-        ["t3", "stopped", null],
+        ["t3", "sailing", null],
         ["t4", null, [-159.81, -18.87]],
         ["t5", null, null],
       ],
     };
-    carryForwardSticky(
+    const columns = new Map([
+      ["navigation.state", 1],
+      ["navigation.position", 2],
+    ]);
+    const carried = buildCarriedState(
       hd,
-      new Map([
-        ["propulsion.main.state", 1],
-        ["navigation.position", 2],
-      ]),
+      columns,
+      1,
+      null,
+      [],
+      new Map(),
+      new Map(),
+      null,
+      null,
+      2,
     );
     assert.deepStrictEqual(
-      hd.data.map((r) => r[1]),
-      ["started", "started", "stopped", "stopped", "stopped"],
-    );
-    assert.deepStrictEqual(
-      hd.data.map((r) => r[2]),
+      carried.map((s) => s.position),
       [
-        [-159.8, -18.86],
-        [-159.8, -18.86],
-        [-159.8, -18.86],
-        [-159.81, -18.87],
-        [-159.81, -18.87],
+        { longitude: -159.8, latitude: -18.86 },
+        { longitude: -159.8, latitude: -18.86 },
+        { longitude: -159.8, latitude: -18.86 },
+        { longitude: -159.81, latitude: -18.87 },
+        { longitude: -159.81, latitude: -18.87 },
       ],
     );
-  });
-
-  test("does not touch non-sticky columns", () => {
-    const hd = {
-      values: [
-        { path: "navigation.state", method: "last" },
-        { path: "electrical.venus.dcPower", method: "average" },
-      ],
-      data: [
-        ["t1", "moored", 100],
-        ["t2", null, 110],
-        ["t3", null, null],
-      ],
-    };
-    carryForwardSticky(
-      hd,
-      new Map([
-        ["navigation.state", 1],
-        ["electrical.venus.dcPower", 2],
-      ]),
-    );
-    // dcPower (a continuous measurement) is NOT carried forward
     assert.deepStrictEqual(
-      hd.data.map((r) => r[2]),
-      [100, 110, null],
-    );
-    // navigation.state IS carried forward
-    assert.deepStrictEqual(
-      hd.data.map((r) => r[1]),
-      ["moored", "moored", "moored"],
+      carried.map((s) => s.navState),
+      ["moored", "moored", "sailing", "sailing", "sailing"],
     );
   });
 });
