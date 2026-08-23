@@ -28,7 +28,16 @@
   "signalk": {
     "displayName": "Energy Predictor",
     "appIcon": "./icon.png",
-    "externalSchema": "config.json"
+    "screenshots": [
+      "./doc/webapp-day.png",
+      "./doc/webapp-month.png"
+    ],
+    "requires": [
+      "@meri-imperiumi/signalk-autostate"
+    ],
+    "recommends": [
+      "signalk-venus-plugin"
+    ]
   },
   "engines": {
     "node": ">=22.0.0"
