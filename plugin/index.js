@@ -31,7 +31,10 @@ const {
   toKnots,
   unwrapPosition,
 } = require("./prediction.js");
-const { AdvisoryPublisher } = require("./advisory.js");
+const {
+  AdvisoryPublisher,
+  solarOffsetMinutesFromLongitude,
+} = require("./advisory.js");
 const { StateConfidence } = require("./urgency.js");
 const {
   buildPluginSchema,
@@ -1216,6 +1219,13 @@ module.exports = (app) => {
         isUnderway: underway,
         deployConfidences,
         batterySoC: predictionEngine.getCurrentSoC(),
+        // Render human-facing notification times in solar-local time
+        // derived from the vessel's longitude, so a UTC-locked server
+        // still surfaces crew-local clock times. Falls back to the host
+        // timezone when longitude is unknown.
+        localOffsetMinutes: solarOffsetMinutesFromLongitude(
+          ingestionFSM.position.longitude,
+        ),
         urgencyConfig: pluginConfig.notification?.urgency,
       });
       app.debug(`Advisories published successfully`);

@@ -53,39 +53,120 @@ const PREDICTION_BASE = "electrical.energy.prediction";
 const NOTIFICATIONS_BASE = "notifications.electrical.energy";
 
 /**
+ * Minimum time between notifications for the same system (milliseconds).
+ */
+const DEBOUNCE_MS = 5 * 60 * 1000; // 5 minutes
+
+/**
+ * Computes a solar (nautical) UTC offset in minutes from a longitude.
+ *
+ * Each 15° of longitude is one hour; the sign matches the convention that
+ * east longitudes lead UTC (positive offset) and west longitudes lag (negative
+ * offset). This is *solar* local time — what the crew experiences relative to
+ * the sun — not civil zone time, which can differ by up to ~1h. It is used for
+ * human-facing notification text only; all timestamps emitted as deltas stay
+ * in UTC (ISO 8601).
+ *
+ * Returns `null` when the longitude is unknown so callers can fall back to the
+ * server's own timezone rendering.
+ *
+ * @param {number} longitude - Longitude in degrees (positive east)
+ * @returns {number|null} Offset from UTC in minutes, or null
+ */
+function solarOffsetMinutesFromLongitude(longitude) {
+  if (longitude == null || Number.isNaN(longitude)) return null;
+  // Round to the nearest whole minute so 25.0°E -> +01:40 exactly, and a
+  // vessel drifting a few hundred metres doesn't churn the rendered time.
+  return Math.round((longitude / 15) * 60);
+}
+
+/**
+ * Formats a `Date` as `HH:MM` in solar-local time given a UTC offset in
+ * minutes, using UTC getters against the shifted instant. This avoids any
+ * dependency on the host's `Intl` timezone database (which on a UTC-locked
+ * marine server would otherwise render everything in UTC).
+ *
+ * @param {Date} when - Instant to format
+ * @param {number} [offsetMinutes=0] - Solar-local offset from UTC in minutes
+ * @returns {string}
+ */
+function formatLocalHHMM(when, offsetMinutes = 0) {
+  const shifted = new Date(when.getTime() + offsetMinutes * 60 * 1000);
+  const hh = String(shifted.getUTCHours()).padStart(2, "0");
+  const mm = String(shifted.getUTCMinutes()).padStart(2, "0");
+  return `${hh}:${mm}`;
+}
+
+/**
+ * Formats a `Date`'s local calendar day as `Mon D` in solar-local time.
+ *
+ * @param {Date} when - Instant to format
+ * @param {number} [offsetMinutes=0] - Solar-local offset from UTC in minutes
+ * @returns {string}
+ */
+function formatLocalMonthDay(when, offsetMinutes = 0) {
+  const shifted = new Date(when.getTime() + offsetMinutes * 60 * 1000);
+  const month = shifted.toLocaleString("en-US", {
+    month: "short",
+    timeZone: "UTC",
+  });
+  const day = shifted.getUTCDate();
+  return `${month} ${day}`;
+}
+
+/**
  * Formats a surplus-window endpoint as `HH:MM`, adding a day marker when
  * it falls on a different day than the window start — a 26h window from
  * 14:46 today to 16:46 tomorrow must not render as the ambiguous
  * `14:46-16:46` (which reads as a 2h same-day span).
  *
+ * When `offsetMinutes` is null the host's own timezone is used (legacy
+ * behaviour); when provided, times render in solar-local time derived from
+ * the vessel's longitude, independent of the server's clock setting.
+ *
  * @param {Date} when - Endpoint to format
  * @param {Date} [start] - Window start, to detect a day rollover
+ * @param {number|null} [offsetMinutes=null] - Solar-local UTC offset in min
  * @returns {string}
  */
-function formatWindowTime(when, start) {
-  const hm = when.toLocaleTimeString([], {
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  });
-  if (start == null || when.toDateString() === start.toDateString()) {
+function formatWindowTime(when, start, offsetMinutes = null) {
+  if (offsetMinutes == null) {
+    const hm = when.toLocaleTimeString([], {
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    });
+    if (start == null || when.toDateString() === start.toDateString()) {
+      return hm;
+    }
+    const tomorrow = new Date(start);
+    tomorrow.setDate(tomorrow.getDate() + 1);
+    if (when.toDateString() === tomorrow.toDateString()) {
+      return `${hm}+1`;
+    }
+    return `${hm} ${when.toLocaleDateString([], {
+      month: "short",
+      day: "numeric",
+    })}`;
+  }
+
+  const hm = formatLocalHHMM(when, offsetMinutes);
+  if (start == null) {
     return hm;
   }
-  const tomorrow = new Date(start);
-  tomorrow.setDate(tomorrow.getDate() + 1);
-  if (when.toDateString() === tomorrow.toDateString()) {
+  // Compare local calendar days (not UTC) so a window crossing solar
+  // midnight is flagged regardless of the absolute longitude.
+  const startDay = formatLocalMonthDay(start, offsetMinutes);
+  const whenDay = formatLocalMonthDay(when, offsetMinutes);
+  if (whenDay === startDay) {
+    return hm;
+  }
+  const tomorrow = new Date(start.getTime() + 24 * 3600 * 1000);
+  if (formatLocalMonthDay(tomorrow, offsetMinutes) === whenDay) {
     return `${hm}+1`;
   }
-  return `${hm} ${when.toLocaleDateString([], {
-    month: "short",
-    day: "numeric",
-  })}`;
+  return `${hm} ${whenDay}`;
 }
-
-/**
- * Minimum time between notifications for the same system (milliseconds).
- */
-const DEBOUNCE_MS = 5 * 60 * 1000; // 5 minutes
 
 /**
  * Computes the severity ratio (`currentValue / limit`) for a deployment
@@ -710,6 +791,8 @@ class AdvisoryPublisher {
    * @param {boolean} [opts.isUnderway=false] - Whether the vessel is
    *        under way (at-rest + night holds low-urgency "run the genset"
    *        suggestions for the morning; battery alarm/high always emit)
+   * @param {number|null} [opts.localOffsetMinutes=null] - Solar-local UTC
+   *        offset (min) for human-facing times; null uses host timezone
    * @param {object} [opts.urgencyConfig] - Urgency config override
    * @returns {void}
    */
@@ -718,16 +801,13 @@ class AdvisoryPublisher {
 
     if (runTime) {
       const hours = Math.round(runTime.hours * 10) / 10;
-      const end = runTime.optimalWindow.end.toLocaleTimeString([], {
-        hour: "2-digit",
-        minute: "2-digit",
-        hour12: false,
-      });
-      const start = runTime.optimalWindow.start.toLocaleTimeString([], {
-        hour: "2-digit",
-        minute: "2-digit",
-        hour12: false,
-      });
+      const off = opts.localOffsetMinutes ?? null;
+      const end = formatWindowTime(runTime.optimalWindow.end, undefined, off);
+      const start = formatWindowTime(
+        runTime.optimalWindow.start,
+        undefined,
+        off,
+      );
       const message = `Run engine for ${hours}h between ${start}-${end} to avoid low battery`;
       const urgency = calculateUrgency({
         advisoryType: "engine",
@@ -821,6 +901,8 @@ class AdvisoryPublisher {
    * @param {object} [opts]
    * @param {boolean} [opts.isNight=false] - Whether it is currently nighttime
    * @param {boolean} [opts.isUnderway=false] - Whether the vessel is under way
+   * @param {number|null} [opts.localOffsetMinutes=null] - Solar-local UTC
+   *        offset (min) for human-facing times; null uses host timezone
    * @param {object} [opts.urgencyConfig] - Urgency config override
    * @returns {void}
    */
@@ -828,8 +910,9 @@ class AdvisoryPublisher {
     const type = AdvisoryType.SURPLUS_OPPORTUNITY;
 
     if (opportunity) {
-      const from = formatWindowTime(opportunity.from);
-      const to = formatWindowTime(opportunity.to, opportunity.from);
+      const off = opts.localOffsetMinutes ?? null;
+      const from = formatWindowTime(opportunity.from, undefined, off);
+      const to = formatWindowTime(opportunity.to, opportunity.from, off);
       let message = `${formatWh(opportunity.surplusWh)} surplus available ${from}-${to}`;
       if (opportunity.suggestedLoadW > 0) {
         message += ` (~${opportunity.suggestedLoadW}W sustained)`;
@@ -916,6 +999,8 @@ class AdvisoryPublisher {
    * @param {boolean} [params.isUnderway=false] - Whether the vessel is under way
    * @param {Map<string, number>} [params.deployConfidences] - Map of device ID to StateConfidence
    * @param {number} [params.batterySoC] - Current battery SoC [0–1]
+   * @param {number|null} [params.localOffsetMinutes=null] - Solar-local UTC
+   *        offset (min) for human-facing times; null uses host timezone
    * @param {object} [params.urgencyConfig] - Urgency config override
    * @returns {void}
    */
@@ -933,6 +1018,7 @@ class AdvisoryPublisher {
     isUnderway = false,
     deployConfidences,
     batterySoC,
+    localOffsetMinutes = null,
     urgencyConfig,
   }) {
     this.app.debug(
@@ -967,6 +1053,7 @@ class AdvisoryPublisher {
       batterySoC,
       isNight,
       isUnderway,
+      localOffsetMinutes,
       urgencyConfig,
     });
 
@@ -975,6 +1062,7 @@ class AdvisoryPublisher {
     this.publishSurplusAdvisory(surplusOpportunity, opportunisticLoads, {
       isNight,
       isUnderway,
+      localOffsetMinutes,
       urgencyConfig,
     });
 
@@ -1014,4 +1102,6 @@ module.exports = {
   severityRatioFor,
   hoursUntil,
   isActualCondition,
+  solarOffsetMinutesFromLongitude,
+  formatWindowTime,
 };
