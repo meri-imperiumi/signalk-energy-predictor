@@ -109,6 +109,10 @@ Before updating the model, the telemetry tick must pass these booleans. If any a
 * `ac.shorePower.connected == true`
 * `controller.mode != 'bulk'` (If mode data is available)
 
+The `controller.mode` gate is the ground-truth signal for bulk charging: the SoC threshold above is unreliable because a shunt SoC drifts, so absorption/float can begin at a reported SoC well below 0.80. Each solar array's mode is read from its configured `controllerModePath` (string enum: `bulk` / `absorption` / `float`) and recorded on every sample, so the same gate can be applied during offline backfill and evaluation. Ticks without a mode reading fall back to the other gates.
+
+Apparent Wind Angle (`environment.wind.angleApparent`) is likewise recorded on every sample (radians) so the sailing bins — keyed on `Azimuth_Elevation_AWA` — can be validated against actuals offline.
+
 ### 4.2 Matrix Structure
 
 The data is binned into two flat key-value maps (stored as JSON) to accommodate standard single-board computer memory constraints.
@@ -124,11 +128,13 @@ The data is binned into two flat key-value maps (stored as JSON) to accommodate 
 
 ### 4.3 Instantaneous Efficiency ($\eta$)
 
-For each array configuration, the current tick efficiency is calculated:
+For each array configuration, the current tick efficiency is calculated. The theoretical power is the array's STC nameplate output under the measured Global Horizontal Irradiance (rated at the standard 1000 W/m²); GHI already encodes the sun elevation for a horizontal panel, so no separate `sin(Elevation)` factor is applied (a night gate drops ticks where the sun is below the horizon):
 
-$$P_{\text{theoretical}} = \text{Capacity}_{Wp} \cdot \left( \frac{GHI_{\text{current}}}{1367} \right) \cdot \sin(\text{Elevation})$$
+$$P_{\text{theoretical}} = \text{Capacity}_{Wp} \cdot \left( \frac{GHI_{\text{current}}}{1000} \right)$$
 
 $$\eta_{\text{observed}} = \min\left(1.0, \max\left(0.0, \frac{P_{\text{actual}}}{P_{\text{theoretical}}}\right)\right)$$
+
+The learned $\eta$ therefore absorbs all real-world derating relative to nameplate — panel temperature, non-optimal tilt, partial shading, soiling, and DC-conversion losses — which is the intended design.
 
 ### 4.4 Exponential Moving Average Update
 

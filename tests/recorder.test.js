@@ -221,6 +221,49 @@ test.describe("recorder", () => {
         superwind: "stowed",
       });
     });
+
+    test("persists controllerModes and awaRad in the sample record", async () => {
+      const sample = {
+        timestamp: new Date("2024-08-21T12:15:00Z"),
+        arrays: {},
+        generators: {},
+        soc: 0.7,
+        houseLoadW: 100,
+        windSpeedKnots: 10,
+        navState: "sailing",
+        position: null,
+        controllerModes: { "aft-arch": "bulk", flinsail: "absorption" },
+        awaRad: 1.2,
+      };
+      await recordSample(mockApp, tempDir, sample);
+      const filePath = getRecordingsPath(tempDir, sample.timestamp);
+      const content = await fs.readFile(filePath, "utf-8");
+      const record = JSON.parse(content.trim());
+      assert.deepStrictEqual(record.controllerModes, {
+        "aft-arch": "bulk",
+        flinsail: "absorption",
+      });
+      assert.strictEqual(record.awaRad, 1.2);
+    });
+
+    test("defaults controllerModes and awaRad when omitted", async () => {
+      const sample = {
+        timestamp: new Date("2024-08-21T12:20:00Z"),
+        arrays: {},
+        generators: {},
+        soc: 0.7,
+        houseLoadW: 100,
+        windSpeedKnots: 10,
+        navState: "anchored",
+        position: null,
+      };
+      await recordSample(mockApp, tempDir, sample);
+      const filePath = getRecordingsPath(tempDir, sample.timestamp);
+      const content = await fs.readFile(filePath, "utf-8");
+      const record = JSON.parse(content.trim());
+      assert.deepStrictEqual(record.controllerModes, {});
+      assert.strictEqual(record.awaRad, null);
+    });
   });
 
   test.describe("pruneOldRecordings", () => {

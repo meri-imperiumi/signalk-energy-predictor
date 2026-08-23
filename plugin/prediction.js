@@ -8,6 +8,7 @@
  */
 
 const { sunPosition, nextSunrise, lastSunset } = require("./solar.js");
+const { theoreticalPower } = require("./learning.js");
 const { formatWh } = require("./format.js");
 const SunCalc = require("suncalc");
 
@@ -105,15 +106,17 @@ function predictSolarHour({
     }
   }
 
-  // Calculate instantaneous power
-  const sinElevation = Math.sin(sunPosition.altitude);
-  if (sinElevation <= 0 || ghi <= 0) {
+  // Theoretical power from GHI (horizontal panel, STC rated at 1000 W/m²).
+  // the theoreticalPower handles the night gate (sun below horizon).
+  const theoretical = theoreticalPower(
+    array.capacityWp,
+    ghi,
+    sunPosition.altitude,
+  );
+  if (theoretical <= 0) {
     return 0;
   }
-
-  const irradianceFactor = ghi / 1367;
-  const theoreticalPower = array.capacityWp * irradianceFactor * sinElevation;
-  const actualPower = theoreticalPower * efficiency;
+  const actualPower = theoretical * efficiency;
 
   // Convert to watt-hours for the hour
   return actualPower;

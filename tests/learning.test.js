@@ -71,19 +71,33 @@ test.describe("SolarMatrix", () => {
   });
 
   test.describe("theoreticalPower", () => {
-    test("calculates power from capacity, GHI, and elevation", () => {
-      const power = theoreticalPower(100, 683.5, Math.PI / 6);
-      assert.ok(power > 0);
-      assert.ok(power < 100);
+    test("scales nameplate by GHI/1000 (STC rated at 1000 W/m²)", () => {
+      // 100 Wp panel at 683.5 W/m² -> 68.35 W theoretical
+      assert.strictEqual(theoreticalPower(100, 683.5, Math.PI / 6), 68.35);
     });
 
-    test("returns zero when elevation is negative", () => {
+    test("does not double-discount sun elevation (GHI already encodes it)", () => {
+      // Same GHI at two different sun elevations must give the same power:
+      // the old formula multiplied by sin(elevation), making low-sun output
+      // ~2× too low and pushing observed efficiency past 1.0.
+      const high = theoreticalPower(100, 800, Math.PI / 2);
+      const low = theoreticalPower(100, 800, Math.PI / 6);
+      assert.strictEqual(high, 80);
+      assert.strictEqual(low, 80);
+    });
+
+    test("returns zero when elevation is negative (night gate)", () => {
       const power = theoreticalPower(100, 1367, -Math.PI / 6);
       assert.strictEqual(power, 0);
     });
 
-    test("returns zero when elevation is zero", () => {
+    test("returns zero when elevation is zero (night gate)", () => {
       const power = theoreticalPower(100, 1367, 0);
+      assert.strictEqual(power, 0);
+    });
+
+    test("returns zero when GHI is zero", () => {
+      const power = theoreticalPower(100, 0, Math.PI / 4);
       assert.strictEqual(power, 0);
     });
   });
@@ -165,6 +179,46 @@ test.describe("SolarMatrix", () => {
         controllerMode: "absorption",
       };
       assert.strictEqual(isValidTick(readings), false);
+    });
+
+    test("accepts operationMode 'mppt active' as bulk-equivalent", () => {
+      // Victron `operationMode` uses a different vocabulary than
+      // `controllerMode`: 'mppt active' is the freely-tracking (bulk)
+      // state. The deployable FLINsail array reports operationMode, so the
+      // gate must accept it or every flinsail tick is dropped.
+      for (const mode of ["mppt active"]) {
+        assert.strictEqual(
+          isValidTick({
+            engineRunning: false,
+            batterySoc: 0.6,
+            shorePowerConnected: false,
+            controllerMode: mode,
+          }),
+          true,
+          `${mode} should be bulk-equivalent`,
+        );
+      }
+    });
+
+    test("rejects limited/off operationMode values", () => {
+      for (const mode of [
+        "voltage/current limited",
+        "off",
+        "external control",
+        "not charging",
+        "float",
+      ]) {
+        assert.strictEqual(
+          isValidTick({
+            engineRunning: false,
+            batterySoc: 0.6,
+            shorePowerConnected: false,
+            controllerMode: mode,
+          }),
+          false,
+          `${mode} should be rejected`,
+        );
+      }
     });
 
     test("passes when controller mode is null", () => {

@@ -1861,6 +1861,30 @@ module.exports = (app) => {
       if (state != null) deployStates[gen.id] = state;
     }
 
+    // Per-array charge controller modes (for the learning sanitization gate).
+    // Recorded so offline backfill/eval can drop non-bulk ticks — the SoC
+    // gate alone is unreliable because the shunt SoC drifts.
+    const controllerModes = {};
+    for (const array of getActiveSolarArrays(pluginConfig)) {
+      if (!array.controllerModePath) continue;
+      const modeRaw =
+        deltaState.get(array.controllerModePath) ||
+        app.getSelfPath(array.controllerModePath);
+      const mode =
+        modeRaw && typeof modeRaw === "object" ? modeRaw.value : modeRaw;
+      if (mode != null) controllerModes[array.id] = mode;
+    }
+
+    // Apparent wind angle (sailing matrix input). Recorded so the sailing
+    // bins can be validated against actuals offline. Stored in radians to
+    // match the learning matrix API.
+    const awaRaw =
+      deltaState.get("environment.wind.angleApparent") ||
+      app.getSelfPath("environment.wind.angleApparent");
+    const awaRad = toNumber(
+      awaRaw && typeof awaRaw === "object" ? awaRaw.value : awaRaw,
+    );
+
     await recorder.recordSample({
       timestamp: new Date(),
       arrays,
@@ -1872,6 +1896,8 @@ module.exports = (app) => {
       position,
       stwKnots,
       deployStates,
+      controllerModes,
+      awaRad,
     });
   }
 

@@ -93,6 +93,15 @@ async function recordCycle(app, dataDir, cycle) {
  * @param {number|null} [sample.stwKnots] - Speed through water in knots
  * @param {object} [sample.deployStates] - Per-device detected deploy state
  *        ("deployed"/"stowed") inferred from power + conditions
+ * @param {object<string,string|null>} [sample.controllerModes] - Per-array
+ *        charge controller mode (e.g. "bulk"/"absorption"/"float") from each
+ *        array's `controllerModePath`. The learning sanitization gate drops
+ *        non-bulk ticks, so recording it lets offline backfill/eval apply the
+ *        same gate to historical samples (the SoC gate alone is unreliable
+ *        because the shunt SoC drifts).
+ * @param {number|null} [sample.awaRad] - Apparent wind angle in radians
+ *        (sailing matrix input). Recorded so the sailing bins can be
+ *        validated against actuals offline.
  * @returns {Promise<void>}
  */
 async function recordSample(app, dataDir, sample) {
@@ -111,6 +120,8 @@ async function recordSample(app, dataDir, sample) {
     position: sample.position,
     stwKnots: sample.stwKnots ?? null,
     deployStates: sample.deployStates || {},
+    controllerModes: sample.controllerModes || {},
+    awaRad: sample.awaRad ?? null,
   };
 
   const line = `${JSON.stringify(record)}\n`;

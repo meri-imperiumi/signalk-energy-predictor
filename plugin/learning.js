@@ -110,21 +110,31 @@ function sailingKey(azimuthRad, elevationRad, awaRad) {
 }
 
 /**
- * Calculates theoretical maximum power output for a solar array.
+ * Calculates theoretical maximum power output for a horizontal solar array
+ * from Global Horizontal Irradiance (GHI).
  *
- * @param {number} capacityWp - Array capacity in peak watts
+ * GHI already accounts for the sun's elevation (a low sun delivers less
+ * irradiance to a horizontal surface by definition), so the panel output is
+ * the nameplate capacity (rated at 1000 W/m² STC) scaled by the irradiance
+ * ratio. Do NOT multiply by sin(elevation) here — that double-discounts the
+ * angle and makes every real panel look ~2× efficient at low sun.
+ *
+ * @param {number} capacityWp - Array capacity in peak watts (rated at 1000 W/m²)
  * @param {number} ghi - Global Horizontal Irradiance in W/m²
- * @param {number} elevationRad - Sun elevation in radians
+ * @param {number} elevationRad - Sun elevation in radians (only used to gate night)
  * @returns {number} Theoretical power in watts
  */
 function theoreticalPower(capacityWp, ghi, elevationRad) {
-  const sinElevation = Math.sin(elevationRad);
-  if (sinElevation <= 0) {
+  if (ghi <= 0) {
     return 0;
   }
-  // Normalize GHI to solar constant and apply elevation factor
-  const irradianceFactor = ghi / 1367;
-  return capacityWp * irradianceFactor * sinElevation;
+  // Sun below horizon means no generation. (ghi<=0 already implies this,
+  // but the explicit check keeps the night gate when called with a clear-sky
+  // GHI that may carry a tiny residual at low altitude.)
+  if (Math.sin(elevationRad) <= 0) {
+    return 0;
+  }
+  return (capacityWp * ghi) / 1000;
 }
 
 /**
@@ -172,7 +182,16 @@ function emaUpdate(existingEfficiency, observedEfficiency, alpha = EMA_ALPHA) {
  * @param {boolean|null} readings.engineRunning - Any engine running (started state or revolutions > 0)
  * @param {number|null} readings.batterySoc - Battery state of charge [0, 1]
  * @param {boolean|null} readings.shorePowerConnected - Shore power connected
- * @param {string|null} readings.controllerMode - Charge controller mode
+ * @param {string|null} readings.controllerMode - Charge controller mode.
+ *        Accepts two vocabularies: `controllerMode` (Victron: `bulk` /
+ *        `absorption` / `float` / `not charging` / `off`) and `operationMode`
+ *        (Victron: `mppt active` / `voltage/current limited` / `off` /
+ *        `external control`). A tick is bulk-equivalent — i.e. the controller
+ *        is tracking the max power point freely, not limiting output — when
+ *        the mode is `bulk` (controllerMode) or `mppt active` (operationMode).
+ *        Any other non-null value means the controller is limiting or off,
+ *        so the tick is dropped (a limited tick would be mis-learned as
+ *        "low efficiency at this sun angle").
  * @returns {boolean} True if tick is valid for learning
  */
 function isValidTick(readings) {
@@ -194,8 +213,16 @@ function isValidTick(readings) {
     return false;
   }
 
-  // Controller not in bulk mode - drop tick (absorption/float limits output)
-  if (controllerMode != null && controllerMode !== "bulk") {
+  // Controller not in a bulk-equivalent mode - drop tick. Both charge-
+  // controller vocabularies are accepted: `bulk` (controllerMode) and
+  // `mppt active` (operationMode) mean the MPPT tracker is running freely;
+  // anything else (absorption, float, voltage/current limited, off, not
+  // charging) means output is limited or absent and would corrupt the bin.
+  if (
+    controllerMode != null &&
+    controllerMode !== "bulk" &&
+    controllerMode !== "mppt active"
+  ) {
     return false;
   }
 

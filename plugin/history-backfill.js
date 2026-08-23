@@ -235,13 +235,15 @@ async function queryHistory({
   fetchImpl = fetch,
 }) {
   const url = new URL("/signalk/v2/api/history/values", baseUrl);
-  // Textual paths (e.g. navigation.state, propulsion.*.state) cannot be
-  // averaged — the default method returns 0 rows for strings. Use :last
-  // for these so enum values come through. The API reports the method
-  // back in values[].method and strips it from values[].path, so
-  // pathColumns maps by the bare path unchanged.
+  // Textual paths (navigation.state, propulsion.*.state, charge
+  // controller mode/operationMode) cannot be averaged — the default method
+  // returns 0 rows for strings. Use :last for these so enum values come
+  // through. The API reports the method back in values[].method and strips
+  // it from values[].path, so pathColumns maps by the bare path unchanged.
   const queryPaths = paths.map((p) =>
-    p.endsWith(".state") && !p.includes(":") ? `${p}:last` : p,
+    /\.(state|controllerMode|operationMode)$/.test(p) && !p.includes(":")
+      ? `${p}:last`
+      : p,
   );
   url.searchParams.set("paths", queryPaths.join(","));
   url.searchParams.set("from", from.toISOString());
@@ -640,6 +642,13 @@ function replayHistory({
   const navStateColumn = columns.get("navigation.state");
   const stwColumn = columns.get("navigation.speedThroughWater");
   const awaColumn = columns.get("environment.wind.angleApparent");
+  // Charge controller mode for this array (string enum): bulk/absorption/
+  // float. The learning gate drops non-bulk ticks, so reading it from history
+  // keeps absorption/float-limited output out of the matrix. null when the
+  // array has no controllerModePath or the path had no history data.
+  const controllerModeColumn = array.controllerModePath
+    ? columns.get(array.controllerModePath)
+    : null;
   const positionColumn = columns.get("navigation.position");
 
   let dataPoints = 0;
@@ -728,7 +737,7 @@ function replayHistory({
         engineRunning: engineRunningAt(point, propulsionCols, columns),
         batterySoc: columnNumber(point, socColumn),
         shorePowerConnected: null,
-        controllerMode: null,
+        controllerMode: columnValue(point, controllerModeColumn),
       },
     });
 
@@ -939,6 +948,9 @@ async function populateFromHistory({
   const queryPaths = Array.from(
     new Set([
       ...arrays.map((a) => a.powerPath),
+      ...arrays
+        .map((a) => a.controllerModePath)
+        .filter((p) => typeof p === "string" && p.length > 0),
       ...generators.map((g) => g.powerPath),
       socPath,
       ...CONTEXT_PATHS,
@@ -1433,6 +1445,18 @@ async function backfillSamples({
       .map((a) => [a.id, columns.get(a.powerPath)])
       .filter(([, col]) => col != null),
   );
+  // Per-array charge controller mode columns (string enums; :last method).
+  // Used to record controllerModes on gap-filled samples so offline eval can
+  // apply the bulk-only learning gate.
+  const controllerModeColumns = new Map(
+    arrays
+      .map((a) => [
+        a.id,
+        a.controllerModePath ? columns.get(a.controllerModePath) : null,
+      ])
+      .filter(([, col]) => col != null),
+  );
+  const awaColumn = columns.get("environment.wind.angleApparent");
   const generatorColumns = new Map(
     generators
       .map((g) => [g.id, columns.get(g.powerPath)])
@@ -1506,6 +1530,16 @@ async function backfillSamples({
     }
 
     const weatherPoint = interpolateWeather(weather, time);
+    // Per-array charge controller mode at this tick (carried-forward via
+    // the :last aggregate; null where the array has no mode path).
+    const controllerModes = {};
+    for (const [id, col] of controllerModeColumns) {
+      const mode = columnValue(point, col);
+      if (mode != null) controllerModes[id] = mode;
+    }
+    // Apparent wind angle (radians) for the sailing matrix. Read raw from
+    // the bucket; the live recorder stores the raw delta value the same way.
+    const awaRad = columnNumber(point, awaColumn);
     const sample = {
       timestamp: time,
       arrays: st.arrayPower,
@@ -1517,6 +1551,8 @@ async function backfillSamples({
       navState: st.navState,
       position: st.position,
       stwKnots: st.stwKnots,
+      controllerModes,
+      awaRad: awaRad ?? null,
     };
 
     // Detect deploy/stow states for deployable devices from the carried-

@@ -403,6 +403,99 @@ test.describe("replayHistory", () => {
     });
     assert.strictEqual(stats.dataPoints, 0);
   });
+
+  test("controllerMode gate drops non-bulk ticks when controllerModePath is configured", () => {
+    // Absorption/float limit panel output below the bulk maximum; the
+    // learning gate must drop those ticks so they aren't mis-learned as
+    // "low efficiency at this sun angle". The controllerMode path is a
+    // string enum, so it must arrive via the :last aggregate.
+    const modePath = "electrical.solar.test.controllerMode";
+    const historyData = {
+      values: [
+        { path: "electrical.solar.test.power" },
+        { path: "electrical.batteries.house.capacity.stateOfCharge" },
+        { path: "navigation.state" },
+        { path: "environment.wind.angleApparent" },
+        { path: "navigation.speedThroughWater" },
+        { path: "navigation.position" },
+        { path: modePath },
+      ],
+      data: [],
+    };
+    // Two bulk ticks (learned) + two absorption ticks (dropped)
+    const rows = [
+      ["bulk", 50],
+      ["bulk", 50],
+      ["absorption", 20],
+      ["float", 10],
+    ];
+    for (let i = 0; i < rows.length; i++) {
+      const row = [new Date(NOON + i * 60000).toISOString()];
+      row[1] = rows[i][1]; // solar
+      row[2] = 0.5; // soc
+      row[3] = "anchored";
+      row[4] = null; // awa
+      row[5] = null; // stw
+      row[6] = [LON, LAT];
+      row[7] = rows[i][0]; // controllerMode
+      historyData.data.push(row);
+    }
+    const modeArray = { ...array, controllerModePath: modePath };
+    const matrix = new SolarMatrix("test-array");
+    const stats = replayHistory({
+      matrix,
+      array: modeArray,
+      socPath: "electrical.batteries.house.capacity.stateOfCharge",
+      historyData,
+      weather: makeWeather(NOON),
+      latitude: LAT,
+      longitude: LON,
+      resolution: 300,
+    });
+    assert.strictEqual(stats.dataPoints, 4, "all ticks counted");
+    assert.strictEqual(stats.binUpdates, 2, "only bulk ticks learned");
+    assert.strictEqual(stats.droppedTicks, 2, "non-bulk ticks dropped");
+  });
+
+  test("queryHistory appends :last to controllerMode and operationMode paths", () => {
+    // String-valued paths cannot be averaged; the API returns no rows for
+    // the default method. Like navigation.state, controller-mode paths
+    // need the :last aggregate so enum values come through.
+    let captured = null;
+    const fakeFetch = async (url) => {
+      captured = url.searchParams.get("paths");
+      return { ok: true, json: async () => ({ values: [], data: [] }) };
+    };
+    queryHistory({
+      baseUrl: "http://x",
+      from: new Date("2026-01-01T00:00:00Z"),
+      to: new Date("2026-01-02T00:00:00Z"),
+      paths: [
+        "electrical.solar.aftarch.controllerMode",
+        "electrical.solar.flinsail.operationMode",
+        "navigation.state",
+        "electrical.solar.bowpanel.panelPower",
+      ],
+      fetchImpl: fakeFetch,
+    });
+    const requested = captured.split(",");
+    assert.ok(
+      requested.includes("electrical.solar.aftarch.controllerMode:last"),
+      "controllerMode gets :last",
+    );
+    assert.ok(
+      requested.includes("electrical.solar.flinsail.operationMode:last"),
+      "operationMode gets :last",
+    );
+    assert.ok(
+      requested.includes("navigation.state:last"),
+      "navigation.state keeps :last",
+    );
+    assert.ok(
+      requested.includes("electrical.solar.bowpanel.panelPower"),
+      "numeric path is left untouched",
+    );
+  });
 });
 
 test.describe("replayGenerators", () => {
@@ -781,6 +874,68 @@ test.describe("recordings gap-fill", () => {
         (s) => Math.abs(Date.parse(s.timestamp) - NOON) < 60000,
       );
       assert.deepStrictEqual(noon.arrays, { live: 1 });
+    } finally {
+      await fs.rm(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  test("writes controllerModes and awaRad into gap-filled samples", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "bf-fields-"));
+    try {
+      const modePath = "electrical.solar.test.controllerMode";
+      const historyData = {
+        values: [
+          { path: "electrical.solar.test.power" },
+          { path: "electrical.batteries.house.capacity.stateOfCharge" },
+          { path: "navigation.state" },
+          { path: "environment.wind.angleApparent" },
+          { path: "navigation.speedThroughWater" },
+          { path: "navigation.position" },
+          { path: modePath },
+        ],
+        data: [],
+      };
+      for (let m = 0; m < 15; m += 5) {
+        const row = [new Date(NOON + m * 60000).toISOString()];
+        row[1] = 50; // solar
+        row[2] = 0.5; // soc
+        row[3] = "sailing";
+        row[4] = 0.9; // awa (radians)
+        row[5] = null; // stw
+        row[6] = [LON, LAT];
+        row[7] = "bulk"; // controllerMode
+        historyData.data.push(row);
+      }
+
+      const written = await backfillSamples({
+        app: { debug() {} },
+        dataDir,
+        historyData,
+        weather: makeWeather(NOON),
+        arrays: [
+          {
+            id: "test-array",
+            powerPath: "electrical.solar.test.power",
+            controllerModePath: modePath,
+          },
+        ],
+        generators: [],
+        socPath: "electrical.batteries.house.capacity.stateOfCharge",
+        from: new Date(NOON - 3600000),
+        to: new Date(NOON + 3600000),
+      });
+      assert.strictEqual(written, 3);
+      const samples = await getRecordings(
+        dataDir,
+        new Date(NOON - 3600000),
+        new Date(NOON + 3600000),
+        "sample",
+      );
+      assert.strictEqual(samples.length, 3);
+      for (const s of samples) {
+        assert.deepStrictEqual(s.controllerModes, { "test-array": "bulk" });
+        assert.strictEqual(s.awaRad, 0.9);
+      }
     } finally {
       await fs.rm(dataDir, { recursive: true, force: true });
     }
