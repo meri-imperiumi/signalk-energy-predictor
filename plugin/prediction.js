@@ -1445,19 +1445,22 @@ class PredictionEngine {
       const lon = pos?.longitude;
       for (const point of this.lastForecast) {
         const gust = point.gustSpeedKnots ?? null;
-        // Mirror the hysteresis in computeDeployableSolarStates: a stowed
-        // array only deploys once gusts drop below (limit - hysteresis).
-        const hysteresis = array.gustHysteresisKnots ?? 2;
-        const deployThreshold = gustLimit - hysteresis;
         // A missing forecast (null gust) is not evidence of calm: skip it
-        // rather than triggering a fabricated deploy/stow.
+        // rather than triggering a fabricated stow.
         if (gust == null) continue;
+        // `currentState` is the recommendation direction. We want the time
+        // of the trigger that *motivates* that recommendation, so the
+        // published `recommendedStateTime` (and the urgency `hoursUntil`)
+        // answer "by when must the crew act", not "when can they undo it":
+        //  - recommending "deployed": the next stow trigger — "deploy now,
+        //    you'll need to stow at X".
+        //  - recommending "stowed": the stow trigger — "stow by X". The
+        //    redeploy time is a separate concern and not exposed here;
+        //    surfacing it would mislead urgency into thinking the action
+        //    is far off when it's actually due now/tonight.
         const wouldStow = gust >= gustLimit;
-        const wouldDeploy = gust < deployThreshold;
         let changeTime = null;
-        if (currentState === "deployed" && wouldStow) {
-          changeTime = point.time;
-        } else if (currentState === "stowed" && wouldDeploy) {
+        if (wouldStow) {
           changeTime = point.time;
         }
         if (changeTime) {
@@ -1466,11 +1469,12 @@ class PredictionEngine {
           if (lat != null && lon != null) {
             const { altitude } = sunPosition(t, lat, lon);
             if (altitude <= 0) {
-              // Change triggers at night: report at the sun boundary instead
-              const target =
-                currentState === "deployed"
-                  ? lastSunset(t, lat, lon) // Stow before dark, not at 2 AM
-                  : nextSunrise(t, lat, lon); // Deploy at sunrise, not at night
+              // Stow trigger at night: report at the preceding sunset
+              // ("stow before dark, not at 2 AM") for both recommendation
+              // directions, since the motivating trigger is a stow in
+              // both cases. Clamped to now, so a trigger already past
+              // reads as "act now".
+              const target = lastSunset(t, lat, lon);
               if (target) {
                 const clamped = new Date(
                   Math.max(target.getTime(), Date.now()),

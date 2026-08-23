@@ -2132,7 +2132,7 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
     assert.strictEqual(hydroSide, undefined);
   });
 
-  test("FLINsail recommendedStateTime: stow now, deploy when gusts drop", () => {
+  test("FLINsail recommendedStateTime: stow trigger when recommending stow", () => {
     const app = makeFakeApp();
     app.setSelfPath("navigation.position", {
       latitude: 60,
@@ -2175,16 +2175,15 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
         .getDeploymentRecommendations()
         .find((r) => r.id === "flinsail");
       assert.strictEqual(rec.recommendedState, "stowed");
-      // Gusts drop at hour 5 (17:00Z), which is after sunset at 60°N in March.
-      // Night-time deploy shifts to the next sunrise instead
+      // The recommendation is "stowed" because gusts breach the limit from
+      // hour 0. recommendedStateTime is the motivating *stow* trigger (when
+      // the crew must act), not the future redeploy time. Hour 0 is daytime
+      // (sun up at 60°N in March at 12:00Z), so no night-boundary shift —
+      // the trigger is now.
       assert.ok(rec.recommendedStateTime);
       const changeTime = new Date(rec.recommendedStateTime);
-      const expectedSunrise = nextSunrise(
-        new Date(now.getTime() + 5 * 3600000),
-        60,
-        18,
-      );
-      assert.strictEqual(changeTime.getTime(), expectedSunrise.getTime());
+      const triggerPoint = new Date(now.getTime());
+      assert.strictEqual(changeTime.getTime(), triggerPoint.getTime());
     } finally {
       Date.now = realNow;
     }
