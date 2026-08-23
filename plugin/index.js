@@ -2006,6 +2006,20 @@ module.exports = (app) => {
         dataDir: app.getDataDirPath(),
       });
       advisoryPublisher = new deps.AdvisoryPublisher(app, plugin.id);
+      // Publish metadata (units, labels, descriptions) for the paths this
+      // plugin emits, once at startup. Per-device deployment meta is emitted
+      // for each configured deployable device.
+      const metaDevices = [
+        ...getActiveSolarArrays(config).map((a) => ({
+          id: a.id,
+          type: "solar-deployable",
+        })),
+        ...getActiveGenerators(config).map((g) => ({
+          id: g.id,
+          type: "mechanical",
+        })),
+      ];
+      advisoryPublisher.sendMeta(metaDevices);
 
       // Initialize recorder
       const dataDir = app.getDataDirPath();

@@ -94,6 +94,215 @@ class AdvisoryPublisher {
   }
 
   /**
+   * Publishes metadata (units, display name, description) for the Signal K
+   * paths this plugin emits, so consumers and instrument panels can render
+   * them with correct units and labels.
+   *
+   * Mirrors the `sendMeta` pattern from signalk-meshtastic: emitted once at
+   * startup. Per-device deployment paths are emitted for each configured
+   * device so their meta resolves to concrete paths.
+   *
+   * @param {Array<{id: string, type: string}>} [devices=[]] - Configured deployable devices to emit deployment meta for
+   * @returns {void}
+   */
+  sendMeta(devices = []) {
+    const meta = [
+      {
+        path: `${PREDICTION_BASE}.forecast.hourly`,
+        value: {
+          displayName: "Hourly energy forecast",
+          description:
+            "Predicted energy per hour for the configured forecast horizon. Each entry is an object with ideal/detected yield (Wh), house load (Wh), net energy (Wh) and state of charge per hour.",
+        },
+      },
+      {
+        path: `${PREDICTION_BASE}.timeToFull`,
+        value: {
+          displayName: "Time to full",
+          description:
+            "Predicted time when the battery will be fully charged, or null",
+          units: "timestamp",
+        },
+      },
+      {
+        path: `${PREDICTION_BASE}.timeToEmpty`,
+        value: {
+          displayName: "Time to empty",
+          description:
+            "Predicted time when the battery will be depleted, or null",
+          units: "timestamp",
+        },
+      },
+      {
+        path: `${PREDICTION_BASE}.windProtection.enabled`,
+        value: {
+          displayName: "Wind protection enabled",
+          description: "Whether wind protection factor correction is active",
+        },
+      },
+      {
+        path: `${PREDICTION_BASE}.windProtection.placeKey`,
+        value: {
+          displayName: "Wind protection place",
+          description:
+            "Learned place key the current wind protection factor applies to",
+        },
+      },
+      {
+        path: `${PREDICTION_BASE}.windProtection.sector`,
+        value: {
+          displayName: "Wind protection sector",
+          description: "Apparent wind sector bin the current factor applies to",
+          units: "deg",
+        },
+      },
+      {
+        path: `${PREDICTION_BASE}.windProtection.night`,
+        value: {
+          displayName: "Wind protection night",
+          description:
+            "Whether the current wind protection factor is the night-time variant",
+        },
+      },
+      {
+        path: `${PREDICTION_BASE}.windProtection.speedFactor`,
+        value: {
+          displayName: "Wind protection speed factor",
+          description:
+            "Multiplier applied to forecast wind speed for the current place and sector",
+          units: "ratio",
+        },
+      },
+      {
+        path: `${PREDICTION_BASE}.windProtection.gustFactor`,
+        value: {
+          displayName: "Wind protection gust factor",
+          description:
+            "Multiplier applied to forecast wind gust for the current place and sector",
+          units: "ratio",
+        },
+      },
+      {
+        path: `${PREDICTION_BASE}.windProtection.forecastSpeedKnots`,
+        value: {
+          displayName: "Forecast wind speed",
+          description:
+            "Raw forecast wind speed at the current position before wind protection correction",
+          units: "knots",
+        },
+      },
+      {
+        path: `${PREDICTION_BASE}.windProtection.forecastGustKnots`,
+        value: {
+          displayName: "Forecast wind gust",
+          description:
+            "Raw forecast wind gust at the current position before wind protection correction",
+          units: "knots",
+        },
+      },
+      {
+        path: `${PREDICTION_BASE}.windProtection.correctedSpeedKnots`,
+        value: {
+          displayName: "Corrected wind speed",
+          description:
+            "Forecast wind speed after applying the learned wind protection factor",
+          units: "knots",
+        },
+      },
+      {
+        path: `${PREDICTION_BASE}.windProtection.correctedGustKnots`,
+        value: {
+          displayName: "Corrected wind gust",
+          description:
+            "Forecast wind gust after applying the learned wind protection factor",
+          units: "knots",
+        },
+      },
+      {
+        path: `${PREDICTION_BASE}.windProtection.position`,
+        value: {
+          displayName: "Wind protection position",
+          description:
+            "Vessel position used to resolve the current wind protection place and sector",
+        },
+      },
+    ];
+
+    // Per-device deployment meta. Emitted for each configured deployable
+    // device so the leaf paths resolve to concrete Signal K paths.
+    for (const device of devices) {
+      const base = `${PREDICTION_BASE}.deployment.${device.id}`;
+      meta.push(
+        {
+          path: `${base}.recommendedState`,
+          value: {
+            displayName: `Recommended state (${device.id})`,
+            description: `Recommended deployment state for ${device.id}: "deployed" or "stowed"`,
+          },
+        },
+        {
+          path: `${base}.detectedState`,
+          value: {
+            displayName: `Detected state (${device.id})`,
+            description: `Currently detected deployment state for ${device.id}: "deployed", "stowed" or null when unknown`,
+          },
+        },
+        {
+          path: `${base}.reason`,
+          value: {
+            displayName: `Recommendation reason (${device.id})`,
+            description: `Human-readable reason for the current ${device.id} deployment recommendation`,
+          },
+        },
+        {
+          path: `${base}.missedYieldWh`,
+          value: {
+            displayName: `Missed yield (${device.id})`,
+            description: `Energy yield missed by not deploying ${device.id} over the recommendation horizon`,
+            units: "Wh",
+          },
+        },
+        {
+          path: `${base}.recommendedStateTime`,
+          value: {
+            displayName: `Recommended state time (${device.id})`,
+            description: `Time at which ${device.id} should change state, or null if it should change now`,
+            units: "timestamp",
+          },
+        },
+      );
+      if (device.type === "solar-deployable") {
+        meta.push(
+          {
+            path: `${base}.recommendedSide`,
+            value: {
+              displayName: `Recommended side (${device.id})`,
+              description: `Side of the vessel ${device.id} should face to maximise yield, when applicable`,
+            },
+          },
+          {
+            path: `${base}.recommendedSideTime`,
+            value: {
+              displayName: `Recommended side time (${device.id})`,
+              description: `Time at which ${device.id} should change side, or null if it should change now`,
+              units: "timestamp",
+            },
+          },
+        );
+      }
+    }
+
+    this.app.handleMessage(this.pluginId, {
+      context: `vessels.${this.app.selfId}`,
+      updates: [
+        {
+          meta,
+        },
+      ],
+    });
+  }
+
+  /**
    * Applies hysteresis to a value to prevent threshold flapping.
    *
    * @param {number} value - Current value
