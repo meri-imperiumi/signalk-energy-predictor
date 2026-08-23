@@ -423,8 +423,16 @@ function pathColumns(historyData) {
  * "anchored" — killing hydro predictions and skipping sailing solar bins
  * even while the boat is clearly underway (STW > 0, hydro producing).
  *
- * Inference:
+ * Carry-forward: `navigation.state` is a sticky state, not a continuous
+ * measurement. When history has an explicit state for some ticks and gaps
+ * (null) for others, a gap carries the last explicit state forward instead
+ * of falling back to STW inference. STW inference only runs when no
+ * explicit state has been seen yet for the run (vessels that never report
+ * navigation.state at all).
+ *
+ * Inference priority:
  * - explicit `navigation.state` wins when present
+ * - otherwise, if a previous explicit state was carried forward, reuse it
  * - STW ≥ SAILING_STW_KN and engine not running → "sailing"
  * - STW ≥ SAILING_STW_KN and engine running → "motoring"
  * - STW < SAILING_STW_KN → "anchored"
@@ -434,7 +442,10 @@ function pathColumns(historyData) {
  * @param {number|null} stwColumn - Column index for speedThroughWater (m/s)
  * @param {Array} propulsionCols - Propulsion column descriptors
  * @param {Map<string, number>} columns - Path → column index map
- * @returns {string} "sailing" | "motoring" | "anchored"
+ * @param {string|null} [previousExplicit] - Last explicitly-seen state to
+ *        carry forward across gaps
+ * @returns {{state: string, explicit: boolean}} The inferred state and
+ *          whether it came from an explicit navigation.state value
  */
 function inferNavState(
   point,
@@ -442,6 +453,7 @@ function inferNavState(
   stwColumn,
   propulsionCols,
   columns,
+  previousExplicit = null,
 ) {
   const explicit = columnValue(point, navStateColumn);
   if (
@@ -451,15 +463,22 @@ function inferNavState(
     explicit === "moored" ||
     explicit === "docked"
   ) {
-    return explicit;
+    return { state: explicit, explicit: true };
+  }
+  // Carry the last explicit state forward across gaps
+  if (previousExplicit) {
+    return { state: previousExplicit, explicit: false };
   }
   const stwMs = columnNumber(point, stwColumn);
   const stwKn = stwMs != null ? stwMs / 0.514444 : 0;
   if (stwKn >= SAILING_STW_KN) {
     const engineRunning = engineRunningAt(point, propulsionCols, columns);
-    return engineRunning === true ? "motoring" : "sailing";
+    return {
+      state: engineRunning === true ? "motoring" : "sailing",
+      explicit: false,
+    };
   }
-  return "anchored";
+  return { state: "anchored", explicit: false };
 }
 
 /**
@@ -579,6 +598,8 @@ function replayHistory({
   let totalPredictedWh = 0;
   const errors = [];
   const intervalHours = resolution / 3600;
+  /** Last explicit navigation.state, carried forward across gaps */
+  let lastExplicitNavState = null;
 
   for (const point of historyData.data || []) {
     const time = parseUtcTimestamp(point[0]);
@@ -626,8 +647,12 @@ function replayHistory({
       stwColumn,
       propulsionCols,
       columns,
+      lastExplicitNavState,
     );
-    const isSailing = inferredState === "sailing" && awaRad != null;
+    if (inferredState.explicit) {
+      lastExplicitNavState = inferredState.state;
+    }
+    const isSailing = inferredState.state === "sailing" && awaRad != null;
     if (isSailing) {
       sailingTicks++;
     }
@@ -721,6 +746,8 @@ function replayGenerators({
     let totalActualWh = 0;
     let totalPredictedWh = 0;
     const errors = [];
+    /** Last explicit navigation.state, carried forward across gaps */
+    let lastExplicitNavState = null;
 
     for (const point of historyData.data || []) {
       const time = parseUtcTimestamp(point[0]);
@@ -729,13 +756,18 @@ function replayGenerators({
         continue;
       }
       const weatherPoint = interpolateWeather(weather, time);
-      const navState = inferNavState(
+      const navStateResult = inferNavState(
         point,
         navStateColumn,
         stwColumn,
         propulsionCols,
         columns,
+        lastExplicitNavState,
       );
+      if (navStateResult.explicit) {
+        lastExplicitNavState = navStateResult.state;
+      }
+      const navState = navStateResult.state;
       dataPoints++;
 
       let predictedW = 0;
@@ -1028,6 +1060,8 @@ async function backfillSamples({
   );
 
   let written = 0;
+  /** Last explicit navigation.state, carried forward across gaps */
+  let lastExplicitNavState = null;
   for (const point of historyData.data || []) {
     const time = parseUtcTimestamp(point[0]);
     if (nearLiveSample(time.getTime())) {
@@ -1042,13 +1076,20 @@ async function backfillSamples({
       soc: columnNumber(point, socColumn),
       houseLoadW: columnNumber(point, houseLoadColumn),
       windSpeedKnots: weatherPoint.windSpeedKnots,
-      navState: inferNavState(
-        point,
-        navStateColumn,
-        stwColumn,
-        propulsionCols,
-        columns,
-      ),
+      navState: (() => {
+        const r = inferNavState(
+          point,
+          navStateColumn,
+          stwColumn,
+          propulsionCols,
+          columns,
+          lastExplicitNavState,
+        );
+        if (r.explicit) {
+          lastExplicitNavState = r.state;
+        }
+        return r.state;
+      })(),
       position: (() => {
         const pos = columnValue(point, positionColumn);
         if (!Array.isArray(pos) || pos.length < 2) return null;

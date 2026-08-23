@@ -725,6 +725,17 @@ module.exports = (app) => {
           }
 
           for (const v of update.values) {
+            // navigation.state is a sticky state: an empty/null update
+            // (some providers emit "" when the source drops out) must not
+            // clear a previously known state. Carry the last valid value
+            // forward until a real new state arrives.
+            if (
+              v.path === "navigation.state" &&
+              (v.value == null || v.value === "") &&
+              deltaState.has("navigation.state")
+            ) {
+              continue;
+            }
             deltaState.set(v.path, v.value);
 
             if (v.path === "navigation.position" && v.value) {

@@ -27,7 +27,7 @@ const LOAD_SMOOTHING_HOURS = 3;
 
 /**
  * Hourly prediction result.
- * @typedef {{hour: number, time: Date, idealSolarYieldWh: number, idealWindYieldWh: number, houseLoadWh: number, idealNetWh: number, idealSoC: number, detectedYieldWh: number, detectedNetWh: number, detectedSoC: number, actions: Array<{id: string, idealAction: string, detectedAction: string|null, reason: string}>}} HourlyPrediction
+ * @typedef {{hour: number, time: Date, idealSolarYieldWh: number, idealWindYieldWh: number, idealHydroYieldWh: number, houseLoadWh: number, idealNetWh: number, idealSoC: number, detectedYieldWh: number, detectedNetWh: number, detectedSoC: number, actions: Array<{id: string, idealAction: string, detectedAction: string|null, reason: string}>}} HourlyPrediction
  */
 
 /**
@@ -168,14 +168,19 @@ function predictWindHour({
   // Deployable wind generators are used at anchor, NOT under way.
   // Some vessels cannot deploy at a mooring (proximity to dock/other
   // boats) — gated by generator.deployableAtMoored (default true).
+  // When the navigation state is unknown we cannot confirm we are at
+  // anchor, so be conservative and stow (only confirmed anchor/mooring
+  // counts as deployable).
   if (generator.deployable) {
     if (navState === "sailing" || navState === "motoring") {
       return 0; // Stowed when under way (hydro or engine are available)
     }
-    if (navState === "moored" && generator.deployableAtMoored === false) {
-      return 0; // Stowed at mooring on this vessel
+    const deployAtMoored = generator.deployableAtMoored !== false;
+    const atAnchor = navState === "anchored";
+    const atMooring = navState === "moored" && deployAtMoored;
+    if (!atAnchor && !atMooring) {
+      return 0; // Stowed: under way, at a mooring that can't deploy, or unknown
     }
-    // When anchored (or moored and deployable there), assume deployed
   }
 
   const power = interpolateWindPower(generator.curve, windSpeedKnots);
@@ -927,7 +932,8 @@ class PredictionEngine {
     const generator = this.mechanicalGenerators.find((g) => g.id === deviceId);
     if (generator) {
       let total = 0;
-      const isSailing = this.getNavState() === "sailing";
+      const navState = this.getNavState();
+      const isSailing = navState === "sailing";
       const speedThroughWater = this.getSpeedThroughWater() ?? 0;
       for (const point of this.lastForecast) {
         if (generator.type === "wind") {
@@ -938,6 +944,7 @@ class PredictionEngine {
             windSpeedKnots,
             gustSpeedKnots,
             isSailing,
+            navState,
           });
         } else if (generator.type === "hydro") {
           total += predictHydroHour({
@@ -1298,6 +1305,7 @@ class PredictionEngine {
    * @param {Map<string, string|null>} [detectedDeployStates] - Detected states
    * @param {Map<string, {state: string, reason: string}>} [solarStates] - Precomputed
    *        deployable solar states for this hour (from computeDeployableSolarStates)
+   * @param {string} [navState] - Navigation state (anchored/moored/...)
    * @returns {Array<{id: string, type: string, idealState: string, idealAction: string, detectedAction: string|null, reason: string}>}
    */
   getHourlyActions(
@@ -1308,6 +1316,7 @@ class PredictionEngine {
     speedThroughWaterKnots,
     detectedDeployStates,
     solarStates,
+    navState = "unknown",
   ) {
     const actions = [];
 
@@ -1352,15 +1361,29 @@ class PredictionEngine {
         if (underway) {
           idealState = "stowed";
           reason = "vessel under way";
-        } else if (gustKnots >= maxWindKnots) {
-          idealState = "stowed";
-          reason = `forecast gusts ${Math.round(gustKnots)}kn ≥ limit ${maxWindKnots}kn`;
-        } else if (windKnots >= minDeployWind) {
-          idealState = "deployed";
-          reason = `forecast wind ${Math.round(windKnots)}kn ≥ startup ${minDeployWind}kn`;
         } else {
-          idealState = "stowed";
-          reason = `forecast wind ${Math.round(windKnots)}kn < startup ${minDeployWind}kn`;
+          // Only deployed where the vessel can deploy (anchor, or mooring
+          // when allowed). Unknown nav state -> stowed (conservative).
+          const deployAtMoored = generator.deployableAtMoored !== false;
+          const deployableHere =
+            navState === "anchored" ||
+            (navState === "moored" && deployAtMoored);
+          if (!deployableHere) {
+            idealState = "stowed";
+            reason =
+              navState === "unknown"
+                ? "vessel nav state unknown"
+                : `cannot deploy while ${navState}`;
+          } else if (gustKnots >= maxWindKnots) {
+            idealState = "stowed";
+            reason = `forecast gusts ${Math.round(gustKnots)}kn ≥ limit ${maxWindKnots}kn`;
+          } else if (windKnots >= minDeployWind) {
+            idealState = "deployed";
+            reason = `forecast wind ${Math.round(windKnots)}kn ≥ startup ${minDeployWind}kn`;
+          } else {
+            idealState = "stowed";
+            reason = `forecast wind ${Math.round(windKnots)}kn < startup ${minDeployWind}kn`;
+          }
         }
       } else if (generator.type === "hydro") {
         const minSpeed = generator.minSpeedKnots ?? 3;
@@ -1543,34 +1566,56 @@ class PredictionEngine {
             recommendedState: "stowed",
             reason: "vessel under way",
           });
-        } else if (maxGust >= maxWindKnots) {
-          recommendations.push({
-            id: generator.id,
-            name,
-            type: "wind",
-            recommendedState: "stowed",
-            reason: `forecast gusts ${Math.round(maxGust)}kn exceed limit of ${maxWindKnots}kn`,
-            currentGustKnots: maxGust,
-            limitKnots: maxWindKnots,
-          });
-        } else if (maxWind >= minDeployWind) {
-          recommendations.push({
-            id: generator.id,
-            name,
-            type: "wind",
-            recommendedState: "deployed",
-            reason: `forecast wind ${Math.round(maxWind)}kn (gusts ${Math.round(maxGust)}kn)`,
-            currentGustKnots: maxGust,
-            limitKnots: maxWindKnots,
-          });
         } else {
-          recommendations.push({
-            id: generator.id,
-            name,
-            type: "wind",
-            recommendedState: "stowed",
-            reason: `forecast wind too low (${Math.round(maxWind)}kn < ${minDeployWind}kn)`,
-          });
+          // Deployable wind generators are only deployed where the
+          // vessel can actually deploy them: at anchor, or at a mooring
+          // when deployableAtMoored is set. Unknown nav state is treated
+          // conservatively (stowed) so we don't advise deploying without
+          // confirmation we are at anchor.
+          const deployAtMoored = generator.deployableAtMoored !== false;
+          const deployableHere =
+            navState === "anchored" ||
+            (navState === "moored" && deployAtMoored);
+          if (!deployableHere) {
+            recommendations.push({
+              id: generator.id,
+              name,
+              type: "wind",
+              recommendedState: "stowed",
+              reason:
+                navState === "unknown"
+                  ? "vessel nav state unknown"
+                  : `cannot deploy while ${navState}`,
+            });
+          } else if (maxGust >= maxWindKnots) {
+            recommendations.push({
+              id: generator.id,
+              name,
+              type: "wind",
+              recommendedState: "stowed",
+              reason: `forecast gusts ${Math.round(maxGust)}kn exceed limit of ${maxWindKnots}kn`,
+              currentGustKnots: maxGust,
+              limitKnots: maxWindKnots,
+            });
+          } else if (maxWind >= minDeployWind) {
+            recommendations.push({
+              id: generator.id,
+              name,
+              type: "wind",
+              recommendedState: "deployed",
+              reason: `forecast wind ${Math.round(maxWind)}kn (gusts ${Math.round(maxGust)}kn)`,
+              currentGustKnots: maxGust,
+              limitKnots: maxWindKnots,
+            });
+          } else {
+            recommendations.push({
+              id: generator.id,
+              name,
+              type: "wind",
+              recommendedState: "stowed",
+              reason: `forecast wind too low (${Math.round(maxWind)}kn < ${minDeployWind}kn)`,
+            });
+          }
         }
       }
     }
@@ -1748,6 +1793,7 @@ class PredictionEngine {
 
       // Calculate wind/hydro yield
       let mechanicalYieldWh = 0;
+      let hydroYieldWh = 0;
       let detectedMechanicalYieldWh = 0;
       const speedThroughWater = this.getSpeedThroughWater();
 
@@ -1769,6 +1815,9 @@ class PredictionEngine {
           });
         }
         mechanicalYieldWh += genYield;
+        if (generator.type === "hydro") {
+          hydroYieldWh += genYield;
+        }
 
         // Detected track models what each generator actually produces:
         // stowed -> no yield; actually up (deployed, or a fixed mount that
@@ -1835,6 +1884,7 @@ class PredictionEngine {
         speedThroughWater ?? null,
         detectedDeployStates,
         solarStatesPerHour[h],
+        navState,
       );
       const actions = allActions.filter(
         (a) =>
@@ -1851,6 +1901,7 @@ class PredictionEngine {
         time,
         idealSolarYieldWh: Math.round(idealSolarYieldWh),
         idealWindYieldWh: Math.round(mechanicalYieldWh),
+        idealHydroYieldWh: Math.round(hydroYieldWh),
         houseLoadWh: Math.round(houseLoadW),
         idealNetWh: Math.round(idealNetWh),
         idealSoC: Math.round(runningSoC * 1000) / 1000,
@@ -2069,13 +2120,14 @@ class PredictionEngine {
   /**
    * Gets hourly forecast data for Signal K delta.
    *
-   * @returns {Array<{time: string, idealSolarYieldWh: number, idealWindYieldWh: number, houseLoadWh: number, idealNetWh: number, idealSoC: number, detectedYieldWh: number, detectedNetWh: number, detectedSoC: number, actions: Array}>}
+   * @returns {Array<{time: string, idealSolarYieldWh: number, idealWindYieldWh: number, idealHydroYieldWh: number, houseLoadWh: number, idealNetWh: number, idealSoC: number, detectedYieldWh: number, detectedNetWh: number, detectedSoC: number, actions: Array}>}
    */
   getHourlyForecast() {
     return this.lastPrediction.map((p) => ({
       time: p.time.toISOString(),
       idealSolarYieldWh: Math.round(p.idealSolarYieldWh),
       idealWindYieldWh: Math.round(p.idealWindYieldWh),
+      idealHydroYieldWh: Math.round(p.idealHydroYieldWh ?? 0),
       houseLoadWh: Math.round(p.houseLoadWh),
       idealNetWh: Math.round(p.idealNetWh),
       idealSoC: Math.round(p.idealSoC * 1000) / 1000,

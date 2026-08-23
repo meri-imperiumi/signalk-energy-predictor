@@ -44,7 +44,47 @@ class EpWindowSelector extends HTMLElement {
 
   connectedCallback() {
     this.loadPrefs();
+    this.loadHash();
     this.render();
+    window.addEventListener("hashchange", this.onHashChange);
+  }
+
+  disconnectedCallback() {
+    window.removeEventListener("hashchange", this.onHashChange);
+  }
+
+  onHashChange = () => {
+    // Reacting to a hashchange: reload state without writing the hash back
+    this.loadHash();
+    this.render();
+    this.emit(false);
+  };
+
+  /** Restore mode and window start from the URL hash, if present. */
+  loadHash() {
+    const hash = window.location.hash.replace(/^#/, "");
+    if (!hash) return;
+    const params = new URLSearchParams(hash);
+    const mode = params.get("mode");
+    if (MODES.includes(mode)) {
+      this.mode = mode;
+    }
+    const date = params.get("date");
+    if (date) {
+      const [y, m, d] = date.split("-").map(Number);
+      if (y && m && d) {
+        this.from = new Date(y, m - 1, d);
+      }
+    }
+  }
+
+  /** Write the current selection to the URL hash. */
+  saveHash() {
+    const date = `${this.from.getFullYear()}-${String(this.from.getMonth() + 1).padStart(2, "0")}-${String(this.from.getDate()).padStart(2, "0")}`;
+    const hash = `mode=${this.mode}&date=${date}`;
+    if (window.location.hash !== `#${hash}`) {
+      window.location.hash = hash;
+    }
   }
 
   loadPrefs() {
@@ -76,8 +116,16 @@ class EpWindowSelector extends HTMLElement {
     };
   }
 
-  emit() {
+  /**
+   * Emits a window-change event and persists state.
+   * @param {boolean} updateHash - whether to sync the URL hash (false when
+   *   reacting to a hashchange so we don't loop)
+   */
+  emit(updateHash = true) {
     this.savePrefs();
+    if (updateHash) {
+      this.saveHash();
+    }
     this.dispatchEvent(
       new CustomEvent("ep-window-change", { detail: this.windowSpec() }),
     );
@@ -101,6 +149,13 @@ class EpWindowSelector extends HTMLElement {
       this.from.getMonth(),
       this.from.getDate() + days,
     );
+    this.render();
+    this.emit();
+  }
+
+  /** Jump the window to today (local midnight). */
+  today() {
+    this.from = EpWindowSelector.todayLocal();
     this.render();
     this.emit();
   }
@@ -148,6 +203,12 @@ class EpWindowSelector extends HTMLElement {
     next.setAttribute("aria-label", "Next");
     next.addEventListener("click", () => this.step(1));
     this.appendChild(next);
+
+    const today = document.createElement("button");
+    today.textContent = "Today";
+    today.setAttribute("aria-label", "Jump to today");
+    today.addEventListener("click", () => this.today());
+    this.appendChild(today);
   }
 }
 

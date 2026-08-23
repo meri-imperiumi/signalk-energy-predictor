@@ -17,8 +17,8 @@ const MARGIN = { top: 14, right: 54, bottom: 28, left: 54 };
 /** Series colors shared with styles.css custom properties */
 const COLORS = {
   solar: "#f5b942",
-  wind: "#4fc3f7",
-  hydro: "#26c6aa",
+  wind: "#26c6aa",
+  hydro: "#4fc3f7",
   load: "#ef5b7b",
   soc: "#9ccc65",
   windKn: "#b39ddb",
@@ -79,6 +79,14 @@ const DAY_SERIES = [
     axis: "left",
   },
   {
+    id: "predHydro",
+    label: "Pred. hydro",
+    color: COLORS.hydro,
+    predicted: true,
+    kind: "line",
+    axis: "left",
+  },
+  {
     id: "predSoC",
     label: "Pred. SoC %",
     color: COLORS.soc,
@@ -116,6 +124,21 @@ const PERIOD_SERIES = [
     id: "windPred",
     label: "Wind pred.",
     color: COLORS.wind,
+    predicted: true,
+    kind: "bar",
+    axis: "left",
+  },
+  {
+    id: "hydroActual",
+    label: "Hydro actual",
+    color: COLORS.hydro,
+    kind: "bar",
+    axis: "left",
+  },
+  {
+    id: "hydroPred",
+    label: "Hydro pred.",
+    color: COLORS.hydro,
     predicted: true,
     kind: "bar",
     axis: "left",
@@ -295,10 +318,13 @@ class EpTimelineChart extends HTMLElement {
     if (cycle) {
       for (const hour of cycle.forecast || []) {
         const t = new Date(hour.time).getTime();
+        const hydroWh = hour.idealHydroYieldWh || 0;
+        const windCombined = hour.idealWindYieldWh || 0;
         pred.push({
           t,
           predSolar: hour.idealSolarYieldWh || 0,
-          predWind: hour.idealWindYieldWh || 0,
+          predWind: Math.max(0, windCombined - hydroWh),
+          predHydro: hydroWh,
           predSoC:
             hour.idealSoC != null
               ? Math.round(hour.idealSoC * 1000) / 10
@@ -308,10 +334,13 @@ class EpTimelineChart extends HTMLElement {
     } else {
       for (const hour of retroPredicted?.points || []) {
         const t = new Date(hour.time).getTime();
+        const hydroWh = hour.idealHydroYieldWh || 0;
+        const windCombined = hour.idealWindYieldWh || 0;
         pred.push({
           t,
           predSolar: hour.idealSolarYieldWh || 0,
-          predWind: hour.idealWindYieldWh || 0,
+          predWind: Math.max(0, windCombined - hydroWh),
+          predHydro: hydroWh,
           predSoC: null,
         });
       }
@@ -336,8 +365,9 @@ class EpTimelineChart extends HTMLElement {
           .map((p) => ({ t: +new Date(p.time), v: p.windSpeedKnots })),
         predSolar: pred.map((p) => ({ t: p.t, v: p.predSolar })),
         predWind: pred.map((p) => ({ t: p.t, v: p.predWind })),
+        predHydro: pred.map((p) => ({ t: p.t, v: p.predHydro })),
         predSoC: pred
-          .filter((p) => p.predSoC != null)
+          .filter((p) => p.predSoC != null && p.t >= Date.now())
           .map((p) => ({ t: p.t, v: p.predSoC })),
       },
     };
@@ -366,6 +396,7 @@ class EpTimelineChart extends HTMLElement {
       const row = rowAt(p.t);
       row.values.predSolar = p.predSolar;
       row.values.predWind = p.predWind;
+      row.values.predHydro = p.predHydro;
       if (p.predSoC != null) row.values.predSoC = p.predSoC;
     }
 
@@ -399,6 +430,7 @@ class EpTimelineChart extends HTMLElement {
           day,
           solarWh: 0,
           windWh: 0,
+          hydroWh: 0,
           socSum: 0,
           socCount: 0,
           windSum: 0,
@@ -410,6 +442,8 @@ class EpTimelineChart extends HTMLElement {
         (((points[i - 1].solarW || 0) + (points[i].solarW || 0)) / 2) * hours;
       entry.windWh +=
         (((points[i - 1].windW || 0) + (points[i].windW || 0)) / 2) * hours;
+      entry.hydroWh +=
+        (((points[i - 1].hydroW || 0) + (points[i].hydroW || 0)) / 2) * hours;
       for (const p of [points[i - 1], points[i]]) {
         if (p.soc != null) {
           entry.socSum += p.soc * 100;
@@ -431,15 +465,18 @@ class EpTimelineChart extends HTMLElement {
         const day = localDayKey(new Date(hour.time).getTime());
         let entry = retroDaily.get(day);
         if (!entry) {
-          entry = { date: day, solarWh: 0, windWh: 0 };
+          entry = { date: day, solarWh: 0, windWh: 0, hydroWh: 0 };
           retroDaily.set(day, entry);
         }
         entry.solarWh += hour.idealSolarYieldWh || 0;
-        entry.windWh += hour.idealWindYieldWh || 0;
+        const hydroWh = hour.idealHydroYieldWh || 0;
+        entry.hydroWh += hydroWh;
+        entry.windWh += Math.max(0, (hour.idealWindYieldWh || 0) - hydroWh);
       }
       for (const entry of retroDaily.values()) {
         entry.solarWh = Math.round(entry.solarWh);
         entry.windWh = Math.round(entry.windWh);
+        entry.hydroWh = Math.round(entry.hydroWh);
       }
       for (const [date, entry] of retroDaily) {
         predByDay.set(date, entry);
@@ -453,18 +490,22 @@ class EpTimelineChart extends HTMLElement {
       const actual = daily.get(day) || {
         solarWh: 0,
         windWh: 0,
+        hydroWh: 0,
         socSum: 0,
         socCount: 0,
         windSum: 0,
         windCount: 0,
       };
       const pred = predByDay.get(day);
+      const predHydro = pred?.hydroWh ?? 0;
       return {
         day,
         solarActual: actual.solarWh,
         solarPred: pred?.solarWh ?? 0,
         windActual: actual.windWh,
-        windPred: pred?.windWh ?? 0,
+        windPred: Math.max(0, (pred?.windWh ?? 0) - predHydro),
+        hydroActual: actual.hydroWh,
+        hydroPred: predHydro,
         soc: actual.socCount > 0 ? actual.socSum / actual.socCount : null,
         socPred: pred?.soc != null ? pred.soc * 100 : null,
         windKn: actual.windCount > 0 ? actual.windSum / actual.windCount : null,
@@ -505,6 +546,8 @@ class EpTimelineChart extends HTMLElement {
           solarPred: b.solarPred,
           windActual: Math.round(b.windActual),
           windPred: b.windPred,
+          hydroActual: Math.round(b.hydroActual),
+          hydroPred: b.hydroPred,
           soc: b.soc != null ? Math.round(b.soc) : null,
           socPred: b.socPred != null ? Math.round(b.socPred) : null,
           windKn: b.windKn != null ? Math.round(b.windKn * 10) / 10 : null,

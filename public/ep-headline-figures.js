@@ -103,6 +103,13 @@ class EpHeadlineFigures extends HTMLElement {
           : null,
       ),
       this.figure(
+        "Hydro yield",
+        this.formatWh(s.yield?.hydro?.totalWh),
+        s.yield?.hydro?.averageW != null
+          ? `avg ${Math.round(s.yield.hydro.averageW)} W`
+          : null,
+      ),
+      this.figure(
         "Combined yield",
         this.formatWh(s.yield?.combined?.totalWh),
         null,

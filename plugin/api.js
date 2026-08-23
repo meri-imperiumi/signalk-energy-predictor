@@ -347,6 +347,7 @@ function hourlyPredictions(cycles) {
         hour: bucket,
         solarWh: point.idealSolarYieldWh || 0,
         windWh: point.idealWindYieldWh || 0,
+        hydroWh: point.idealHydroYieldWh || 0,
         loadWh: point.houseLoadWh || 0,
         netWh: point.idealNetWh || 0,
         soc: point.idealSoC ?? null,
@@ -414,6 +415,7 @@ function buildPredictions(cycles, from, to) {
       date: cursor.toISOString().slice(0, 10),
       solarWh: 0,
       windWh: 0,
+      hydroWh: 0,
       loadWh: 0,
       netWh: 0,
       hours: 0,
@@ -424,6 +426,7 @@ function buildPredictions(cycles, from, to) {
       if (entry.hour >= cursor.getTime() && entry.hour < next.getTime()) {
         day.solarWh += entry.solarWh;
         day.windWh += entry.windWh;
+        day.hydroWh += entry.hydroWh;
         day.loadWh += entry.loadWh;
         day.netWh += entry.netWh;
         day.hours++;
@@ -438,6 +441,7 @@ function buildPredictions(cycles, from, to) {
         date: day.date,
         solarWh: Math.round(day.solarWh),
         windWh: Math.round(day.windWh),
+        hydroWh: Math.round(day.hydroWh),
         loadWh: Math.round(day.loadWh),
         netWh: Math.round(day.netWh),
         hours: day.hours,
@@ -935,6 +939,7 @@ async function buildRetroPredicted(samples, config, dataDir, from, to) {
       time: time.toISOString(),
       idealSolarYieldWh: Math.round(idealSolarYieldWh),
       idealWindYieldWh: Math.round(idealWindYieldWh + idealHydroYieldWh),
+      idealHydroYieldWh: Math.round(idealHydroYieldWh),
     });
   }
 
