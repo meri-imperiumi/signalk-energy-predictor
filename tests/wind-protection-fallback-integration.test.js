@@ -277,3 +277,69 @@ test.describe("WPF fallback non-cascading at the application path", () => {
     await plugin.stop();
   });
 });
+
+test.describe("WPF fallback end-to-end: hourly forecast reflects the fallback", () => {
+  test("an unlearned-sector hour's published windSpeedKnots carries the fallback factor", async () => {
+    const app = new FakeSignalKApp();
+    const lat = 60.1;
+    const lon = 21.8;
+    app.setSelfPath("navigation.position", { latitude: lat, longitude: lon });
+    app.setSelfPath("navigation.state", "anchored");
+
+    // Seed sector 3 (SE, 135°) at this place with ratio 0.5. Then forecast
+    // from sector 2 (E, 90°), which is unlearned and borrows sector 3 → the
+    // hourly wind for those hours must be the fallback-corrected value.
+    const { plugin, windProtection } = await startAndSeedSpeed(app, {
+      lat,
+      lon,
+      dirDeg: 135,
+      ratio: 0.5,
+    });
+    windProtection.alpha = 1; // (re-applied; startAndSeedSpeed already set)
+
+    const engine = plugin.__getInternals().predictionEngine;
+    const now = new Date();
+    const forecast = Array.from({ length: 24 }, (_, h) => ({
+      time: new Date(now.getTime() + h * 3600000),
+      ghi: 0, // night-equivalent; we only care about wind here
+      cloudCover: 0,
+      windSpeedKnots: 10,
+      gustSpeedKnots: null,
+      windDirectionDeg: 90, // sector 2 (E), unlearned → adjacent fallback from sector 3
+    }));
+    engine.runPrediction(forecast);
+
+    const hourly = engine.getHourlyForecast();
+    assert.ok(hourly.length > 0, "hourly forecast produced");
+
+    // Every hour is sector 2 (unlearned). The published windSpeedKnots is
+    // the WPF-corrected (fallback) value; forecastWindSpeedKnots is the raw.
+    // 10 kn × 0.5 (sector-3 fallback) scaled at 10 m then translated to
+    // device height → somewhat below 5 kn. Assert it's reduced from raw 10
+    // and well below it, and that the raw is preserved at 10.
+    const sample = hourly[0];
+    assert.ok(
+      sample.windSpeedKnots != null,
+      "hourly windSpeedKnots is populated",
+    );
+    assert.ok(
+      sample.windSpeedKnots < 10,
+      `fallback-corrected wind ${sample.windSpeedKnots} should be < raw 10`,
+    );
+    assert.ok(
+      sample.windSpeedKnots > 4 && sample.windSpeedKnots < 6,
+      `expected ~5 kn at device height (10×0.5 translated down), got ${sample.windSpeedKnots}`,
+    );
+    assert.strictEqual(sample.forecastWindSpeedKnots, 10);
+
+    // The source is also reported on the windProtection publish path.
+    // (resolveWindProtectionContext is the single source of truth for the
+    // source; assert it agrees with the fallback that drove the hour.)
+    const { resolveWindProtectionContext } = plugin.__getInternals();
+    const ctx = resolveWindProtectionContext(10, null, 90, Math.PI / 4);
+    assert.strictEqual(ctx.speedSource, "adjacent-sector");
+    assert.strictEqual(ctx.speedFactor, 0.5);
+
+    await plugin.stop();
+  });
+});
