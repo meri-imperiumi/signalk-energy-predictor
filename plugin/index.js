@@ -733,14 +733,19 @@ module.exports = (app) => {
           }
 
           for (const v of update.values) {
-            // navigation.state is a sticky state: an empty/null update
-            // (some providers emit "" when the source drops out) must not
-            // clear a previously known state. Carry the last valid value
-            // forward until a real new state arrives.
+            // Sticky signals (navigation.state, propulsion.*.state,
+            // navigation.position) persist until a new value arrives: an
+            // empty/null update (some providers emit "" when the source drops
+            // out) must not clear a previously known value. Carry the last
+            // valid value forward until a real new value arrives.
+            const sticky =
+              v.path === "navigation.state" ||
+              v.path === "navigation.position" ||
+              PROPULSION_STATE_RE.test(v.path);
             if (
-              v.path === "navigation.state" &&
+              sticky &&
               (v.value == null || v.value === "") &&
-              deltaState.has("navigation.state")
+              deltaState.has(v.path)
             ) {
               continue;
             }

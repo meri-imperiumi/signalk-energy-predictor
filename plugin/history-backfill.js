@@ -422,6 +422,48 @@ function pathColumns(historyData) {
 }
 
 /**
+ * Fills null gaps in sticky signal columns by carrying the last known
+ * value forward, in place on historyData.data.
+ *
+ * `navigation.state`, `propulsion.*.state`, and `navigation.position` are
+ * sticky: the last reported value persists until a new one arrives. The
+ * History API returns null for a resolution bucket that logged no new value,
+ * so a gap would otherwise reset the state to "unknown" / drop the position.
+ * Consumers downstream (matrix replay, load-profile replay, recordings
+ * backfill) then read the gap as null and fall back to inference or skip —
+ * misclassifying a moored vessel as anchored (deploying the wind generator)
+ * or losing the sun-position fix for the hour.
+ *
+ * @param {object} historyData - History API /values response (mutated)
+ * @param {Map<string, number>} columns - path -> column index
+ * @returns {void}
+ */
+function carryForwardSticky(historyData, columns) {
+  const stickyCols = [];
+  for (const [path, col] of columns) {
+    if (
+      path === "navigation.state" ||
+      path === "navigation.position" ||
+      PROPULSION_STATE_RE.test(path)
+    ) {
+      stickyCols.push(col);
+    }
+  }
+  if (stickyCols.length === 0) return;
+  const last = new Map();
+  for (const point of historyData.data || []) {
+    for (const col of stickyCols) {
+      const v = point[col];
+      if (v == null) {
+        if (last.has(col)) point[col] = last.get(col);
+      } else {
+        last.set(col, v);
+      }
+    }
+  }
+}
+
+/**
  * Infers a navigation state from available motion signals when
  * `navigation.state` is absent from history. Many vessels never report a
  * nav state, so without inference the backfill would treat every tick as
@@ -929,6 +971,12 @@ async function populateFromHistory({
     fetchImpl,
   });
 
+  // Carry sticky signals (navigation.state, propulsion.*.state,
+  // navigation.position) forward across resolution-bucket gaps so a moored
+  // vessel is not misclassified as anchored (deploying the wind generator)
+  // and the sun-position fix is not lost mid-day.
+  carryForwardSticky(historyData, pathColumns(historyData));
+
   const dailyPositions = dailyPositionsFromHistory(historyData, from, to);
   const weather =
     dailyPositions.length > 0
@@ -988,10 +1036,20 @@ async function populateFromHistory({
       // No existing profile: start fresh
     }
   }
+  // Uncounted charging sources (wind, hydro) whose output flows through the
+  // battery shunt but is NOT added back into dcPower by Venus (unlike solar).
+  // Adding them back reconstructs gross house consumption for the bins.
+  // Alternator is excluded: it only produces while motoring, and those
+  // samples are gated as engine-running before reaching the bins anyway.
+  const uncountedChargingPaths = generators
+    .filter((g) => g.type === "wind" || g.type === "hydro")
+    .map((g) => g.powerPath);
+
   const loadProfileStats = replayLoadProfile({
     loadProfile,
     historyData,
     resolution,
+    uncountedChargingPaths,
   });
   await matrixPersistence.saveLoadProfile(dataDir, loadProfile);
 
@@ -1102,6 +1160,78 @@ async function backfillSamples({
       .filter(([, col]) => col != null),
   );
 
+  // Overwrite sticky fields (navState, position) on existing live samples
+  // from the history-derived carry-forward map. The live delta stream
+  // flaps these sticky signals (e.g. anchored ↔ moored); the History API
+  // :last aggregate is stable, so history wins for sticky fields even over
+  // existing live samples, while continuous measurements stay as recorded.
+  const stickyTimeline = [];
+  {
+    let carriedNav = null;
+    for (const point of historyData.data || []) {
+      const t = parseUtcTimestamp(point[0]).getTime();
+      const r = inferNavState(
+        point,
+        navStateColumn,
+        stwColumn,
+        propulsionCols,
+        columns,
+        carriedNav,
+      );
+      if (r.explicit) carriedNav = r.state;
+      const pos = columnValue(point, positionColumn);
+      stickyTimeline.push({
+        t,
+        navState: r.state,
+        position:
+          Array.isArray(pos) && pos.length >= 2
+            ? { longitude: pos[0], latitude: pos[1] }
+            : null,
+      });
+    }
+  }
+  if (stickyTimeline.length > 0) {
+    const resolveSticky = (tsMs) => {
+      // Latest history point at or before tsMs (sticky carry-forward)
+      let lo = 0;
+      let hi = stickyTimeline.length - 1;
+      let idx = -1;
+      while (lo <= hi) {
+        const mid = (lo + hi) >> 1;
+        if (stickyTimeline[mid].t <= tsMs) {
+          idx = mid;
+          lo = mid + 1;
+        } else hi = mid - 1;
+      }
+      if (idx < 0) {
+        // Before first history point: use the earliest (state continuity)
+        return {
+          navState: stickyTimeline[0].navState,
+          position: stickyTimeline[0].position,
+        };
+      }
+      const e = stickyTimeline[idx];
+      // Position carries forward from the last known non-null in the timeline
+      let pos = e.position;
+      if (!pos) {
+        for (let i = idx; i >= 0; i--) {
+          if (stickyTimeline[i].position) {
+            pos = stickyTimeline[i].position;
+            break;
+          }
+        }
+      }
+      return { navState: e.navState, position: pos };
+    };
+    await recorderModule.overwriteStickyFields(
+      app,
+      dataDir,
+      from,
+      to,
+      resolveSticky,
+    );
+  }
+
   let written = 0;
   /** Last explicit navigation.state, carried forward across gaps */
   let lastExplicitNavState = null;
@@ -1201,6 +1331,7 @@ function replayLoadProfile({
   loadProfile,
   historyData,
   resolution = DEFAULT_RESOLUTION,
+  uncountedChargingPaths = [],
 }) {
   const columns = pathColumns(historyData);
   const dcColumn = columns.get("electrical.venus.dcPower");
@@ -1209,6 +1340,14 @@ function replayLoadProfile({
   const positionColumn = columns.get("navigation.position");
   const stwColumn = columns.get("navigation.speedThroughWater");
   const propulsionCols = propulsionColumns(historyData);
+  // Charging-source power columns whose output flows through the battery
+  // shunt but is NOT added back into dcPower (wind, hydro, alternator).
+  // Venus computes dcPower = shunt + solar, so these uncounted chargers
+  // make dcPower understate real consumption when they produce. Adding
+  // them back reconstructs gross house load for the load-profile bins.
+  const chargingColumns = uncountedChargingPaths
+    .map((p) => columns.get(p))
+    .filter((c) => c != null);
 
   let dataPoints = 0;
   let ingested = 0;
@@ -1224,6 +1363,16 @@ function replayLoadProfile({
       continue;
     }
     dataPoints++;
+
+    // Reconstruct gross DC consumption by adding back wind/hydro/alternator
+    // charging (they flow through the shunt but Venus doesn't add them to
+    // dcPower, unlike solar which is already added back).
+    let chargingW = 0;
+    for (const c of chargingColumns) {
+      const v = columnNumber(point, c);
+      if (v != null) chargingW += v;
+    }
+    const grossDc = (dcLoadW ?? 0) + chargingW;
 
     const navStateResult = inferNavState(
       point,
@@ -1246,7 +1395,7 @@ function replayLoadProfile({
 
     const gate = loadProfile.ingestSample({
       time,
-      dcLoadW: Math.max(0, dcLoadW ?? 0),
+      dcLoadW: Math.max(0, grossDc),
       acLoadW: Math.max(0, acLoadW ?? 0),
       position,
       stateClass,
@@ -1275,6 +1424,7 @@ module.exports = {
   fetchHistoricalWeatherTrack,
   dailyPositionsFromHistory,
   interpolateWeather,
+  carryForwardSticky,
   replayHistory,
   replayGenerators,
   replayLoadProfile,

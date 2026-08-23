@@ -13,6 +13,7 @@ const path = require("node:path");
 const {
   fetchHistoricalWeather,
   interpolateWeather,
+  carryForwardSticky,
   replayHistory,
   replayGenerators,
   replayLoadProfile,
@@ -106,6 +107,94 @@ function pushTick(historyData, minutes, vals) {
   row[COL.position] = vals.position ?? [LON, LAT];
   historyData.data.push(row);
 }
+
+test.describe("carryForwardSticky", () => {
+  test("carries navigation.state forward across null gaps", () => {
+    const hd = {
+      values: [{ path: "navigation.state", method: "last" }],
+      data: [
+        ["t1", "moored"],
+        ["t2", null],
+        ["t3", null],
+        ["t4", "sailing"],
+        ["t5", null],
+      ],
+    };
+    carryForwardSticky(hd, new Map([["navigation.state", 1]]));
+    assert.deepStrictEqual(
+      hd.data.map((r) => r[1]),
+      ["moored", "moored", "moored", "sailing", "sailing"],
+    );
+  });
+
+  test("carries propulsion.*.state and navigation.position forward", () => {
+    const hd = {
+      values: [
+        { path: "propulsion.main.state", method: "last" },
+        { path: "navigation.position", method: "first" },
+      ],
+      data: [
+        ["t1", "started", [-159.8, -18.86]],
+        ["t2", null, null],
+        ["t3", "stopped", null],
+        ["t4", null, [-159.81, -18.87]],
+        ["t5", null, null],
+      ],
+    };
+    carryForwardSticky(
+      hd,
+      new Map([
+        ["propulsion.main.state", 1],
+        ["navigation.position", 2],
+      ]),
+    );
+    assert.deepStrictEqual(
+      hd.data.map((r) => r[1]),
+      ["started", "started", "stopped", "stopped", "stopped"],
+    );
+    assert.deepStrictEqual(
+      hd.data.map((r) => r[2]),
+      [
+        [-159.8, -18.86],
+        [-159.8, -18.86],
+        [-159.8, -18.86],
+        [-159.81, -18.87],
+        [-159.81, -18.87],
+      ],
+    );
+  });
+
+  test("does not touch non-sticky columns", () => {
+    const hd = {
+      values: [
+        { path: "navigation.state", method: "last" },
+        { path: "electrical.venus.dcPower", method: "average" },
+      ],
+      data: [
+        ["t1", "moored", 100],
+        ["t2", null, 110],
+        ["t3", null, null],
+      ],
+    };
+    carryForwardSticky(
+      hd,
+      new Map([
+        ["navigation.state", 1],
+        ["electrical.venus.dcPower", 2],
+      ]),
+    );
+    // dcPower (a continuous measurement) is NOT carried forward
+    assert.deepStrictEqual(
+      hd.data.map((r) => r[2]),
+      [100, 110, null],
+    );
+    // navigation.state IS carried forward
+    assert.deepStrictEqual(
+      hd.data.map((r) => r[1]),
+      ["moored", "moored", "moored"],
+    );
+  });
+});
 
 test.describe("weather fetch", () => {
   test("archive query includes wind and parses UTC timestamps", async () => {
@@ -548,6 +637,76 @@ test.describe("replayLoadProfile", () => {
     assert.strictEqual(stats.ingested, 0);
     assert.strictEqual(stats.gated, 4);
     assert.strictEqual(loadProfile.learnedBins().length, 0);
+  });
+
+  test("adds uncounted wind/hydro charging back to reconstruct gross load", () => {
+    // dcPower = shunt + solar. Wind charging flows through the shunt but is
+    // NOT added back by Venus, so a tick with dcPower=-50 and wind=60 should
+    // ingest gross=10W, not -50 (clamped to 0).
+    const historyData = makeHistoryData();
+    for (let day = 0; day < 4; day++) {
+      const t = NOON + day * 24 * 3600000;
+      const row = [new Date(t).toISOString()];
+      row[COL.soc] = 0.5;
+      row[COL.navState] = "anchored";
+      row[COL.windGen] = 60;
+      row[COL.house] = -50;
+      row[COL.position] = [LON, LAT];
+      historyData.data.push(row);
+    }
+
+    const loadProfile = new LoadProfile({
+      config: { minDaysPerBin: 3 },
+      getSelfPath: () => undefined,
+      app: undefined,
+    });
+    const stats = replayLoadProfile({
+      loadProfile,
+      historyData,
+      resolution: 300,
+      uncountedChargingPaths: ["electrical.dcsource.wind.power"],
+    });
+
+    assert.strictEqual(stats.ingested, 4);
+    assert.strictEqual(stats.gated, 0);
+    const load = loadProfile.getLoad(SunPhase.DAY, StateClass.AT_REST);
+    assert.ok(load, "getLoad should return a value after replay");
+    // Gross = -50 + 60 = 10W. EMA seeded at 10 and unchanged (all samples 10).
+    assert.ok(
+      load.dcWh > 0 && load.dcWh <= 11,
+      `expected gross ~10W, got ${load.dcWh}`,
+    );
+  });
+
+  test("without uncountedChargingPaths, negative dcPower clamps to 0", () => {
+    // Same ticks but no wind path passed: gross = max(0, -50) = 0W.
+    const historyData = makeHistoryData();
+    for (let day = 0; day < 4; day++) {
+      const t = NOON + day * 24 * 3600000;
+      const row = [new Date(t).toISOString()];
+      row[COL.soc] = 0.5;
+      row[COL.navState] = "anchored";
+      row[COL.windGen] = 60;
+      row[COL.house] = -50;
+      row[COL.position] = [LON, LAT];
+      historyData.data.push(row);
+    }
+
+    const loadProfile = new LoadProfile({
+      config: { minDaysPerBin: 3 },
+      getSelfPath: () => undefined,
+      app: undefined,
+    });
+    const stats = replayLoadProfile({
+      loadProfile,
+      historyData,
+      resolution: 300,
+    });
+
+    assert.strictEqual(stats.ingested, 4);
+    const load = loadProfile.getLoad(SunPhase.DAY, StateClass.AT_REST);
+    assert.ok(load, "getLoad should return a value");
+    assert.ok(load.dcWh <= 1, `expected ~0W, got ${load.dcWh}`);
   });
 });
 

@@ -306,6 +306,35 @@ class EpTimelineChart extends HTMLElement {
   // --- data shaping ---
 
   /**
+   * Builds the predicted-SoC line points for the day view.
+   *
+   * Predicted SoC is only meaningful in the future (the recorded cycle's
+   * forecast starts at "now"), so points before now are dropped. To avoid a
+   * visible gap between the actual SoC line (which ends at the last sample)
+   * and the predicted SoC line (which starts at the first forecast hour ≥
+   * now), prepend an anchor point at the last actual SoC sample so the two
+   * lines connect.
+   * @param {Array<{t: number, predSoC: number|null}>} pred
+   * @param {Array<{soc: number|null, time: string}>} actualsPoints
+   * @returns {Array<{t: number, v: number}>}
+   */
+  _predSoCPoints(pred, actualsPoints) {
+    const future = pred
+      .filter((p) => p.predSoC != null && p.t >= Date.now())
+      .map((p) => ({ t: p.t, v: p.predSoC }));
+    if (future.length === 0) return future;
+    const lastActual = actualsPoints
+      .filter((p) => p.soc != null)
+      .map((p) => ({ t: +new Date(p.time), v: Math.round(p.soc * 1000) / 10 }))
+      .sort((a, b) => a.t - b.t)
+      .pop();
+    if (!lastActual) return future;
+    // Anchor at the last actual sample so the predicted line continues from
+    // where the actual line ends, closing the gap at the now boundary.
+    return [{ t: lastActual.t, v: lastActual.v }, ...future];
+  }
+
+  /**
    * Day view: maps actuals points and the freshest cycle into a shared
    * time-sorted series model.
    * @returns {{model: object, rows: object[]}}
@@ -319,10 +348,30 @@ class EpTimelineChart extends HTMLElement {
     const from = new Date(this._data.actuals?.window?.from || 0).getTime();
     const to = new Date(this._data.actuals?.window?.to || Date.now()).getTime();
 
-    // Pred series: stepped hourly segments from the freshest cycle.
-    // Falls back to retro-predicted (backfilled model over archive weather)
-    // when no recorded cycle covers the window.
+    // Pred series: stepped hourly segments.
+    //
+    // The freshest recorded cycle covers from its record time forward (its
+    // forecast starts at "now" and runs predictionHours into the future).
+    // For the current day that leaves the hours before the cycle's start
+    // without any predicted yield, so the day view would show predicted
+    // solar/wind/hydro only in the future — unlike past days, which have no
+    // recorded cycles and fall back to the retro-predicted backfill covering
+    // the whole window.
+    //
+    // To keep the current day consistent with past days, stitch the two
+    // sources: use retro-predicted points for hours before the freshest
+    // cycle's first forecast hour, and the cycle's forecast from there on.
+    // predLoad and predSoC only come from the cycle (retro-predicted has no
+    // load/SoC), so they remain forecast-only.
     const pred = [];
+    const retroByTime = new Map();
+    for (const hour of retroPredicted?.points || []) {
+      retroByTime.set(new Date(hour.time).getTime(), hour);
+    }
+    const cycleStart =
+      cycle && (cycle.forecast || []).length > 0
+        ? new Date(cycle.forecast[0].time).getTime()
+        : Number.POSITIVE_INFINITY;
     if (cycle) {
       for (const hour of cycle.forecast || []) {
         const t = new Date(hour.time).getTime();
@@ -340,21 +389,24 @@ class EpTimelineChart extends HTMLElement {
               : null,
         });
       }
-    } else {
-      for (const hour of retroPredicted?.points || []) {
-        const t = new Date(hour.time).getTime();
-        const hydroWh = hour.idealHydroYieldWh || 0;
-        const windCombined = hour.idealWindYieldWh || 0;
-        pred.push({
-          t,
-          predSolar: hour.idealSolarYieldWh || 0,
-          predWind: Math.max(0, windCombined - hydroWh),
-          predHydro: hydroWh,
-          predLoad: null,
-          predSoC: null,
-        });
-      }
     }
+    // Fill the past portion (before the freshest cycle) from retro-predicted
+    // so the current day shows predicted yield across its whole span, matching
+    // past days that rely on the backfill.
+    for (const [t, hour] of retroByTime) {
+      if (t >= cycleStart) continue;
+      const hydroWh = hour.idealHydroYieldWh || 0;
+      const windCombined = hour.idealWindYieldWh || 0;
+      pred.push({
+        t,
+        predSolar: hour.idealSolarYieldWh || 0,
+        predWind: Math.max(0, windCombined - hydroWh),
+        predHydro: hydroWh,
+        predLoad: null,
+        predSoC: null,
+      });
+    }
+    pred.sort((a, b) => a.t - b.t);
 
     const model = {
       from,
@@ -379,9 +431,7 @@ class EpTimelineChart extends HTMLElement {
         predLoad: pred
           .filter((p) => p.predLoad != null)
           .map((p) => ({ t: p.t, v: p.predLoad })),
-        predSoC: pred
-          .filter((p) => p.predSoC != null && p.t >= Date.now())
-          .map((p) => ({ t: p.t, v: p.predSoC })),
+        predSoC: this._predSoCPoints(pred, points),
       },
     };
 

@@ -187,6 +187,101 @@ async function pruneOldRecordings(app, dataDir, retentionDays) {
 }
 
 /**
+ * Overwrites sticky signal fields (navState, position) on existing sample
+ * records across a window, rewriting each affected day-file in place.
+ *
+ * Sticky signals (navigation.state, navigation.position) are unreliable
+ * in the live delta stream — they flap between values (e.g. anchored ↔
+ * moored) when a source drops out or an autostate plugin toggles. The
+ * History API's :last aggregate is the stable source of truth. During
+ * backfill we resolve each sample's sticky fields from the history-derived
+ * carry-forward map and overwrite the live values, while leaving the
+ * continuous measurements (power, SoC, load) intact.
+ *
+ * @param {object} app - Signal K server API (for logging)
+ * @param {string} dataDir - Plugin data directory
+ * @param {Date} from - Window start
+ * @param {Date} to - Window end
+ * @param {(tsMs: number) => {navState: string|null, position: {latitude: number, longitude: number}|null}} resolve
+ *        Returns the sticky values to write for a sample timestamp
+ * @returns {Promise<{updated: number, files: number}>} Counts
+ */
+async function overwriteStickyFields(app, dataDir, from, to, resolve) {
+  const recordingsDir = path.join(dataDir, "recordings");
+  let updated = 0;
+  let files = 0;
+  const current = new Date(from);
+  const endDate = new Date(to);
+  while (current <= endDate) {
+    const filePath = getRecordingsPath(dataDir, current);
+    let lines;
+    try {
+      lines = (await fs.readFile(filePath, { encoding: "utf-8" })).split("\n");
+    } catch (error) {
+      if (error.code === "ENOENT") {
+        current.setUTCDate(current.getUTCDate() + 1);
+        continue;
+      }
+      throw error;
+    }
+    let changed = false;
+    const out = [];
+    for (const line of lines) {
+      if (!line.trim()) {
+        out.push(line);
+        continue;
+      }
+      let record;
+      try {
+        record = JSON.parse(line);
+      } catch (_parseError) {
+        out.push(line);
+        continue;
+      }
+      if (
+        record.type === "sample" &&
+        record.timestamp &&
+        new Date(record.timestamp) >= from &&
+        new Date(record.timestamp) <= to
+      ) {
+        const r = resolve(new Date(record.timestamp).getTime());
+        if (r.navState != null && r.navState !== record.navState) {
+          record.navState = r.navState;
+          changed = true;
+        }
+        if (r.position && !deepEqualPos(r.position, record.position)) {
+          record.position = r.position;
+          changed = true;
+        }
+        if (changed) updated++;
+        out.push(JSON.stringify(record));
+      } else {
+        out.push(line);
+      }
+    }
+    if (changed) {
+      await fs.writeFile(filePath, out.join("\n"), { encoding: "utf-8" });
+      files++;
+    }
+    current.setUTCDate(current.getUTCDate() + 1);
+  }
+  app.debug?.(
+    `Overwrote sticky fields on ${updated} samples in ${files} files`,
+  );
+  return { updated, files };
+}
+
+/**
+ * Shallow position equality for overwrite decisions.
+ * @param {{latitude: number, longitude: number}} a
+ * @param {{latitude: number, longitude: number}|null} b
+ * @returns {boolean}
+ */
+function deepEqualPos(a, b) {
+  return b != null && a.latitude === b.latitude && a.longitude === b.longitude;
+}
+
+/**
  * Reads records from a file within a time window.
  *
  * @param {string} filePath - File path to read
@@ -397,6 +492,7 @@ module.exports = {
   recordCycle,
   recordSample,
   pruneOldRecordings,
+  overwriteStickyFields,
   getRecordings,
   getRecordingsPath,
   ensureRecordingsDir,

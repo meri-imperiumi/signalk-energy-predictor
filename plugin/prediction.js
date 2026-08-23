@@ -433,13 +433,24 @@ class LoadProfile {
       return "engine-running";
     }
 
-    // Spike/outlier gate (only check if we have an EMA value)
+    // Spike/outlier gate (only check if we have an EMA value).
+    // Symmetric: rejects samples that are far ABOVE or far BELOW the current
+    // EMA. The high gate catches sensor spikes (e.g. a momentary 500W blip);
+    // the low gate catches charging artifacts and sensor dropouts that would
+    // otherwise drag a healthy bin down and lock it there (a collapsed EMA
+    // then rejects all real samples via the high gate). A 3x factor allows
+    // gradual seasonal drift while blocking single-sample poisoning.
     const bin = this.bins.get(binKey);
     const totalLoadW = dcLoadW + acLoadW;
     if (bin && bin.dcEma != null) {
       const currentEma = bin.dcEma + bin.acEma;
-      if (totalLoadW > currentEma * this.outlierFactor) {
+      const upper = currentEma * this.outlierFactor;
+      const lower = currentEma / this.outlierFactor;
+      if (totalLoadW > upper) {
         return "spike-outlier";
+      }
+      if (totalLoadW < lower) {
+        return "low-outlier";
       }
     }
 
@@ -855,20 +866,64 @@ class PredictionEngine {
    *
    * @returns {void}
    */
+  /**
+   * Sums the live power output of charging sources that flow through the
+   * battery shunt but are NOT added back into `electrical.venus.dcPower`.
+   *
+   * The Victron Venus `dcPower` value is computed as `shunt + solar`, where
+   * `shunt` is the net battery flow (positive when discharging to loads,
+   * negative when charging from any source). Solar is added back because it
+   * feeds the DC bus directly, but wind, hydro, and alternator charging also
+   * flow through the shunt and are NOT added back — so when they produce,
+   * `dcPower` understates (or goes negative for) real house consumption.
+   *
+   * True gross consumption (DC bus power balance) is:
+   *   consumption = shunt + solar + wind + hydro + alternator
+   *              = dcPower + wind + hydro + alternator
+   *
+   * So we add wind + hydro + alternator back to dcPower to reconstruct it.
+   * These are the configured mechanical generators of type wind/hydro plus
+   * the alternator input power path.
+   *
+   * @returns {number} Total uncounted charging output in watts
+   */
+  uncountedChargingW() {
+    let w = 0;
+    for (const gen of this.mechanicalGenerators) {
+      // Hydro and wind charge via the battery shunt but Venus doesn't add
+      // them back into dcPower (unlike solar), so they must be added here
+      // to reconstruct gross consumption. Alternator is excluded: it only
+      // produces while motoring, and those samples are gated as
+      // engine-running before reaching the bins anyway.
+      if (gen.type === "hydro" || gen.type === "wind") {
+        const v = toNumber(this.getSelfPath(gen.powerPath));
+        if (v != null) w += v;
+      }
+    }
+    return w;
+  }
+
   updateLoadProfile() {
-    // Read actual consumption from Victron Venus
-    // dcPower and acPower are already net consumption (producers removed)
+    // Read consumption from Victron Venus.
+    // dcPower = shunt + solar, so wind/hydro/alternator charging (which flow
+    // through the shunt but aren't added back) make it understate real load.
+    // Add those back to reconstruct gross house consumption.
+    // acPower is AC consumption (inverter/shore), independent of the bus.
     const rawDc = this.getSelfPath("electrical.venus.dcPower");
     const rawAc = this.getSelfPath("electrical.venus.acPower");
     const dcPowerW = toNumber(rawDc);
     const acPowerW = toNumber(rawAc);
+    const chargingW = this.uncountedChargingW();
 
     this.app?.debug?.(
-      `updateLoadProfile: dcPower=${JSON.stringify(rawDc)} (${dcPowerW}), acPower=${JSON.stringify(rawAc)} (${acPowerW})`,
+      `updateLoadProfile: dcPower=${JSON.stringify(rawDc)} (${dcPowerW}), uncountedCharging=${chargingW}, gross=${dcPowerW != null ? dcPowerW + chargingW : null}, acPower=${JSON.stringify(rawAc)} (${acPowerW})`,
     );
 
     if (dcPowerW != null || acPowerW != null) {
-      const dc = Math.max(0, dcPowerW ?? 0);
+      // Reconstruct gross DC consumption; clamp at 0 (a negative gross means
+      // charging exceeded load, i.e. the battery was net charging, which is
+      // not a consumption sample).
+      const dc = Math.max(0, (dcPowerW ?? 0) + chargingW);
       const ac = Math.max(0, acPowerW ?? 0);
 
       // Get current position for sun phase classification. unwrapPosition

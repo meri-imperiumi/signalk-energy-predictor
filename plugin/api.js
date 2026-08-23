@@ -126,6 +126,24 @@ function sourceTypesFromConfig(config) {
 }
 
 /**
+ * Resolves the navigation state for a retro-predicted hour.
+ *
+ * `stateAt` returns the latest sample at or before the hour, or null before
+ * the first recorded sample. A hardcoded "anchored" default would let a
+ * deployable wind generator (which only produces at anchor — or moored when
+ * allowed) spuriously predict yield for the gap hours at the start of the
+ * window when the vessel is actually moored. Fall back to the first sample's
+ * state instead, assuming state continuity up to the first observation.
+ *
+ * @param {object|null} state - Sample at or before the hour, or null
+ * @param {object[]} sorted - Samples sorted ascending by timestamp
+ * @returns {string} Resolved navigation state
+ */
+function resolveNavState(state, sorted) {
+  return state?.navState ?? sorted?.[0]?.navState ?? "anchored";
+}
+
+/**
  * Converts a recorded sample into a normalized actuals point with
  * per-source power in watts.
  *
@@ -856,6 +874,12 @@ async function buildRetroPredicted(samples, config, dataDir, from, to) {
   const sorted = samples
     .slice()
     .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+  // navigation.state and navigation.position are sticky: the last reported
+  // value persists until a new one arrives. navStateAt/posAt carry the most
+  // recent non-null value forward across gaps (a sample with a null navState
+  // does not reset the state to "unknown"; the prior known state holds).
+  // stateAt returns the latest sample at/before t for continuous signals
+  // (e.g. speed through water) where carry-forward would be wrong.
   const stateAt = (t) => {
     let lo = 0;
     let hi = sorted.length - 1;
@@ -871,18 +895,51 @@ async function buildRetroPredicted(samples, config, dataDir, from, to) {
     }
     return best;
   };
-
-  const posAt = (t) => {
-    let best = null;
-    let bestDist = Infinity;
-    for (const s of sorted) {
-      const d = Math.abs(new Date(s.timestamp) - t);
-      if (d < bestDist && s.position) {
-        best = s.position;
-        bestDist = d;
+  // Carry-forward navState: scan backward from the sample at/before t for
+  // the first with a non-null navState, so a null reading does not reset
+  // the sticky state. Returns the carrying sample (with .navState set) or
+  // null if no sample has a known state.
+  const navStateAt = (t) => {
+    let lo = 0;
+    let hi = sorted.length - 1;
+    let idx = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (new Date(sorted[mid].timestamp) <= t) {
+        idx = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
       }
     }
-    return best;
+    for (let i = idx; i >= 0; i--) {
+      if (sorted[i].navState != null) return sorted[i];
+    }
+    return null;
+  };
+  // Carry-forward position: latest known position at or before t (sticky,
+  // not nearest) — the boat does not teleport back to an earlier fix during
+  // a gap. Falls back to the earliest known position before t ever existed.
+  const posAt = (t) => {
+    let lo = 0;
+    let hi = sorted.length - 1;
+    let idx = -1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (new Date(sorted[mid].timestamp) <= t) {
+        idx = mid;
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    for (let i = idx; i >= 0; i--) {
+      if (sorted[i].position) return sorted[i].position;
+    }
+    // No prior position: use the earliest known position so the window start
+    // still has a fix to anchor sun/weather to.
+    for (const s of sorted) if (s.position) return s.position;
+    return null;
   };
 
   const points = [];
@@ -891,8 +948,8 @@ async function buildRetroPredicted(samples, config, dataDir, from, to) {
   for (let t = Math.ceil(fromMs / 3600000) * 3600000; t <= toMs; t += 3600000) {
     const time = new Date(t);
     const w = backfill.interpolateWeather(weather, time);
-    const state = stateAt(time);
-    const navState = state?.navState ?? "anchored";
+    const state = navStateAt(time);
+    const navState = resolveNavState(state, sorted);
     const pos = posAt(time);
 
     let idealSolarYieldWh = 0;
@@ -925,8 +982,11 @@ async function buildRetroPredicted(samples, config, dataDir, from, to) {
           navState,
         });
       } else if (g.type === "hydro") {
+        const stwState = stateAt(time);
         const stwKn =
-          state && typeof state.stwKnots === "number" ? state.stwKnots : 0;
+          stwState && typeof stwState.stwKnots === "number"
+            ? stwState.stwKnots
+            : 0;
         idealHydroYieldWh += predictHydroHour({
           generator: g,
           speedThroughWaterKnots: stwKn,
@@ -955,6 +1015,7 @@ module.exports = {
   parseTimeWindow,
   granularityForWindow,
   sourceTypesFromConfig,
+  resolveNavState,
   sampleToActualPoint,
   integratePerHour,
   downsamplePoints,

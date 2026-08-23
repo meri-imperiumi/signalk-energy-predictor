@@ -15,6 +15,7 @@ const {
   recordCycle,
   recordSample,
   pruneOldRecordings,
+  overwriteStickyFields,
   getRecordings,
   getRecordingsPath,
   ensureRecordingsDir,
@@ -594,6 +595,112 @@ test.describe("recorder", () => {
       const records = await recorder.getRecordings(from, to);
 
       assert.deepStrictEqual(records, []);
+    });
+  });
+
+  test.describe("overwriteStickyFields", () => {
+    test("overwrites navState and position on existing samples", async () => {
+      const day = new Date("2026-08-19T00:00:00Z");
+      // Live samples with flapping navState and a stale position
+      await recordSample(mockApp, tempDir, {
+        timestamp: new Date("2026-08-19T00:05:00Z"),
+        navState: "anchored",
+        position: { latitude: -18.86, longitude: -159.8 },
+        soc: 0.8,
+        arrays: {},
+        generators: {},
+        houseLoadW: 60,
+      });
+      await recordSample(mockApp, tempDir, {
+        timestamp: new Date("2026-08-19T00:10:00Z"),
+        navState: "moored",
+        position: { latitude: -18.86, longitude: -159.8 },
+        soc: 0.79,
+        arrays: {},
+        generators: {},
+        houseLoadW: 62,
+      });
+      const from = new Date("2026-08-19T00:00:00Z");
+      const to = new Date("2026-08-19T23:59:59Z");
+      await overwriteStickyFields(mockApp, tempDir, from, to, (_ts) => ({
+        navState: "moored",
+        position: { latitude: -18.87, longitude: -159.81 },
+      }));
+      const recs = await getRecordings(tempDir, from, to, "sample");
+      assert.deepStrictEqual(
+        recs.map((r) => r.navState),
+        ["moored", "moored"],
+      );
+      // Continuous fields are untouched
+      assert.deepStrictEqual(
+        recs.map((r) => r.soc),
+        [0.8, 0.79],
+      );
+      assert.deepStrictEqual(
+        recs.map((r) => r.houseLoadW),
+        [60, 62],
+      );
+      // Position overwritten
+      for (const r of recs) {
+        assert.deepStrictEqual(r.position, {
+          latitude: -18.87,
+          longitude: -159.81,
+        });
+      }
+    });
+
+    test("leaves non-sample records and out-of-window samples untouched", async () => {
+      const day = new Date("2026-08-19T00:00:00Z");
+      await recordSample(mockApp, tempDir, {
+        timestamp: new Date("2026-08-19T00:05:00Z"),
+        navState: "anchored",
+        position: { latitude: -18.86, longitude: -159.8 },
+        soc: 0.8,
+        arrays: {},
+        generators: {},
+        houseLoadW: 60,
+      });
+      // A cycle record (not a sample) in the same file
+      const recorder = new Recorder(mockApp, tempDir, {});
+      await recorder.recordCycle({
+        timestamp: new Date("2026-08-19T00:06:00Z"),
+        weatherTier: 1,
+        forecast: [],
+        actions: [],
+      });
+      // Out-of-window sample (before `from`)
+      await recordSample(mockApp, tempDir, {
+        timestamp: new Date("2026-08-18T23:50:00Z"),
+        navState: "anchored",
+        position: { latitude: -18.86, longitude: -159.8 },
+        soc: 0.8,
+        arrays: {},
+        generators: {},
+        houseLoadW: 60,
+      });
+      const from = new Date("2026-08-19T00:00:00Z");
+      const to = new Date("2026-08-19T23:59:59Z");
+      await overwriteStickyFields(mockApp, tempDir, from, to, (_ts) => ({
+        navState: "moored",
+        position: { latitude: -18.87, longitude: -159.81 },
+      }));
+      const all = await getRecordings(
+        tempDir,
+        new Date("2026-08-18T00:00:00Z"),
+        to,
+      );
+      const samples = all.filter((r) => r.type === "sample");
+      // The 00:05 sample (in window) is overwritten
+      const sIn = samples.find(
+        (r) => r.timestamp === "2026-08-19T00:05:00.000Z",
+      );
+      assert.strictEqual(sIn.navState, "moored");
+      // The 23:50 sample (previous day, out of window) is untouched
+      const sOut = samples.find((r) => r.timestamp.startsWith("2026-08-18"));
+      assert.strictEqual(sOut.navState, "anchored");
+      // The cycle record survives unchanged
+      const cycles = all.filter((r) => r.type === "cycle");
+      assert.strictEqual(cycles.length, 1);
     });
   });
 });

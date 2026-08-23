@@ -193,6 +193,26 @@ test.describe("LoadProfile", () => {
     assert.strictEqual(gate, "spike-outlier");
   });
 
+  test("gates low outliers so a low-sample run cannot collapse the bin", () => {
+    // Seed a healthy at-rest:day bin at 90W (150 total with ac).
+    const binKey = "at-rest:day";
+    loadProfile.bins.set(binKey, { dcEma: 100, acEma: 50 });
+    // A sample far below the EMA (3× below) is a charging artifact, not real
+    // consumption. Without the low gate, a run of these would drag the EMA
+    // to ~0 and then lock it there via the high gate.
+    const gate = loadProfile.shouldGate(10, 0, binKey);
+    assert.strictEqual(gate, "low-outlier");
+  });
+
+  test("does not gate samples within the lower band (gradual drift ok)", () => {
+    // EMA 150 total; a sample at 60W is below but not 3× below (150/3=50),
+    // so gradual decline is allowed to track.
+    const binKey = "at-rest:day";
+    loadProfile.bins.set(binKey, { dcEma: 100, acEma: 50 });
+    const gate = loadProfile.shouldGate(60, 0, binKey);
+    assert.strictEqual(gate, null);
+  });
+
   test("does not gate normal samples", () => {
     const gate = loadProfile.shouldGate(100, 50, "at-rest:day");
     assert.strictEqual(gate, null);
@@ -450,5 +470,110 @@ test.describe("PredictionEngine position unwrapping", () => {
       new Set(loads).size > 1,
       `expected per-phase house load variation, got ${loads.join(",")}`,
     );
+  });
+});
+
+test.describe("PredictionEngine.updateLoadProfile gross consumption", () => {
+  // electrical.venus.dcPower = shunt + solar. Wind/hydro charging flows
+  // through the shunt but is NOT added back by Venus, so it understates real
+  // consumption. updateLoadProfile must add wind/hydro back to reconstruct
+  // gross house load before feeding the load-profile bins.
+  function makeEngine(pathValues) {
+    const { PredictionEngine } = require("../plugin/prediction.js");
+    const app = {
+      debug() {},
+      error() {},
+      getSelfPath: (p) => pathValues.get(p),
+    };
+    return new PredictionEngine({
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [],
+      mechanicalGenerators: [
+        {
+          id: "superwind",
+          type: "wind",
+          powerPath: "electrical.chargers.wind.power",
+        },
+        {
+          id: "sailinggen",
+          type: "hydro",
+          powerPath: "electrical.chargers.hydrogenerator.power",
+        },
+      ],
+      getEfficiency: () => 0.7,
+      getSelfPath: (p) => app.getSelfPath(p),
+      app,
+    });
+  }
+
+  function seedAtRestDay(loadProfile, dc) {
+    loadProfile.bins.set("at-rest:day", { dcEma: dc, acEma: 0 });
+    for (let i = 0; i < 5; i++) {
+      loadProfile.samplesPerBin.set(`at-rest:day:2024-01-0${i + 1}`, true);
+    }
+  }
+
+  test("adds wind charging back to a negative dcPower reading", () => {
+    // Nighttime: no solar, shunt shows -50W (battery charging from wind),
+    // wind produces 60W. Gross consumption = -50 + 60 = 10W. With a healthy
+    // established bin (100W), the low-outlier gate rejects this 10W sample as
+    // anomalous, protecting the bin from a single low reading.
+    const pathValues = new Map([
+      ["electrical.venus.dcPower", -50],
+      ["electrical.venus.acPower", 0],
+      ["electrical.chargers.wind.power", 60],
+      ["electrical.chargers.hydrogenerator.power", 0],
+      ["navigation.state", "moored"],
+      ["navigation.position", { latitude: -18.86, longitude: -159.8 }],
+    ]);
+    const engine = makeEngine(pathValues);
+    seedAtRestDay(engine.loadProfile, 100);
+    engine.updateLoadProfile();
+    const after = engine.loadProfile.bins.get("at-rest:day").dcEma;
+    // 10W is 3x below the 100W EMA, so the low-outlier gate rejects it and the
+    // bin is protected (EMA unchanged).
+    assert.strictEqual(
+      after,
+      100,
+      `EMA should be protected by low gate, got ${after}`,
+    );
+  });
+
+  test("does not add solar back (already counted in dcPower)", () => {
+    // dcPower = shunt + solar = 30 + 100 = 130W already. Solar must NOT be
+    // added again. With no wind/hydro, gross == dcPower.
+    const pathValues = new Map([
+      ["electrical.venus.dcPower", 130],
+      ["electrical.venus.acPower", 0],
+      ["electrical.chargers.wind.power", 0],
+      ["electrical.chargers.hydrogenerator.power", 0],
+      ["navigation.state", "moored"],
+      ["navigation.position", { latitude: -18.86, longitude: -159.8 }],
+    ]);
+    const engine = makeEngine(pathValues);
+    seedAtRestDay(engine.loadProfile, 100);
+    engine.updateLoadProfile();
+    const after = engine.loadProfile.bins.get("at-rest:day").dcEma;
+    // Ingested 130W; EMA moves from 100 toward 130 (alpha-smoothed), so it
+    // should increase, not stay flat or overshoot.
+    assert.ok(after > 100, `EMA should rise toward 130W, got ${after}`);
+    assert.ok(after <= 130, `EMA ${after} should not exceed 130`);
+  });
+
+  test("clamps negative gross to zero (pure charging, no consumption)", () => {
+    // dcPower -50, wind 10 -> gross -40, clamped to 0.
+    const pathValues = new Map([
+      ["electrical.venus.dcPower", -50],
+      ["electrical.venus.acPower", 0],
+      ["electrical.chargers.wind.power", 10],
+      ["electrical.chargers.hydrogenerator.power", 0],
+      ["navigation.state", "moored"],
+      ["navigation.position", { latitude: -18.86, longitude: -159.8 }],
+    ]);
+    const engine = makeEngine(pathValues);
+    seedAtRestDay(engine.loadProfile, 100);
+    engine.updateLoadProfile();
+    const after = engine.loadProfile.bins.get("at-rest:day").dcEma;
+    assert.ok(after >= 0, `EMA should stay non-negative, got ${after}`);
   });
 });

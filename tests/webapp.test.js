@@ -97,6 +97,22 @@ test("chart overlays retro-predicted when no recorded cycle covers the window", 
   assert.match(source, /retroPredicted\.points/);
 });
 
+test("chart stitches retro-predicted into the current day's past and anchors predicted SoC", () => {
+  const source = readFileSync(
+    path.join(PUBLIC_DIR, "ep-timeline-chart.js"),
+    "utf8",
+  );
+  // Hours before the freshest cycle's first forecast are filled from
+  // retro-predicted so the current day shows predicted yield across its
+  // whole span, matching past days that rely on the backfill.
+  assert.match(source, />= cycleStart/);
+  assert.match(source, /cycle\.forecast\[0\]\.time/);
+  // Predicted SoC line is anchored to the last actual SoC sample so the
+  // predicted and actual lines connect at the now boundary (no gap).
+  assert.match(source, /_predSoCPoints/);
+  assert.match(source, /lastActual/);
+});
+
 test("window selector exposes Today and hash-based navigation", () => {
   const source = readFileSync(
     path.join(PUBLIC_DIR, "ep-window-selector.js"),

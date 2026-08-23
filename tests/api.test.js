@@ -24,6 +24,7 @@ const {
   buildEnvironment,
   buildSummary,
   registerApiRoutes,
+  resolveNavState,
   MAX_WINDOW_DAYS,
 } = require("../plugin/api.js");
 const openApiSpec = require("../schema/openapi.json");
@@ -202,6 +203,30 @@ test.describe("sourceTypesFromConfig and sample mapping", () => {
     assert.strictEqual(point.houseLoadW, 60);
     // Unconfigured devices are ignored
     assert.strictEqual(point.solarW, 200);
+  });
+});
+
+test.describe("resolveNavState", () => {
+  test("uses the sample state when present", () => {
+    const sorted = [{ navState: "moored" }];
+    assert.strictEqual(
+      resolveNavState({ navState: "anchored" }, sorted),
+      "anchored",
+    );
+  });
+
+  test("falls back to the first sample's state before any sample", () => {
+    // Hours before the first recorded sample have no state to carry forward.
+    // A hardcoded "anchored" default would let a deployable wind generator
+    // predict yield for the gap at the start of the window when the vessel
+    // is actually moored. Use the first sample's state instead.
+    const sorted = [{ navState: "moored" }, { navState: "anchored" }];
+    assert.strictEqual(resolveNavState(null, sorted), "moored");
+  });
+
+  test("defaults to anchored when there are no samples at all", () => {
+    assert.strictEqual(resolveNavState(null, []), "anchored");
+    assert.strictEqual(resolveNavState(null, undefined), "anchored");
   });
 });
 
