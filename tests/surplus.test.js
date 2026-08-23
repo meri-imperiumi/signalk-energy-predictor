@@ -180,6 +180,88 @@ test.describe("findSurplusOpportunity", () => {
     });
   });
 
+  test("does not count next-day refill of an overnight drawdown as surplus", () => {
+    // The bank fills midday day 1, discharges overnight, then solar refills
+    // it day 2. Only energy produced *while the bank is full* is curtailed
+    // surplus; the day-2 solar is refilling the drawdown, not being
+    // wasted. The old per-hour max(0, net) sum double-counted the refill
+    // and stretched the window across the overnight gap into day 2.
+    //
+    // We inject a synthetic lastPrediction so the track is exact and the
+    // assertion is deterministic (independent of the solar model).
+    withFrozenNow(() => {
+      const app = makeFakeApp();
+      setSoC(app, 0.9);
+      const engine = makeEngine({ app, capacityWp: 1000 });
+      engine.capacityWh = 400 * 12;
+      const start = midday(); // 2026-06-21 11:00 UTC, lat 60 → sun up
+      // Hours: 0–4 fill+curtail (bank hits full ~h2), 5–14 overnight
+      // drawdown (net negative), 15–23 day-2 solar that refills most of
+      // the drawdown but never re-fills to full (SoC peaks ~0.95), so
+      // none of day-2 solar is curtailed. The old code summed every
+      // net-positive hour and reported day-2 solar as surplus too.
+      const track = [
+        // [idealSoC, solarWh, houseWh]  (wind/hydro/alt all 0, moored)
+        [0.9, 300, 100],
+        [0.96, 300, 100],
+        [1.0, 300, 100],
+        [1.0, 300, 100],
+        [1.0, 300, 100],
+        [0.98, 0, 100],
+        [0.95, 0, 100],
+        [0.92, 0, 100],
+        [0.89, 0, 100],
+        [0.86, 0, 100],
+        [0.83, 0, 100],
+        [0.8, 0, 100],
+        [0.77, 0, 100],
+        [0.74, 0, 100],
+        [0.71, 0, 100],
+        [0.71, 150, 100],
+        [0.74, 150, 100],
+        [0.77, 150, 100],
+        [0.8, 150, 100],
+        [0.83, 150, 100],
+        [0.86, 150, 100],
+        [0.89, 150, 100],
+        [0.92, 150, 100],
+        [0.94, 150, 100],
+        [0.95, 150, 100],
+      ];
+      engine.lastPrediction = track.map((r, h) => ({
+        hour: h,
+        time: new Date(start.getTime() + h * 3600000),
+        idealSoC: r[0],
+        idealSolarYieldWh: r[1],
+        idealWindYieldWh: 0,
+        idealHydroYieldWh: 0,
+        alternatorWh: 0,
+        houseLoadWh: r[2],
+      }));
+
+      const opp = engine.findSurplusOpportunity({ minSurplusWh: 100 });
+      assert.ok(opp, "should detect the day-1 curtailment surplus");
+      // The window must end on day 1 (before the overnight drawdown),
+      // not stretch into day 2's refill. Hour 4 is the last day-1
+      // curtailment hour; the drawdown starts at h5 and day-2 solar never
+      // re-fills the bank, so there is no second curtailment window.
+      assert.ok(
+        opp.to.getTime() <= new Date(start.getTime() + 5 * 3600000).getTime(),
+        `window to (${opp.to.toISOString()}) must not cross into the overnight drawdown`,
+      );
+      // Day-1 curtailment is h2–4 ≈ 600 Wh. Day-2 solar (h15–23, ~900 Wh
+      // net positive) must NOT be in the surplus total — it's refilling
+      // the overnight drawdown (SoC peaks at 0.95, never full). Cap the
+      // asserted surplus well below the refill magnitude to prove the
+      // refill isn't counted.
+      assert.ok(
+        opp.surplusWh < 700,
+        `surplusWh=${opp.surplusWh} should exclude the ~900Wh day-2 refill`,
+      );
+      assert.ok(opp.surplusWh >= 100, `surplusWh=${opp.surplusWh}`);
+    });
+  });
+
   test("returns null when the full window is beyond maxLeadHours", () => {
     // Here we DON'T freeze now: build a forecast starting 48h out, while
     // the engine's startTime is real-now, so the full window is far away.
@@ -302,8 +384,10 @@ test.describe("publishSurplusAdvisory", () => {
   test("publishes a warn notification with window, Wh, and suggested load", () => {
     const app = makeFakeApp();
     const pub = new AdvisoryPublisher(app, "test-plugin");
-    const from = new Date("2026-06-21T11:00:00Z");
-    const to = new Date("2026-06-21T16:00:00Z");
+    // Window starting ~1h out lands at medium urgency (warn) regardless of
+    // when the test runs; older fixed dates made this date-dependent.
+    const from = new Date(Date.now() + 60 * 60 * 1000);
+    const to = new Date(Date.now() + 6 * 60 * 60 * 1000);
     pub.publishSurplusAdvisory(
       { surplusWh: 1200, from, to, suggestedLoadW: 240 },
       [{ name: "Watermaker", watts: 150 }],
@@ -317,6 +401,36 @@ test.describe("publishSurplusAdvisory", () => {
     assert.match(n.value.message, /1\.2kWh surplus available/);
     assert.match(n.value.message, /~240W sustained/);
     assert.match(n.value.message, /Watermaker \(150W\) for ~8h/);
+  });
+
+  test("marks the end time when the surplus window spans midnight", () => {
+    // A 26h window (14:46 today → 16:46 tomorrow) must not render as the
+    // ambiguous `14:46-16:46` (reads as a 2h same-day span and makes the
+    // Wh/W math look impossible).
+    const app = makeFakeApp();
+    const pub = new AdvisoryPublisher(app, "test-plugin");
+    const from = new Date(Date.now() + 60 * 60 * 1000);
+    from.setHours(14, 46, 0, 0);
+    const to = new Date(from.getTime() + 26 * 60 * 60 * 1000);
+    pub.publishSurplusAdvisory(
+      { surplusWh: 1900, from, to, suggestedLoadW: 70 },
+      [],
+    );
+    const notifs = getNotifications(app);
+    const n = notifs.find((v) =>
+      v.path.startsWith("notifications.electrical.energy.surplus"),
+    );
+    assert.ok(n);
+    assert.match(
+      n.value.message,
+      /16:46\+1/,
+      "tomorrow endpoint should carry a +1 day marker",
+    );
+    assert.doesNotMatch(
+      n.value.message,
+      /14:46-16:46 \(/,
+      "must not render as a plain same-day 2h span",
+    );
   });
 
   test("publishes the surplusWh / from / to deltas", () => {

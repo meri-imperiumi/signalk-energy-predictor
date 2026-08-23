@@ -31,6 +31,7 @@ const {
   unwrapPosition,
 } = require("./prediction.js");
 const { AdvisoryPublisher } = require("./advisory.js");
+const { StateConfidence } = require("./urgency.js");
 const {
   buildPluginSchema,
   parseManufacturerCurve,
@@ -417,9 +418,7 @@ module.exports = (app) => {
     // (e.g. a small gust factor with a large speed factor, or just forecast
     // rounding), so floor the corrected gust at the corrected speed.
     const flooredGust =
-      correctedGust != null
-        ? Math.max(correctedGust, correctedSpeed)
-        : null;
+      correctedGust != null ? Math.max(correctedGust, correctedSpeed) : null;
 
     return {
       applies: true,
@@ -631,6 +630,48 @@ module.exports = (app) => {
         learnGusts: wpfConfig.learnGusts !== false,
         minForecastWindKnots: wpfConfig.minForecastWindKnots,
       });
+    }
+  }
+
+  /**
+   * Loads the last recorded per-device deploy states (carry-forward
+   * fallback for the live detection).
+   *
+   * `runPredictionCycle` rebuilds `currentDeployStates` fresh each cycle
+   * from live power + conditions. At night a deployable solar array
+   * (FLINsail) naturally produces ~0 W, so neither "power > 0" nor "0 W in
+   * daytime" yields a definite state — after a server restart the Map is
+   * empty and `detectedState` publishes as `null` even though the array
+   * was last known to be, say, "deployed". The 5-minute sample recordings
+   * already persist `deployStates` per device, so we recover the last
+   * known state from the most recent sample as a fallback.
+   *
+   * Only samples within `SEED_FRESHNESS_MS` are honoured, so a stale state
+   * from a multi-day outage is not carried forward indefinitely (it may
+   * have changed since). Returns the raw `{ deviceId: "deployed"|"stowed" }`
+   * object from the recording, or `null`.
+   *
+   * @returns {Promise<object|null>}
+   */
+  async function getLastDeployStates() {
+    if (!recorder) return null;
+    try {
+      const now = Date.now();
+      const from = new Date(now - 2 * 24 * 3600000);
+      const to = new Date(now);
+      const samples = await recorder.getRecordings(from, to, "sample");
+      if (samples.length === 0) return null;
+      const last = samples[samples.length - 1];
+      const ts = new Date(last.timestamp).getTime();
+      if (Number.isNaN(ts) || now - ts > SEED_FRESHNESS_MS) {
+        return null; // Too stale to trust as carry-forward
+      }
+      const states = last.deployStates;
+      if (!states || typeof states !== "object") return null;
+      return states;
+    } catch (error) {
+      app.debug(`getLastDeployStates: failed (${error.message})`);
+      return null;
     }
   }
 
@@ -866,17 +907,39 @@ module.exports = (app) => {
         navState === "motoring" ||
         navState === "under way";
 
+      // Recover the last known deploy states from the most recent sample
+      // recording as a carry-forward fallback. At night a deployable solar
+      // array produces ~0 W, so the live inference below yields null and a
+      // fresh-restart Map would publish `detectedState: null` even though
+      // the array was last known to be deployed/stowed. The seeded entries
+      // are only a fallback: every definite live inference below overwrites
+      // them, and entries the live inference leaves null keep the seed.
+      const seededDeployStates = await getLastDeployStates();
+      const seededDeployStateIds = new Set();
       const currentDeployStates = new Map();
+      if (seededDeployStates) {
+        for (const [id, state] of Object.entries(seededDeployStates)) {
+          if (state === "deployed" || state === "stowed") {
+            currentDeployStates.set(id, state);
+            seededDeployStateIds.add(id);
+          }
+        }
+      }
       for (const array of getActiveSolarArrays(pluginConfig)) {
         if (array.deployStatePath) {
           const val = deltaState.get(array.deployStatePath);
-          currentDeployStates.set(array.id, normalizeDeployState(val));
+          const sensorState = normalizeDeployState(val);
+          if (sensorState != null) {
+            currentDeployStates.set(array.id, sensorState);
+            seededDeployStateIds.delete(array.id);
+          }
         }
         // For deployable solar arrays, infer from power output during daytime
         if (array.type === "deployable" && array.powerPath) {
           const powerVal = toNumber(deltaState.get(array.powerPath));
           if (powerVal != null && powerVal > 0) {
             currentDeployStates.set(array.id, "deployed");
+            seededDeployStateIds.delete(array.id);
           }
           // No solar output during daytime means array is stowed
           if (powerVal != null && powerVal === 0) {
@@ -893,6 +956,7 @@ module.exports = (app) => {
               );
               if (sunPos.altitude > 0) {
                 currentDeployStates.set(array.id, "stowed");
+                seededDeployStateIds.delete(array.id);
               }
             }
           }
@@ -908,27 +972,32 @@ module.exports = (app) => {
               : null;
           if (!(powerVal != null && powerVal > 0)) {
             currentDeployStates.set(array.id, "stowed");
+            seededDeployStateIds.delete(array.id);
           }
         }
       }
       for (const gen of getActiveGenerators(pluginConfig)) {
         if (gen.deployStatePath) {
           const val = deltaState.get(gen.deployStatePath);
-          currentDeployStates.set(gen.id, normalizeDeployState(val));
+          const sensorState = normalizeDeployState(val);
+          if (sensorState != null) {
+            currentDeployStates.set(gen.id, sensorState);
+            seededDeployStateIds.delete(gen.id);
+          }
         }
         // For deployable generators, infer from power output
         if (gen.deployable && gen.powerPath) {
           const powerVal = toNumber(deltaState.get(gen.powerPath));
           if (powerVal != null && powerVal > 0) {
             currentDeployStates.set(gen.id, "deployed");
+            seededDeployStateIds.delete(gen.id);
           }
         }
-        // Wind generator: if there is wind but no power output, it is stowed
-        if (
-          gen.deployable &&
-          gen.type === "wind" &&
-          !currentDeployStates.has(gen.id)
-        ) {
+        // Wind generator: if there is wind but no power output, it is stowed.
+        // Runs even when a seed is present: a definite live "stowed" reading
+        // overwrites the carried-forward state; no wind evidence leaves the
+        // seed in place.
+        if (gen.deployable && gen.type === "wind") {
           const powerVal = toNumber(deltaState.get(gen.powerPath));
           const startupSpeed = gen.startupSpeedKnots ?? 5;
           // Use average wind speed over recent history to avoid false positives
@@ -975,18 +1044,17 @@ module.exports = (app) => {
             recentWind.length >= 2
           ) {
             currentDeployStates.set(gen.id, "stowed");
+            seededDeployStateIds.delete(gen.id);
           }
         }
         // Hydro is stowed when not sailing
         if (gen.deployable && gen.type === "hydro" && navState !== "sailing") {
           currentDeployStates.set(gen.id, "stowed");
+          seededDeployStateIds.delete(gen.id);
         }
-        // Hydro: if sailing above min speed but no power output, it is stowed
-        if (
-          gen.deployable &&
-          gen.type === "hydro" &&
-          !currentDeployStates.has(gen.id)
-        ) {
+        // Hydro: if sailing above min speed but no power output, it is stowed.
+        // Runs even when a seed is present (definite live reading wins).
+        if (gen.deployable && gen.type === "hydro") {
           const powerVal = toNumber(deltaState.get(gen.powerPath));
           const speed = toKnots(deltaState.get("navigation.speedThroughWater"));
           const minSpeed = gen.minSpeedKnots ?? 3;
@@ -997,6 +1065,7 @@ module.exports = (app) => {
             speed >= minSpeed
           ) {
             currentDeployStates.set(gen.id, "stowed");
+            seededDeployStateIds.delete(gen.id);
           }
         }
         // Wind generators stowed when underway ONLY if not producing
@@ -1009,6 +1078,7 @@ module.exports = (app) => {
               : null;
           if (!(powerVal != null && powerVal > 0)) {
             currentDeployStates.set(gen.id, "stowed");
+            seededDeployStateIds.delete(gen.id);
           }
         }
       }
@@ -1047,6 +1117,48 @@ module.exports = (app) => {
       const deploymentRecommendations =
         predictionEngine.getDeploymentRecommendations();
 
+      // Day/night and navigation-state context for urgency-aware
+      // notifications. At night, deployables use visual-only and at-rest
+      // non-urgent activity suggestions are held for the morning.
+      let isNight = false;
+      const posForNight = unwrapPosition(
+        deltaState.get("navigation.position") ||
+          app.getSelfPath("navigation.position"),
+      );
+      if (posForNight && posForNight.latitude != null) {
+        const sunPos = sunPosition(
+          new Date(),
+          posForNight.latitude,
+          posForNight.longitude ?? 0,
+        );
+        isNight = wpfIsNight(sunPos.altitude);
+      }
+
+      // Per-device state confidence for urgency. A positive power reading
+      // or a sensor-provided state is HIGH confidence; an inferred stowed
+      // state is MEDIUM; a state recovered from the last recording as a
+      // carry-forward fallback (live inference yielded null, e.g. at night)
+      // is LOW; a genuinely-unknown state with no history is NONE (worst
+      // case — assume deployed).
+      const deployConfidences = new Map();
+      for (const rec of deploymentRecommendations) {
+        const state = currentDeployStates.get(rec.id) ?? null;
+        if (seededDeployStateIds.has(rec.id)) {
+          // Carried forward from the last recording: stale but not unknown.
+          deployConfidences.set(rec.id, StateConfidence.LOW);
+        } else if (state === "deployed") {
+          // Deployed inference is only set from positive power / sensor —
+          // both are HIGH confidence.
+          deployConfidences.set(rec.id, StateConfidence.HIGH);
+        } else if (state === "stowed") {
+          // Stowed is inferred (no power + conditions favourable) — MEDIUM.
+          deployConfidences.set(rec.id, StateConfidence.MEDIUM);
+        } else {
+          // Unknown: worst case for urgency (assume deployed).
+          deployConfidences.set(rec.id, StateConfidence.NONE);
+        }
+      }
+
       // Publish all advisories
       app.debug("Publishing advisories...");
       advisoryPublisher.publishAll({
@@ -1059,6 +1171,11 @@ module.exports = (app) => {
         opportunisticLoads: surplusConfig.opportunisticLoads || [],
         deploymentRecommendations,
         currentDeployStates,
+        isNight,
+        isUnderway: underway,
+        deployConfidences,
+        batterySoC: predictionEngine.getCurrentSoC(),
+        urgencyConfig: pluginConfig.notification?.urgency,
       });
       app.debug(`Advisories published successfully`);
 
@@ -1171,6 +1288,16 @@ module.exports = (app) => {
    * at rest, and deploy recommendations need a known state).
    */
   const INITIAL_PREDICTION_DELAY_MS = 10 * 1000; // 10 seconds
+
+  /**
+   * Maximum age of a recorded sample whose deploy states are trusted as a
+   * carry-forward fallback after a restart. Samples older than this are
+   * ignored (the device may have changed state since), so a stale value
+   * from a multi-day outage is not carried forward indefinitely. Six hours
+   * covers a night-time restart (the common case: solar produces ~0 W at
+   * night so the live inference yields null) while bounding staleness.
+   */
+  const SEED_FRESHNESS_MS = 6 * 60 * 60 * 1000; // 6 hours
 
   /**
    * Rolling solar power samples per path for running averages.

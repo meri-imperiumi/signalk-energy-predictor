@@ -1174,6 +1174,121 @@ class PredictionEngine {
   }
 
   /**
+   * Whether the battery is projected to reach full (100% SoC) over the
+   * prediction horizon using only solar and hydro yield — i.e. without
+   * any deployable wind generator. When this is true, deploying a wind
+   * generator adds no useful energy: solar already covers the load and
+   * charges the bank to full, so the wind gen recommendation is suppressed
+   * (recommend stow instead) to save the crew a deck trip for nothing.
+   *
+   * This is the recommendation-side companion to the urgency model's
+   * reluctance gate: reluctance asks "is it worth the effort *if we need
+   * the energy*"; this asks "do we even need the energy."
+   *
+   * @returns {boolean} True if solar+hydro alone fill the battery during
+   *          the horizon.
+   */
+  wouldSolarFillBattery() {
+    if (this.lastPrediction.length === 0) return false;
+    const startSoC = this.lastPrediction[0].idealSoC;
+    if (startSoC == null) return false;
+    let soc = startSoC;
+    for (const p of this.lastPrediction) {
+      const netWithoutWind =
+        (p.idealSolarYieldWh || 0) +
+        (p.idealHydroYieldWh || 0) -
+        (p.houseLoadWh || 0);
+      if (this.capacityWh > 0) {
+        soc = Math.max(0, Math.min(1, soc + netWithoutWind / this.capacityWh));
+      }
+      if (soc >= 1) return true;
+    }
+    return false;
+  }
+
+  /**
+   * How many consecutive forecast hours a deployable source would produce
+   * good output starting from the current hour — the "good-output window"
+   * length. This feeds the urgency model's duration gate: a deploy
+   * suggestion is only worth acting on if the forecast offers a long enough
+   * window (1h for hydro, ~2h for FLINsail, 8h+ for a wind generator).
+   *
+   * For a wind generator, "good output" means wind ≥ startup speed and
+   * gusts below the max. For a deployable solar array (FLINsail), it means
+   * the sun is up and gusts are below the limit. The count starts from the
+   * current hour and continues while conditions hold; a later lull ends
+   * the window (we don't skip gaps — a discontinuous window isn't a single
+   * good-output run the crew can plan a deck trip around).
+   *
+   * @param {string} deviceId - Device ID
+   * @returns {number} Consecutive good-output hours from now (0 if none)
+   */
+  getGoodOutputHours(deviceId) {
+    if (this.lastForecast.length === 0) return 0;
+    const generator = this.mechanicalGenerators.find((g) => g.id === deviceId);
+    const array = this.solarArrays.find((a) => a.id === deviceId);
+
+    if (generator && generator.type === "wind") {
+      const maxWindKnots = generator.maxWindKnots ?? 30;
+      const minDeployWind = generator.startupSpeedKnots ?? 5;
+      let hours = 0;
+      for (const point of this.lastForecast) {
+        const gust = point.gustSpeedKnots ?? null;
+        const wind = point.windSpeedKnots ?? null;
+        if (
+          wind != null &&
+          wind >= minDeployWind &&
+          (gust == null || gust < maxWindKnots)
+        ) {
+          hours++;
+        } else {
+          break;
+        }
+      }
+      return hours;
+    }
+
+    if (array && array.type === "deployable") {
+      const gustLimit = array.gustLimitKnots ?? 20;
+      const pos = this.getSelfPath("navigation.position");
+      const lat = pos?.latitude ?? 0;
+      const lon = pos?.longitude ?? 0;
+      let hours = 0;
+      for (const point of this.lastForecast) {
+        const t = new Date(point.time);
+        const gust = point.gustSpeedKnots ?? 0;
+        const { altitude } = sunPosition(t, lat, lon);
+        if (altitude > 0 && gust < gustLimit) {
+          hours++;
+        } else {
+          break;
+        }
+      }
+      return hours;
+    }
+
+    // Hydro: good output while there's boat speed. Count hours with
+    // speedThroughWater above the generator's startup (default 0).
+    if (generator && generator.type === "hydro") {
+      const minSpeed = generator.startupSpeedKnots ?? 0;
+      let hours = 0;
+      for (const point of this.lastForecast) {
+        // Forecast doesn't carry speedThroughWater; use the current
+        // reading as a proxy for the near-term window.
+        const speed = this.getSpeedThroughWater() ?? 0;
+        if (speed >= minSpeed) {
+          hours++;
+        } else {
+          break;
+        }
+      }
+      return hours;
+    }
+
+    return 0;
+  }
+
+  /**
    * Computes a pointing recommendation (port/starboard) for a deployable solar array.
    *
    * During daytime (sun above horizon), side is based on the sun's current
@@ -1914,6 +2029,19 @@ class PredictionEngine {
               currentGustKnots: maxGust,
               limitKnots: maxWindKnots,
             });
+          } else if (this.wouldSolarFillBattery()) {
+            // Solar+hydro alone are projected to fill the battery —
+            // deploying the wind gen adds no useful energy, so skip the
+            // deck trip. Stow is the cheaper state (no drag, no wear).
+            recommendations.push({
+              id: generator.id,
+              name,
+              type: "wind",
+              recommendedState: "stowed",
+              reason: "solar already sufficient to fill the battery",
+              currentGustKnots: maxGust,
+              limitKnots: maxWindKnots,
+            });
           } else if (maxWind >= minDeployWind) {
             recommendations.push({
               id: generator.id,
@@ -1937,18 +2065,35 @@ class PredictionEngine {
       }
     }
 
-    return recommendations.map((rec) => ({
-      ...rec,
-      horizonHours: this.predictionHours,
-      missedYieldWh:
-        rec.recommendedState === "deployed"
-          ? this.getPotentialYieldWh(rec.id)
-          : 0,
-      recommendedStateTime: this.getRecommendedStateChangeTime(
-        rec.id,
-        rec.recommendedState,
-      ),
-    }));
+    return recommendations.map((rec) => {
+      const device =
+        this.solarArrays.find((a) => a.id === rec.id) ||
+        this.mechanicalGenerators.find((g) => g.id === rec.id);
+      return {
+        ...rec,
+        horizonHours: this.predictionHours,
+        missedYieldWh:
+          rec.recommendedState === "deployed"
+            ? this.getPotentialYieldWh(rec.id)
+            : 0,
+        recommendedStateTime: this.getRecommendedStateChangeTime(
+          rec.id,
+          rec.recommendedState,
+        ),
+        // Forecast good-output window (consecutive hours the source would
+        // produce well from now). Feeds the urgency reluctance gate for
+        // deploy suggestions: a short window caps at `low` for a
+        // high-reluctance source. 0 for stow recommendations (not used).
+        goodOutputHours:
+          rec.recommendedState === "deployed"
+            ? this.getGoodOutputHours(rec.id)
+            : 0,
+        // Per-device reluctance flows from the device config into urgency
+        // (#11/#12 cross-ref). Falls back to undefined so the urgency
+        // module's type-level default applies when unset.
+        reluctance: device?.reluctance,
+      };
+    });
   }
 
   /**
@@ -2651,10 +2796,7 @@ class PredictionEngine {
     // that as headroom so the absorption-tail energy isn't reported as
     // curtailed surplus (it's going into the bank, not being wasted).
     let surplusWh = 0;
-    let headroomWh = Math.max(
-      0,
-      (1.0 - fullHour.idealSoC) * capacityWh,
-    );
+    let headroomWh = Math.max(0, (1.0 - fullHour.idealSoC) * capacityWh);
     let lastIndex = fullHourIndex;
     let lastSurplusIndex = -1;
     for (let i = fullHourIndex; i < this.lastPrediction.length; i++) {

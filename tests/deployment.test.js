@@ -251,6 +251,52 @@ test.describe("Deployment recommendations: wind generators", () => {
     assert.strictEqual(rec.reason, "forecast wind 12kn (gusts 15kn)");
   });
 
+  test("stows wind generator when solar already fills the battery", () => {
+    // Wind is deployable and within range, but a solar array alone is
+    // projected to fill the battery over the horizon — deploying the
+    // wind gen adds no useful energy, so recommend stow to save the
+    // crew a deck trip.
+    const app = makeFakeApp();
+    app.setSelfPath("navigation.position", {
+      latitude: 60,
+      longitude: 18,
+    });
+    const engine = makePredictionEngine({
+      app,
+      solarArrays: [
+        {
+          id: "solar",
+          type: "fixed",
+          capacityWp: 1200,
+          // No azimuth/tilt tracking needed for the yield model
+        },
+      ],
+      generators: [
+        {
+          id: "windgen",
+          type: "wind",
+          deployable: true,
+          maxWindKnots: 30,
+          powerPath: "electrical.windgen.power",
+          manufacturerCurve: "5,10,10,50,15,100,20,150,25,200,30,250",
+        },
+      ],
+      navState: "moored",
+    });
+    // Start from a low-ish SoC so there's headroom to fill.
+    app.setSelfPath("electrical.batteries.house.capacity.stateOfCharge", 0.3);
+    engine.runPrediction(makeForecastWithGusts(15, 12));
+    assert.ok(
+      engine.wouldSolarFillBattery(),
+      "test preconditions: solar alone should fill the battery",
+    );
+    const rec = engine
+      .getDeploymentRecommendations()
+      .find((r) => r.id === "windgen");
+    assert.strictEqual(rec.recommendedState, "stowed");
+    assert.match(rec.reason, /solar already sufficient/);
+  });
+
   test("stows wind generator when wind too low", () => {
     const engine = makePredictionEngine({
       generators: [

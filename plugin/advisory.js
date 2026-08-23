@@ -9,6 +9,12 @@
 /** @typedef {import("@signalk/server-api").ServerAPI} ServerAPI */
 
 const { formatWh } = require("./format.js");
+const {
+  calculateUrgency,
+  urgencyToNotification,
+  Urgency,
+  StateConfidence,
+} = require("./urgency.js");
 
 /**
  * FLINsail deployment advisory states.
@@ -47,9 +53,89 @@ const PREDICTION_BASE = "electrical.energy.prediction";
 const NOTIFICATIONS_BASE = "notifications.electrical.energy";
 
 /**
+ * Formats a surplus-window endpoint as `HH:MM`, adding a day marker when
+ * it falls on a different day than the window start — a 26h window from
+ * 14:46 today to 16:46 tomorrow must not render as the ambiguous
+ * `14:46-16:46` (which reads as a 2h same-day span).
+ *
+ * @param {Date} when - Endpoint to format
+ * @param {Date} [start] - Window start, to detect a day rollover
+ * @returns {string}
+ */
+function formatWindowTime(when, start) {
+  const hm = when.toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    hour12: false,
+  });
+  if (start == null || when.toDateString() === start.toDateString()) {
+    return hm;
+  }
+  const tomorrow = new Date(start);
+  tomorrow.setDate(tomorrow.getDate() + 1);
+  if (when.toDateString() === tomorrow.toDateString()) {
+    return `${hm}+1`;
+  }
+  return `${hm} ${when.toLocaleDateString([], {
+    month: "short",
+    day: "numeric",
+  })}`;
+}
+
+/**
  * Minimum time between notifications for the same system (milliseconds).
  */
 const DEBOUNCE_MS = 5 * 60 * 1000; // 5 minutes
+
+/**
+ * Computes the severity ratio (`currentValue / limit`) for a deployment
+ * recommendation. For gust-driven recommendations (FLINsail, wind gen) it is
+ * `currentGustKnots / limitKnots`; for hydro (speed-driven) it is
+ * `currentSpeedKnots / limitKnots`. Returns null when neither a current
+ * reading nor a limit is present (no intensity evidence).
+ *
+ * @param {object} rec - Deployment recommendation
+ * @returns {number|null}
+ */
+function severityRatioFor(rec) {
+  const limit = rec.limitKnots;
+  if (limit == null || limit <= 0) return null;
+  const current =
+    rec.currentGustKnots != null ? rec.currentGustKnots : rec.currentSpeedKnots;
+  if (current == null) return null;
+  return current / limit;
+}
+
+/**
+ * Converts a future recommended-state-change time into hours from now.
+ * A `null` time means "change now" (per the advisory contract), which
+ * maps to 0 hours (maximum time score). A past time also maps to 0.
+ * Returns null only when the value is unparseable.
+ *
+ * @param {Date|string|number|null} when
+ * @returns {number|null}
+ */
+function hoursUntil(when) {
+  if (when == null) return 0;
+  const t = when instanceof Date ? when.getTime() : new Date(when).getTime();
+  if (Number.isNaN(t)) return null;
+  const diff = (t - Date.now()) / (60 * 60 * 1000);
+  return diff > 0 ? diff : 0;
+}
+
+/**
+ * Whether a recommendation's triggering condition is happening now (actual)
+ * versus forecast. We treat it as actual when there is a *current* reading
+ * already at or above the limit (e.g. gusts already hitting the limit), and
+ * forecast otherwise (the condition is expected later).
+ *
+ * @param {object} rec - Deployment recommendation
+ * @returns {boolean}
+ */
+function isActualCondition(rec) {
+  const ratio = severityRatioFor(rec);
+  return ratio != null && ratio >= 1;
+}
 
 /**
  * Advisory publisher.
@@ -349,12 +435,18 @@ class AdvisoryPublisher {
    * Publishes or clears a notification with debouncing.
    *
    * @param {string} type - Advisory/notification type
-   * @param {string} state - "normal", "alert", or "warn"
+   * @param {string} state - "normal", "alert", "warn", "alarm"
    * @param {string} message - Human-readable message
-   * @param {boolean} [force=false] - Force notification even if debounced
+   * @param {object} [opts]
+   * @param {boolean} [opts.force=false] - Force notification even if
+   *        debounced
+   * @param {string[]} [opts.methods] - Notification methods (e.g.
+   *        `["visual", "sound"]`). Defaults to `["visual", "sound"]` for
+   *        active states; `[]` for `normal`.
    * @returns {void}
    */
-  publishNotification(type, state, message, force = false) {
+  publishNotification(type, state, message, opts = {}) {
+    const { force = false, methods } = opts;
     const path = `${NOTIFICATIONS_BASE}.${type}`;
     const now = new Date().toISOString();
 
@@ -390,7 +482,7 @@ class AdvisoryPublisher {
       this.publishDelta({
         [path]: {
           state,
-          method: ["visual", "sound"],
+          method: methods ?? ["visual", "sound"],
           message,
           timestamp: now,
         },
@@ -416,11 +508,30 @@ class AdvisoryPublisher {
    * Publishes the recommended state as a delta value, and sends a notification
    * only if the current state differs from the recommended state.
    *
-   * @param {Array<{id: string, name: string, type: string, recommendedState: string, reason: string}>} recommendations - Deployment recommendations
-   * @param {Map<string, string|null>} currentStates - Map of device ID to current state (deployed/stowed/null)
+   * Urgency (and thus the Signal K notification state + methods) is computed
+   * via {@link module:urgency~calculateUrgency} from the recommendation's
+   * severity ratio, time-to-action, duration, detected state, and state
+   * confidence, then mapped through the day/night and navigation-state
+   * rules in {@link module:urgency~urgencyToNotification}.
+   *
+   * @param {Array<object>} recommendations - Deployment recommendations
+   * @param {Map<string, string|null>} currentStates - Map of device ID to
+   *        current state (deployed/stowed/null)
+   * @param {object} [opts]
+   * @param {boolean} [opts.isNight=false] - Whether it is currently nighttime
+   * @param {boolean} [opts.isUnderway=false] - Whether the vessel is under way
+   * @param {Map<string, number>} [opts.confidences] - Map of device ID to
+   *        StateConfidence value (defaults to HIGH)
+   * @param {object} [opts.urgencyConfig] - Urgency config override
    * @returns {void}
    */
-  publishDeploymentStates(recommendations, currentStates) {
+  publishDeploymentStates(recommendations, currentStates, opts = {}) {
+    const {
+      isNight = false,
+      isUnderway = false,
+      confidences,
+      urgencyConfig,
+    } = opts;
     const updates = {};
 
     for (const rec of recommendations) {
@@ -444,6 +555,7 @@ class AdvisoryPublisher {
 
       // Check current state to decide if notification is needed
       const currentState = currentStates.get(rec.id) ?? null;
+      const confidence = confidences?.get(rec.id) ?? StateConfidence.HIGH;
       const needsChange =
         currentState !== null && currentState !== rec.recommendedState;
 
@@ -456,15 +568,51 @@ class AdvisoryPublisher {
 
       if (needsChange) {
         const action = rec.recommendedState === "deployed" ? "Deploy" : "Stow";
-        const state =
-          rec.recommendedState === "deployed"
-            ? DeployState.WARN
-            : DeployState.ALERT;
-        this.publishNotification(
-          `deploy_${rec.id}`,
-          state,
-          `${rec.name}: ${action} now, ${rec.reason}${yieldSuffix}`,
-        );
+        // For a deploy suggestion, the "duration" feeding the urgency
+        // duration gate is the forecast good-output window (the crew is
+        // deciding whether the window is long enough to justify the deck
+        // trip). For a stow recommendation, duration is about how long the
+        // over-limit condition has persisted (an actual-event signal we
+        // don't track per-recommendation yet — pass null so the sustained
+        // default applies).
+        const eventDurationMinutes =
+          rec.recommendedState === "deployed" && rec.goodOutputHours != null
+            ? rec.goodOutputHours * 60
+            : null;
+        let urgency = calculateUrgency({
+          severityRatio: severityRatioFor(rec),
+          timeToActionHours: hoursUntil(rec.recommendedStateTime),
+          isActual: isActualCondition(rec),
+          advisoryType: "deployable",
+          detectedState: currentState,
+          recommendedState: rec.recommendedState,
+          stateConfidence: confidence,
+          deployableType: rec.type,
+          reluctance: rec.reluctance,
+          eventDurationMinutes,
+          config: urgencyConfig,
+        });
+        // A detected/recommended mismatch always warrants at least an
+        // informational alert so the crew knows a state change is advised.
+        // Reluctance and confidence can dampen the *level* (toward visual/
+        // info) but should not suppress the notification entirely (that
+        // would read as "all clear").
+        if (urgency === Urgency.NORMAL) urgency = Urgency.INFO;
+        const notif = urgencyToNotification(urgency, {
+          isNight,
+          advisoryType: "deployable",
+          isUnderway,
+        });
+        // null = held for the morning (at-rest + night + low urgency):
+        // skip publishing entirely so the last notification stands.
+        if (notif != null) {
+          this.publishNotification(
+            `deploy_${rec.id}`,
+            notif.state,
+            `${rec.name}: ${action} now, ${rec.reason}${yieldSuffix}`,
+            { methods: notif.methods },
+          );
+        }
       } else {
         // State matches or unknown - clear any existing notification
         this.publishNotification(
@@ -501,15 +649,42 @@ class AdvisoryPublisher {
   /**
    * Publishes drag reduction advisory (stowage when sufficient solar forecast).
    *
+   * Urgency is time-driven (the stowage opportunity is hours away) and
+   * capped at `medium` — it's a fuel/drag saving opportunity, not a safety
+   * matter. At rest + night + low urgency it's held for the morning.
+   *
    * @param {{hour: number, reason: string}|null} opportunity - Stowage opportunity from prediction engine
+   * @param {object} [opts]
+   * @param {boolean} [opts.isNight=false] - Whether it is currently nighttime
+   * @param {boolean} [opts.isUnderway=false] - Whether the vessel is under way
+   * @param {object} [opts.urgencyConfig] - Urgency config override
    * @returns {void}
    */
-  publishDragReductionAdvisory(opportunity) {
+  publishDragReductionAdvisory(opportunity, opts = {}) {
     const type = AdvisoryType.STOW_SOON;
 
     if (opportunity) {
       const message = `Stow mechanical generators in ${opportunity.hour}h to reduce drag - ${opportunity.reason}`;
-      this.publishNotification(type, DeployState.WARN, message);
+      let urgency = calculateUrgency({
+        advisoryType: "opportunity",
+        timeToActionHours: opportunity.hour,
+        isActual: false,
+        config: opts.urgencyConfig,
+      });
+      // A real stowage opportunity always warrants at least an info alert.
+      if (urgency === Urgency.NORMAL) urgency = Urgency.INFO;
+      const notif = urgencyToNotification(urgency, {
+        isNight: opts.isNight ?? false,
+        isUnderway: opts.isUnderway ?? false,
+        advisoryType: "opportunity",
+      });
+      // null = held for the morning (at-rest + night + low urgency):
+      // skip publishing so the last notification stands.
+      if (notif != null) {
+        this.publishNotification(type, notif.state, message, {
+          methods: notif.methods,
+        });
+      }
     } else {
       this.publishNotification(
         type,
@@ -522,10 +697,23 @@ class AdvisoryPublisher {
   /**
    * Publishes engine run advisory when battery depletion is projected.
    *
+   * Urgency is computed from the current battery SoC and the hours until
+   * the optimal window closes (the latest sensible start time), then
+   * mapped through the day/night method table. Battery `alarm`/`high`
+   * (<1h to empty) sound even at night — the boat going dark is urgent
+   * regardless of time.
+   *
    * @param {{hours: number, optimalWindow: {start: Date, end: Date}}|null} runTime - Engine run time calculation
+   * @param {object} [opts]
+   * @param {number} [opts.batterySoC] - Current battery SoC [0–1]
+   * @param {boolean} [opts.isNight=false] - Whether it is currently nighttime
+   * @param {boolean} [opts.isUnderway=false] - Whether the vessel is
+   *        under way (at-rest + night holds low-urgency "run the genset"
+   *        suggestions for the morning; battery alarm/high always emit)
+   * @param {object} [opts.urgencyConfig] - Urgency config override
    * @returns {void}
    */
-  publishEngineRunAdvisory(runTime) {
+  publishEngineRunAdvisory(runTime, opts = {}) {
     const type = AdvisoryType.ENGINE_RUN;
 
     if (runTime) {
@@ -541,7 +729,26 @@ class AdvisoryPublisher {
         hour12: false,
       });
       const message = `Run engine for ${hours}h between ${start}-${end} to avoid low battery`;
-      this.publishNotification(type, DeployState.WARN, message);
+      const urgency = calculateUrgency({
+        advisoryType: "engine",
+        batterySoC: opts.batterySoC ?? null,
+        timeToActionHours: hoursUntil(runTime.optimalWindow.end),
+        isActual: false,
+        config: opts.urgencyConfig,
+      });
+      const notif = urgencyToNotification(urgency, {
+        isNight: opts.isNight ?? false,
+        isUnderway: opts.isUnderway ?? false,
+        advisoryType: "engine",
+      });
+      // null = held for the morning (at-rest + night + low urgency):
+      // skip so the last notification stands. Battery alarm/high never
+      // hit this path (they're medium+ and always emit, with sound).
+      if (notif != null) {
+        this.publishNotification(type, notif.state, message, {
+          methods: notif.methods,
+        });
+      }
     } else {
       this.publishNotification(
         type,
@@ -601,26 +808,28 @@ class AdvisoryPublisher {
    * curtail energy that could instead run opportunistic loads (watermaker,
    * ice maker, …). Includes the classic motoring side-effect case.
    *
+   * Urgency is time-driven (the surplus window is hours away) and capped
+   * at `medium` — it's a gain from acting, not a safety matter. At rest +
+   * night + low urgency it's held for the morning (the window is daytime
+   * anyway, since the prediction engine already suppresses nighttime
+   * surplus windows at rest).
+   *
    * @param {{surplusWh: number, from: Date, to: Date, suggestedLoadW: number}|null} opportunity -
    *        Surplus window from findSurplusOpportunity, or null to clear
    * @param {Array<{name: string, watts: number}>} [opportunisticLoads] -
    *        Configured loads used to suggest uses for the surplus
+   * @param {object} [opts]
+   * @param {boolean} [opts.isNight=false] - Whether it is currently nighttime
+   * @param {boolean} [opts.isUnderway=false] - Whether the vessel is under way
+   * @param {object} [opts.urgencyConfig] - Urgency config override
    * @returns {void}
    */
-  publishSurplusAdvisory(opportunity, opportunisticLoads = []) {
+  publishSurplusAdvisory(opportunity, opportunisticLoads = [], opts = {}) {
     const type = AdvisoryType.SURPLUS_OPPORTUNITY;
 
     if (opportunity) {
-      const from = opportunity.from.toLocaleTimeString([], {
-        hour: "2-digit",
-        minute: "2-digit",
-        hour12: false,
-      });
-      const to = opportunity.to.toLocaleTimeString([], {
-        hour: "2-digit",
-        minute: "2-digit",
-        hour12: false,
-      });
+      const from = formatWindowTime(opportunity.from);
+      const to = formatWindowTime(opportunity.to, opportunity.from);
       let message = `${formatWh(opportunity.surplusWh)} surplus available ${from}-${to}`;
       if (opportunity.suggestedLoadW > 0) {
         message += ` (~${opportunity.suggestedLoadW}W sustained)`;
@@ -644,7 +853,33 @@ class AdvisoryPublisher {
           .join(", ");
         message += `: ${suggestions}`;
       }
-      this.publishNotification(type, DeployState.WARN, message);
+      let urgency = calculateUrgency({
+        advisoryType: "opportunity",
+        timeToActionHours: hoursUntil(opportunity.from),
+        isActual: false,
+        config: opts.urgencyConfig,
+      });
+      // A real surplus opportunity always warrants at least an
+      // informational alert (far-future windows would otherwise compute
+      // to normal and read as "all clear"). The time score only dampens
+      // the *level* toward visual/info; it never suppresses the
+      // notification entirely.
+      if (urgency === Urgency.NORMAL) urgency = Urgency.INFO;
+      const notif = urgencyToNotification(urgency, {
+        isNight: opts.isNight ?? false,
+        isUnderway: opts.isUnderway ?? false,
+        advisoryType: "opportunity",
+      });
+      // null = held for the morning (at-rest + night + low urgency):
+      // skip the notification so the last one stands. Still publish the
+      // surplus Wh/window deltas — those are data, not a nudge, and
+      // consumers (dashboards) want them regardless of whether the crew
+      // is being nudged right now.
+      if (notif != null) {
+        this.publishNotification(type, notif.state, message, {
+          methods: notif.methods,
+        });
+      }
       // Also expose the value as a delta so consumers can act without
       // parsing the notification.
       this.publishDelta({
@@ -677,6 +912,11 @@ class AdvisoryPublisher {
    * @param {{hours: number, optimalWindow: {start: Date, end: Date}}|null} params.engineRunTime - Engine run time
    * @param {Array<{id: string, name: string, type: string, recommendedState: string, reason: string}>} params.deploymentRecommendations - Deployment recommendations
    * @param {Map<string, string|null>} params.currentDeployStates - Map of device ID to current state
+   * @param {boolean} [params.isNight=false] - Whether it is currently nighttime
+   * @param {boolean} [params.isUnderway=false] - Whether the vessel is under way
+   * @param {Map<string, number>} [params.deployConfidences] - Map of device ID to StateConfidence
+   * @param {number} [params.batterySoC] - Current battery SoC [0–1]
+   * @param {object} [params.urgencyConfig] - Urgency config override
    * @returns {void}
    */
   publishAll({
@@ -689,6 +929,11 @@ class AdvisoryPublisher {
     opportunisticLoads = [],
     deploymentRecommendations = [],
     currentDeployStates = new Map(),
+    isNight = false,
+    isUnderway = false,
+    deployConfidences,
+    batterySoC,
+    urgencyConfig,
   }) {
     this.app.debug(
       `Publishing advisories for ${hourlyForecast.length} forecast hours`,
@@ -702,17 +947,36 @@ class AdvisoryPublisher {
     this.publishDeploymentStates(
       deploymentRecommendations,
       currentDeployStates,
+      {
+        isNight,
+        isUnderway,
+        confidences: deployConfidences,
+        urgencyConfig,
+      },
     );
 
     // Publish drag reduction advisory
-    this.publishDragReductionAdvisory(stowageOpportunity);
+    this.publishDragReductionAdvisory(stowageOpportunity, {
+      isNight,
+      isUnderway,
+      urgencyConfig,
+    });
 
     // Publish engine run advisory
-    this.publishEngineRunAdvisory(engineRunTime);
+    this.publishEngineRunAdvisory(engineRunTime, {
+      batterySoC,
+      isNight,
+      isUnderway,
+      urgencyConfig,
+    });
 
     // Publish surplus opportunity advisory (battery full while yield
     // continues — watermaker/ice-maker case; motoring side-effect)
-    this.publishSurplusAdvisory(surplusOpportunity, opportunisticLoads);
+    this.publishSurplusAdvisory(surplusOpportunity, opportunisticLoads, {
+      isNight,
+      isUnderway,
+      urgencyConfig,
+    });
 
     this.app.debug(
       `Advisories published: ${this.activeNotifications.size} active notifications`,
@@ -747,4 +1011,7 @@ module.exports = {
   PREDICTION_BASE,
   NOTIFICATIONS_BASE,
   DEBOUNCE_MS,
+  severityRatioFor,
+  hoursUntil,
+  isActualCondition,
 };

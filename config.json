@@ -122,6 +122,21 @@
             "minimum": 0,
             "maximum": 10
           },
+          "reluctance": {
+            "type": "string",
+            "title": "Reluctance to deploy",
+            "description": "How willing the crew is to deploy/stow this source. Low: deploy even for an hour of output. Medium: deploy when a couple hours of output are available. High: deploy only when you can get most of a day of output. Leave blank to use the type default (FLINsail arrays are typically Medium).",
+            "enum": [
+              "low",
+              "medium",
+              "high"
+            ],
+            "enumNames": {
+              "low": "Low — deploy even for an hour of output",
+              "medium": "Medium — deploy for a couple hours of output",
+              "high": "High — deploy only for most of a day of output"
+            }
+          },
           "hardwareEpochs": {
             "type": "array",
             "title": "Hardware Epochs",
@@ -211,6 +226,21 @@
             "title": "Deployable at mooring",
             "description": "Whether this wind generator can be deployed while moored (some vessels cannot due to proximity to dock or other boats). When false, the generator is predicted stowed at moored and only deployed at anchor.",
             "default": true
+          },
+          "reluctance": {
+            "type": "string",
+            "title": "Reluctance to deploy",
+            "description": "How willing the crew is to deploy/stow this generator. Low: deploy even for an hour of output. Medium: deploy when a couple hours of output are available. High: deploy only when you can get most of a day of output. Leave blank to use the type default (hydro generators are typically Low; wind generators typically High).",
+            "enum": [
+              "low",
+              "medium",
+              "high"
+            ],
+            "enumNames": {
+              "low": "Low — deploy even for an hour of output",
+              "medium": "Medium — deploy for a couple hours of output",
+              "high": "High — deploy only for most of a day of output"
+            }
           },
           "maxWindKnots": {
             "type": "number",
@@ -579,6 +609,142 @@
               "name",
               "watts"
             ]
+          }
+        }
+      }
+    },
+    "notification": {
+      "type": "object",
+      "title": "Notification Urgency",
+      "description": "Multi-level notification urgency. Maps deploy/stow and battery advisories to Signal K notification states (alert/warn/alarm) and methods (visual/sound) based on intensity, time-to-action, event duration, and how confident we are about the detected deployment state. The urgency ladder (info→low→medium→high) is designed to prevent ever reaching alarm, which is reserved for vessel-safety-compromised situations (e.g. battery about to cut off nav lights/AIS/VHF)",
+      "properties": {
+        "urgency": {
+          "type": "object",
+          "title": "Urgency Tuning",
+          "description": "Override the urgency calculation knobs. Defaults are sensible for most vessels; leave a field blank to keep its default",
+          "properties": {
+            "weights": {
+              "type": "object",
+              "title": "Score Weights",
+              "properties": {
+                "intensity": {
+                  "type": "number",
+                  "title": "Intensity weight",
+                  "default": 0.4,
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "time": {
+                  "type": "number",
+                  "title": "Time-to-action weight",
+                  "default": 0.6,
+                  "minimum": 0,
+                  "maximum": 1
+                }
+              }
+            },
+            "thresholds": {
+              "type": "object",
+              "title": "Urgency Thresholds",
+              "description": "Score boundaries mapping to each urgency level",
+              "properties": {
+                "normal": {
+                  "type": "number",
+                  "default": 0.1,
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "info": {
+                  "type": "number",
+                  "default": 0.3,
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "low": {
+                  "type": "number",
+                  "default": 0.5,
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "medium": {
+                  "type": "number",
+                  "default": 0.7,
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "high": {
+                  "type": "number",
+                  "default": 0.85,
+                  "minimum": 0,
+                  "maximum": 1
+                }
+              }
+            },
+            "batterySoCTiers": {
+              "type": "object",
+              "title": "Battery SoC Tiers",
+              "description": "SoC fractions (0-1) at which each urgency level kicks in for engine/battery advisories",
+              "properties": {
+                "alarm": {
+                  "type": "number",
+                  "default": 0.1,
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "high": {
+                  "type": "number",
+                  "default": 0.2,
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "medium": {
+                  "type": "number",
+                  "default": 0.35,
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "low": {
+                  "type": "number",
+                  "default": 0.5,
+                  "minimum": 0,
+                  "maximum": 1
+                },
+                "info": {
+                  "type": "number",
+                  "default": 0.65,
+                  "minimum": 0,
+                  "maximum": 1
+                }
+              }
+            },
+            "minGoodOutputHoursByType": {
+              "type": "object",
+              "title": "Per-Deployable Reluctance (minimum good-output hours)",
+              "description": "Default minimum good-output hours to justify deploying each deployable type — the reluctance gate. A short forecast window caps a deploy suggestion at Low (visual, no sound). Hydro is Low (1h), FLINsail is Medium (2h), wind generators are High (8h). A per-device reluctance pulldown overrides these.",
+              "properties": {
+                "hydro": {
+                  "type": "number",
+                  "default": 1,
+                  "minimum": 0.25,
+                  "maximum": 24,
+                  "title": "Hydro — hours"
+                },
+                "solar-deployable": {
+                  "type": "number",
+                  "default": 2,
+                  "minimum": 0.25,
+                  "maximum": 24,
+                  "title": "FLINsail — hours"
+                },
+                "wind": {
+                  "type": "number",
+                  "default": 8,
+                  "minimum": 0.25,
+                  "maximum": 24,
+                  "title": "Wind — hours"
+                }
+              }
+            }
           }
         }
       }
