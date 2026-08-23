@@ -818,6 +818,10 @@ class PredictionEngine {
    * @param {object[]} params.mechanicalGenerators - Wind/hydro generator configurations
    * @param {(arrayId: string, isSailing: boolean, azimuth: number, elevation: number, awa?: number) => number} getEfficiency - Function to get efficiency from learning matrix
    * @param {(path: string) => unknown} getSelfPath - Function to read Signal K values
+   * @param {(forecastSpeedKnots: number, forecastGustKnots: number|null, windDirectionDeg: number, sunElevationRad: number) => {speed: number, gust: number}|null} [params.getWindProtection] -
+   *   Returns the WPF-corrected wind/gusts at device height for the current
+   *   place, or null for "no correction" (under way, unknown place, or no
+   *   learned factor). When null, the forecast values pass through unchanged.
    * @param {number} [params.predictionHours] - Prediction horizon in hours
    *   (24–168; from `weather.forecastHours`, defaults to 24)
    */
@@ -827,9 +831,11 @@ class PredictionEngine {
     mechanicalGenerators,
     getEfficiency,
     getSelfPath,
+    getWindProtection,
     getDisplayName,
     app,
     loadProfileConfig,
+    windProtectionConfig,
     predictionHours,
   }) {
     this.battery = battery;
@@ -837,6 +843,8 @@ class PredictionEngine {
     this.mechanicalGenerators = mechanicalGenerators;
     this.getEfficiency = getEfficiency;
     this.getSelfPath = getSelfPath;
+    this.getWindProtection = getWindProtection || (() => null);
+    this.windProtectionConfig = windProtectionConfig || {};
     this.getDisplayName =
       getDisplayName || ((config) => config.name || config.id);
     this.app = app;
@@ -975,7 +983,11 @@ class PredictionEngine {
    */
   getNavState() {
     const state = this.getSelfPath("navigation.state");
-    return state || "unknown";
+    // Signal K may deliver either a bare string (from deltaState) or a
+    // wrapped value object (from app.getSelfPath). Unwrap and coerce:
+    // an empty string or null/undefined means "no state known".
+    const v = state && typeof state === "object" ? state.value : state;
+    return v || "unknown";
   }
 
   /**
@@ -1031,6 +1043,57 @@ class PredictionEngine {
     return this.lastPrediction.reduce((max, p) => {
       return Math.max(max, p.windSpeedKnots ?? 0);
     }, 0);
+  }
+
+  /**
+   * Applies the Wind Protection Factor to a single forecast point, returning
+   * a copy with wind/gusts corrected for the current place.
+   *
+   * At rest at a learned place, the forecast wind speed and gust are scaled
+   * by the learned factor (per place and wind-direction sector; gusts also
+   * per day/night) at the 10 m reference, then translated down to device
+   * height. Under way, unknown place, missing position, or unlearned bins,
+   * the point passes through unchanged.
+   *
+   * Wind direction is preserved as-is: the WPF factor is selected *by*
+   * direction but does not rotate it.
+   *
+   * @param {object} fp - Forecast point with time/windSpeedKnots/gustSpeedKnots/windDirectionDeg
+   * @param {number} latitude - Vessel latitude (degrees)
+   * @param {number} longitude - Vessel longitude (degrees)
+   * @returns {object} Corrected forecast point (shallow copy)
+   */
+  applyWindProtection(fp, latitude, longitude) {
+    const rawSpeed = fp.windSpeedKnots ?? null;
+    const rawGust = fp.gustSpeedKnots ?? null;
+    const dirDeg = fp.windDirectionDeg ?? null;
+
+    if (
+      rawSpeed == null ||
+      dirDeg == null ||
+      latitude == null ||
+      longitude == null
+    ) {
+      return fp;
+    }
+
+    const { sunPosition } = require("./solar.js");
+    const sunPos = sunPosition(fp.time, latitude, longitude);
+    const corrected = this.getWindProtection(
+      rawSpeed,
+      rawGust,
+      dirDeg,
+      sunPos.altitude,
+    );
+    if (!corrected) {
+      return fp;
+    }
+
+    return {
+      ...fp,
+      windSpeedKnots: corrected.speed,
+      gustSpeedKnots: corrected.gust ?? rawGust,
+    };
   }
 
   /**
@@ -1589,12 +1652,31 @@ class PredictionEngine {
     const maxGust = this.getMaxForecastGust();
     const maxWind = this.getMaxForecastWind();
 
-    // FLINsail (deployable solar arrays)
+    // FLINsail (deployable solar arrays). The current recommendedState is
+    // the *current hour's* ideal state (from computeDeployableSolarStates,
+    // which uses the WPF-corrected current gust and the night-block max),
+    // NOT the max over the whole forecast window — otherwise a gust spike
+    // 18h from now would say "stow now" even though it's clear right now.
+    // When the state should change later, recommendedStateTime (computed
+    // below) carries the future timestamp.
+    const currentSolarStates =
+      this.lastPrediction.length > 0
+        ? this.computeDeployableSolarStates(
+            this.lastForecast,
+            this.getSelfPath("navigation.position")?.latitude ?? 0,
+            this.getSelfPath("navigation.position")?.longitude ?? 0,
+            this.lastPrediction[0].time,
+            1,
+            underway,
+          )
+        : null;
+
     for (const array of this.solarArrays) {
       if (array.type !== "deployable") continue;
 
       const name = this.getDisplayName(array);
       const gustLimit = array.gustLimitKnots ?? 20;
+      const currentGust = this.getCurrentGustKnots() ?? 0;
 
       if (underway) {
         // FLINsail is always stowed when underway
@@ -1604,46 +1686,57 @@ class PredictionEngine {
           type: "solar-deployable",
           recommendedState: "stowed",
           reason: "vessel under way",
-          recommendedSide: null,
-          recommendedSideTime: null,
-        });
-      } else if (maxGust >= gustLimit) {
-        recommendations.push({
-          id: array.id,
-          name,
-          type: "solar-deployable",
-          recommendedState: "stowed",
-          reason: `forecast gusts ${Math.round(maxGust)}kn exceed limit of ${gustLimit}kn`,
-          currentGustKnots: maxGust,
+          currentGustKnots: currentGust,
           limitKnots: gustLimit,
           recommendedSide: null,
           recommendedSideTime: null,
         });
       } else {
-        // Deployed - compute pointing recommendation (port/starboard)
-        const pointing = this.getPointingRecommendation(array);
-        let reason =
-          maxGust > 0
-            ? `forecast gusts ${Math.round(maxGust)}kn below limit of ${gustLimit}kn`
-            : "no significant gusts forecast";
-        if (pointing) {
-          if (pointing.side) {
-            reason += `. ${pointing.reason}`;
-          } else if (pointing.reason) {
-            reason += `. ${pointing.reason}`;
+        // Current hour's ideal state (accounts for WPF + night block)
+        const currentState =
+          currentSolarStates?.[0]?.get(array.id) ??
+          (currentGust >= gustLimit
+            ? { state: "stowed", reason: `forecast gusts ${Math.round(currentGust)}kn ≥ limit ${gustLimit}kn` }
+            : { state: "deployed", reason: `forecast gusts ${Math.round(currentGust)}kn < limit ${gustLimit}kn` });
+
+        if (currentState.state === "stowed") {
+          recommendations.push({
+            id: array.id,
+            name,
+            type: "solar-deployable",
+            recommendedState: "stowed",
+            reason: currentState.reason,
+            currentGustKnots: currentGust,
+            limitKnots: gustLimit,
+            recommendedSide: null,
+            recommendedSideTime: null,
+          });
+        } else {
+          // Deployed - compute pointing recommendation (port/starboard)
+          const pointing = this.getPointingRecommendation(array);
+          let reason =
+            currentGust > 0
+              ? `forecast gusts ${Math.round(currentGust)}kn below limit of ${gustLimit}kn`
+              : "no significant gusts forecast";
+          if (pointing) {
+            if (pointing.side) {
+              reason += `. ${pointing.reason}`;
+            } else if (pointing.reason) {
+              reason += `. ${pointing.reason}`;
+            }
           }
+          recommendations.push({
+            id: array.id,
+            name,
+            type: "solar-deployable",
+            recommendedState: "deployed",
+            reason,
+            currentGustKnots: currentGust,
+            limitKnots: gustLimit,
+            recommendedSide: pointing?.side ?? null,
+            recommendedSideTime: pointing?.targetTime ?? null,
+          });
         }
-        recommendations.push({
-          id: array.id,
-          name,
-          type: "solar-deployable",
-          recommendedState: "deployed",
-          reason,
-          currentGustKnots: maxGust,
-          limitKnots: gustLimit,
-          recommendedSide: pointing?.side ?? null,
-          recommendedSideTime: pointing?.targetTime ?? null,
-        });
       }
     }
 
@@ -1856,9 +1949,24 @@ class PredictionEngine {
     const startTime = new Date(Date.now());
     // Track previous hour's ideal states to emit actions only on change
     let prevIdealStates = new Map();
+
+    // Apply the Wind Protection Factor to forecast wind/gusts for the
+    // current place before anything consumes them. This is done once,
+    // here, so every downstream consumer (predictSolarHour gust gate,
+    // predictWindHour curve + max-wind gate, getHourlyActions,
+    // computeDeployableSolarStates, getDeploymentRecommendations,
+    // getRecommendedStateChangeTime, getPotentialYield) sees consistent
+    // corrected values. At rest at a learned place the wind/gusts are
+    // scaled at the 10 m reference and translated down to device height;
+    // under way, unknown place, or unlearned bins pass through unchanged
+    // (getWindProtection returns null).
+    const correctedForecast = forecast.map((fp) =>
+      this.applyWindProtection(fp, latitude, longitude),
+    );
+
     // Deployable solar states with sunrise/sunset-aware night handling
     const solarStatesPerHour = this.computeDeployableSolarStates(
-      forecast,
+      correctedForecast,
       latitude,
       longitude,
       startTime,
@@ -1870,16 +1978,34 @@ class PredictionEngine {
     for (let h = 0; h < this.predictionHours; h++) {
       const time = new Date(startTime.getTime() + h * 3600000);
 
-      // Find corresponding forecast point
-      const forecastPoint = forecast.find((fp) => {
+      // Find corresponding forecast point (use the WPF-corrected forecast
+      // so gates and curves see device-height corrected wind)
+      const forecastPoint = correctedForecast.find((fp) => {
         const diff = Math.abs(fp.time.getTime() - time.getTime());
         return diff < 1800000; // Within 30 minutes
+      });
+      // Raw (pre-WPF) forecast point, so the hourly forecast can show
+      // both the original forecast wind/gusts and the WPF-corrected values
+      // that actually drive the gates and curves.
+      const rawPoint = forecast.find((fp) => {
+        const diff = Math.abs(fp.time.getTime() - time.getTime());
+        return diff < 1800000;
       });
 
       const ghi = forecastPoint?.ghi ?? 0;
       const cloudCover = forecastPoint?.cloudCover ?? 0;
       const windGustKnots = forecastPoint?.gustSpeedKnots ?? 0;
       const windSpeedKnots = forecastPoint?.windSpeedKnots ?? 0;
+      const forecastWindSpeedKnots =
+        rawPoint?.windSpeedKnots != null
+          ? Math.round((rawPoint.windSpeedKnots || 0) * 10) / 10
+          : null;
+      const forecastGustKnots =
+        rawPoint?.gustSpeedKnots != null
+          ? Math.round((rawPoint.gustSpeedKnots || 0) * 10) / 10
+          : null;
+      const windDirectionDeg =
+        rawPoint?.windDirectionDeg ?? forecastPoint?.windDirectionDeg ?? null;
 
       // Get sun position
       const sunPos = sunPosition(time, latitude, longitude);
@@ -2054,6 +2180,9 @@ class PredictionEngine {
         detectedSoC: Math.round(detectedRunningSoC * 1000) / 1000,
         gustSpeedKnots: Math.round((windGustKnots || 0) * 10) / 10,
         windSpeedKnots: Math.round((windSpeedKnots || 0) * 10) / 10,
+        forecastWindSpeedKnots,
+        forecastGustKnots,
+        windDirectionDeg,
         actions,
       });
     }
@@ -2063,7 +2192,7 @@ class PredictionEngine {
     this.shiftSolarActionsToSunBoundaries(predictions, latitude, longitude);
 
     this.lastPrediction = predictions;
-    this.lastForecast = forecast;
+    this.lastForecast = correctedForecast;
     return predictions;
   }
 
@@ -2278,6 +2407,11 @@ class PredictionEngine {
       detectedYieldWh: Math.round(p.detectedYieldWh),
       detectedNetWh: Math.round(p.detectedNetWh),
       detectedSoC: Math.round(p.detectedSoC * 1000) / 1000,
+      windSpeedKnots: p.windSpeedKnots,
+      gustSpeedKnots: p.gustSpeedKnots,
+      forecastWindSpeedKnots: p.forecastWindSpeedKnots,
+      forecastGustKnots: p.forecastGustKnots,
+      windDirectionDeg: p.windDirectionDeg,
       actions: p.actions,
     }));
   }

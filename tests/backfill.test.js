@@ -17,6 +17,7 @@ const {
   replayHistory,
   replayGenerators,
   replayLoadProfile,
+  replayWindProtection,
   backfillSamples,
   populateFromHistory,
   historyHeaders,
@@ -1047,5 +1048,334 @@ test.describe("queryHistory", () => {
       !pathsParam.includes("speedThroughWater:last"),
       "numeric path must not get :last",
     );
+  });
+});
+
+test.describe("replayWindProtection", () => {
+  test("learns speed + gust factors from at-rest history (gust = speed max)", () => {
+    // There is no environment.wind.gust sensor; the measured gust is the
+    // max of true wind speed over the bucket (History API :max).
+    const historyData = {
+      values: [
+        { path: "navigation.state", method: "last" },
+        { path: "navigation.speedThroughWater" },
+        { path: "environment.wind.speedTrue" },
+        { path: "environment.wind.speedTrue", method: "max" },
+        { path: "navigation.position" },
+      ],
+      data: [],
+    };
+    // Columns: 0=ts, 1=navState, 2=stw, 3=speedTrue(avg, m/s), 4=speedTrue:max, 5=position
+    // Dwell 15 min: first qualifying tick is at +15 min.
+    // True wind 4 m/s (~7.77 kn) measured, forecast 15 kn → speed factor < 1.
+    // Max over bucket 6 m/s (~11.66 kn) vs forecast gust 20 kn → gust factor < 1.
+    const pushTick = (minutes, { speedMs, gustMs }) => {
+      historyData.data.push([
+        new Date(NOON + minutes * 60000).toISOString(),
+        "anchored",
+        0,
+        speedMs,
+        gustMs,
+        [LON, LAT],
+      ]);
+    };
+    for (const m of [0, 5, 10, 15, 20, 25]) {
+      pushTick(m, { speedMs: 4, gustMs: 6 });
+    }
+
+    const weather = makeWeather(NOON);
+    const { WindProtectionStore } = require("../plugin/wind-protection.js");
+    const store = new WindProtectionStore({ alpha: 0.5, maxPlaces: 10 });
+    const stats = replayWindProtection({
+      store,
+      config: { windProtection: { enabled: true, dwellMinutes: 15 } },
+      historyData,
+      weather,
+      resolution: 300,
+    });
+
+    // The drop bucket (0 min, transition into at-rest) resolves the place
+    // and is skipped; 5/10 min are dwell-skipped; 15/20/25 min learn.
+    assert.ok(stats.samples >= 1, `expected samples, got ${stats.samples}`);
+    assert.ok(
+      stats.skippedDwell >= 2,
+      `expected dwell skips, got ${stats.skippedDwell}`,
+    );
+    assert.ok(store.sizePlaces === 1);
+    assert.ok(store.sizeSpeed >= 1);
+    assert.ok(store.sizeGust >= 1);
+    // Forecast wind from the east (90°) → sector 2 (E)
+    const factors = store.getFactors(store.placeLru[0], 2, false);
+    assert.ok(factors.speed < 1, `speed factor ${factors.speed} should be < 1`);
+    assert.ok(factors.gust < 1, `gust factor ${factors.gust} should be < 1`);
+  });
+
+  test("skips under-way ticks and resets the dwell window", () => {
+    const historyData = {
+      values: [
+        { path: "navigation.state", method: "last" },
+        { path: "navigation.speedThroughWater" },
+        { path: "environment.wind.speedTrue" },
+        { path: "navigation.position" },
+      ],
+      data: [],
+    };
+    const pushTick = (minutes, navState, speedMs) => {
+      historyData.data.push([
+        new Date(NOON + minutes * 60000).toISOString(),
+        navState,
+        navState === "sailing" ? 3 : 0,
+        speedMs,
+        [LON, LAT],
+      ]);
+    };
+    // Anchored 0..20 (dwell at 15+), then sailing, then anchored again
+    for (const m of [0, 5, 10, 15, 20]) pushTick(m, "anchored", 4);
+    pushTick(25, "sailing", 6);
+    for (const m of [30, 35, 40, 45, 50]) pushTick(m, "anchored", 4);
+
+    const weather = makeWeather(NOON);
+    const { WindProtectionStore } = require("../plugin/wind-protection.js");
+    const store = new WindProtectionStore({ alpha: 0.5, maxPlaces: 10 });
+    const stats = replayWindProtection({
+      store,
+      config: { windProtection: { enabled: true, dwellMinutes: 15 } },
+      historyData,
+      weather,
+      resolution: 300,
+    });
+
+    assert.ok(stats.skippedUnderway >= 1, "sailing tick skipped");
+    // The second anchored window must dwell again before learning
+    assert.ok(
+      stats.samples < 6,
+      `second window should dwell-skip early ticks, samples=${stats.samples}`,
+    );
+  });
+
+  test("a relocation within a moored session restarts dwell", () => {
+    // Real scenario from 2026-08-17: the nav state flipped to "moored" while
+    // the boat was still at the approach position, then it moved ~1.5 km to
+    // the slip 30 min later — all within one continuous "moored" state.
+    // The replay must treat these as two distinct anchorages (the 1.5 km
+    // jump exceeds the match radius) and restart the dwell window at the
+    // slip, so learning happens at the slip, not the approach.
+    const historyData = {
+      values: [
+        { path: "navigation.state", method: "last" },
+        { path: "navigation.speedThroughWater" },
+        { path: "environment.wind.speedTrue" },
+        { path: "navigation.position" },
+      ],
+      data: [],
+    };
+    const approach = [-159.8090204, -18.8528303]; // [lon, lat]
+    const slip = [-159.8000228, -18.8638846];
+    // 0..25 min at the approach (moored), 30+ min at the slip (moored)
+    const pushTick = (minutes, pos, speedMs) => {
+      historyData.data.push([
+        new Date(NOON + minutes * 60000).toISOString(),
+        "moored",
+        0,
+        speedMs,
+        pos,
+      ]);
+    };
+    for (const m of [0, 5, 10, 15, 20, 25]) pushTick(m, approach, 4);
+    for (const m of [30, 35, 40, 45, 50, 55]) pushTick(m, slip, 4);
+
+    const weather = makeWeather(NOON);
+    const { WindProtectionStore } = require("../plugin/wind-protection.js");
+    const store = new WindProtectionStore({ alpha: 0.5, maxPlaces: 10 });
+    const stats = replayWindProtection({
+      store,
+      config: { windProtection: { enabled: true, dwellMinutes: 15 } },
+      historyData,
+      weather,
+      resolution: 300,
+    });
+
+    // Two distinct anchorages registered (approach + slip)
+    assert.strictEqual(
+      store.anchorages.size,
+      2,
+      "approach and slip should be separate anchorages",
+    );
+    // Learning happens at the slip (the approach never dwells long enough
+    // before the relocation, and even if it did, it's a different place)
+    assert.ok(
+      stats.samples >= 1,
+      `expected samples at the slip, got ${stats.samples}`,
+    );
+  });
+});
+
+test.describe("populateFromHistory: wind protection", () => {
+  test("seeds and persists the WPF store from history", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "bf-wpf-"));
+    try {
+      const config = {
+        battery: {
+          socPath: "electrical.batteries.house.capacity.stateOfCharge",
+        },
+        solarArrays: [
+          {
+            id: "test-array",
+            powerPath: "electrical.solar.test.power",
+            capacityWp: 100,
+          },
+        ],
+        mechanicalGenerators: [],
+        windProtection: { enabled: true, dwellMinutes: 15 },
+      };
+
+      // History with wind columns + a :max gust column
+      const historyData = {
+        values: [
+          { path: "electrical.solar.test.power" },
+          { path: "electrical.batteries.house.capacity.stateOfCharge" },
+          { path: "navigation.state", method: "last" },
+          { path: "environment.wind.angleApparent" },
+          { path: "navigation.speedThroughWater" },
+          { path: "electrical.venus.dcPower" },
+          { path: "electrical.venus.acPower" },
+          { path: "environment.wind.speedTrue" },
+          { path: "environment.wind.speedTrue", method: "max" },
+          { path: "navigation.position" },
+        ],
+        data: [],
+      };
+      // columns: 0 ts, 1 solar, 2 soc, 3 nav, 4 awa, 5 stw, 6 dc, 7 ac, 8 windAvg, 9 windMax, 10 pos
+      for (const m of [0, 5, 10, 15, 20, 25]) {
+        historyData.data.push([
+          new Date(NOON + m * 60000).toISOString(),
+          50, // solar
+          0.5, // soc
+          "anchored",
+          null,
+          0,
+          60,
+          0,
+          4, // wind avg m/s
+          6, // wind max m/s
+          [LON, LAT],
+        ]);
+      }
+
+      const fetchImpl = async (url) => {
+        const u = String(url);
+        if (u.includes("/history/values")) {
+          return { ok: true, json: async () => historyData };
+        }
+        if (u.includes("/history/paths")) {
+          return { ok: true, json: async () => [] };
+        }
+        if (u.includes("archive-api")) {
+          return {
+            ok: true,
+            json: async () => ({
+              hourly: {
+                time: ["2026-08-20T22:00"],
+                shortwave_radiation: [800],
+                cloud_cover: [null],
+                wind_speed_10m: [27.782], // ~15 kn
+                wind_gusts_10m: [37], // ~19.98 kn
+                wind_direction_10m: [90],
+              },
+            }),
+          };
+        }
+        throw new Error(`unexpected url ${u}`);
+      };
+
+      const result = await populateFromHistory({
+        config,
+        baseUrl: "http://localhost:3000",
+        from: new Date(NOON - 3600000),
+        to: new Date(NOON + 3600000),
+        latitude: LAT,
+        longitude: LON,
+        dataDir,
+        resolution: 300,
+        fetchImpl,
+      });
+
+      assert.ok(result.windProtection, "populate should report WPF stats");
+      assert.ok(result.windProtection.samples >= 1);
+      assert.ok(result.windProtection.places >= 1);
+
+      // Persisted to disk
+      const wpfFile = path.join(dataDir, "wind-protection.json");
+      const persisted = JSON.parse(await fs.readFile(wpfFile, "utf8"));
+      assert.ok(
+        Object.keys(persisted.speedFactors || {}).length > 0,
+        "speed factors persisted",
+      );
+    } finally {
+      await fs.rm(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  test("omits windProtection when disabled in config", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "bf-wpf-off-"));
+    try {
+      const config = {
+        battery: {
+          socPath: "electrical.batteries.house.capacity.stateOfCharge",
+        },
+        solarArrays: [
+          {
+            id: "test-array",
+            powerPath: "electrical.solar.test.power",
+            capacityWp: 100,
+          },
+        ],
+        mechanicalGenerators: [],
+        windProtection: { enabled: false },
+      };
+      const historyData = makeHistoryData();
+      for (let m = 0; m < 30; m += 5) {
+        pushTick(historyData, m, { solar: 50, soc: 0.5, navState: "anchored" });
+      }
+      const fetchImpl = async (url) => {
+        const u = String(url);
+        if (u.includes("/history/values")) {
+          return { ok: true, json: async () => historyData };
+        }
+        if (u.includes("/history/paths")) {
+          return { ok: true, json: async () => [] };
+        }
+        if (u.includes("archive-api")) {
+          return {
+            ok: true,
+            json: async () => ({
+              hourly: {
+                time: ["2026-08-20T22:00"],
+                shortwave_radiation: [800],
+                cloud_cover: [null],
+                wind_speed_10m: [27.782],
+                wind_gusts_10m: [37],
+                wind_direction_10m: [90],
+              },
+            }),
+          };
+        }
+        throw new Error(`unexpected url ${u}`);
+      };
+      const result = await populateFromHistory({
+        config,
+        baseUrl: "http://localhost:3000",
+        from: new Date(NOON - 3600000),
+        to: new Date(NOON + 3600000),
+        latitude: LAT,
+        longitude: LON,
+        dataDir,
+        resolution: 300,
+        fetchImpl,
+      });
+      assert.strictEqual(result.windProtection, null);
+    } finally {
+      await fs.rm(dataDir, { recursive: true, force: true });
+    }
   });
 });

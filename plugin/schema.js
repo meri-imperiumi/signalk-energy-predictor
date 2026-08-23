@@ -386,6 +386,100 @@ function buildPluginSchema() {
           },
         },
       },
+      windProtection: {
+        type: "object",
+        title: "Wind Protection Factor",
+        description:
+          "Learn local wind shelter at anchor and marina: a place- and direction-local correction between measured and forecast wind, applied to FLINsail gust gates and wind generator predictions",
+        properties: {
+          enabled: {
+            type: "boolean",
+            title: "Enable Wind Protection Learning",
+            description:
+              "Learn a place-local wind correction factor while anchored or moored and apply it to wind-dependent predictions",
+            default: true,
+          },
+          learnGusts: {
+            type: "boolean",
+            title: "Learn Gust Factor",
+            description:
+              "Learn a gust factor (per place, direction, and day/night) in addition to the speed factor",
+            default: true,
+          },
+          emaAlpha: {
+            type: "number",
+            title: "EMA Smoothing Factor",
+            description:
+              "Exponential moving average alpha for factor learning (lower = slower learning)",
+            default: 0.05,
+            minimum: 0.01,
+            maximum: 0.2,
+          },
+          minForecastWindKnots: {
+            type: "number",
+            title: "Minimum Forecast Wind",
+            description:
+              "Discard learning samples when forecast wind is below this (ratios are noise in calm conditions), in knots",
+            default: 5,
+            minimum: 2,
+            maximum: 15,
+          },
+          dwellMinutes: {
+            type: "number",
+            title: "Dwell Time",
+            description:
+              "Minimum time settled in a place before learning starts (excludes arrival maneuvers), in minutes",
+            default: 15,
+            minimum: 1,
+            maximum: 120,
+          },
+          cellSizeM: {
+            type: "number",
+            title: "Place Cell Size",
+            description:
+              "Size of the grid cell used as the place identity (approximate meters). Smaller = more precise but slower to converge",
+            default: 500,
+            minimum: 100,
+            maximum: 2000,
+          },
+          maxPlaces: {
+            type: "number",
+            title: "Max Stored Places",
+            description:
+              "LRU cap on the number of places kept (favorite anchorages and the home marina converge quickly)",
+            default: 100,
+            minimum: 10,
+            maximum: 1000,
+          },
+          anemometerHeightM: {
+            type: "number",
+            title: "Anemometer Height",
+            description:
+              "Anemometer height above waterline in meters (masthead). Leave 0 to read from design.airHeight",
+            default: 0,
+            minimum: 0,
+            maximum: 60,
+          },
+          deviceHeightM: {
+            type: "number",
+            title: "Device Height",
+            description:
+              "Height of solar panels / wind generator above waterline, in meters. Corrected wind is translated down to this height before hitting gust gates and the wind gen curve",
+            default: 5,
+            minimum: 1,
+            maximum: 30,
+          },
+          roughnessLength: {
+            type: "number",
+            title: "Roughness Length (z₀)",
+            description:
+              "Log wind-profile roughness length in meters (0.0002 open water, 0.1 rough coast). Not observable per spot in v1",
+            default: 0.0002,
+            minimum: 0.00001,
+            maximum: 1,
+          },
+        },
+      },
       loadProfile: {
         type: "object",
         title: "Load Profile Configuration",

@@ -265,6 +265,39 @@ async function saveLoadProfile(dataDir, loadProfile) {
   await writeJsonFile(path, loadProfile.toJSON());
 }
 
+/**
+ * Gets the wind protection store file path.
+ *
+ * @param {string} dataDir - Plugin data directory
+ * @returns {string} File path
+ */
+function windProtectionPath(dataDir) {
+  return join(dataDir, "wind-protection.json");
+}
+
+/**
+ * Loads the wind protection store from disk.
+ *
+ * @param {string} dataDir - Plugin data directory
+ * @returns {Promise<object|null>} Store data, or null if file doesn't exist
+ */
+async function loadWindProtection(dataDir) {
+  const path = windProtectionPath(dataDir);
+  return await readJsonFile(path);
+}
+
+/**
+ * Saves the wind protection store to disk.
+ *
+ * @param {string} dataDir - Plugin data directory
+ * @param {object} storeData - Store data to save
+ * @returns {Promise<void>}
+ */
+async function saveWindProtection(dataDir, storeData) {
+  const path = windProtectionPath(dataDir);
+  await writeJsonFile(path, storeData);
+}
+
 module.exports = {
   matrixFilename,
   loadMatrix,
@@ -278,4 +311,7 @@ module.exports = {
   loadProfilePath,
   loadLoadProfile,
   saveLoadProfile,
+  windProtectionPath,
+  loadWindProtection,
+  saveWindProtection,
 };

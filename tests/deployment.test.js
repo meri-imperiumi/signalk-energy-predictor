@@ -7,7 +7,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const { PredictionEngine, LoadProfile } = require("../plugin/prediction.js");
-const { nextSunrise, lastSunset } = require("../plugin/solar.js");
+const { nextSunrise, lastSunset, sunPosition } = require("../plugin/solar.js");
 const { AdvisoryPublisher } = require("../plugin/advisory.js");
 const { parseManufacturerCurve } = require("../plugin/schema.js");
 
@@ -1986,6 +1986,82 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
         .find((r) => r.id === "flinsail");
       assert.strictEqual(rec.recommendedState, "deployed");
       assert.strictEqual(rec.recommendedStateTime, null);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test("FLINsail: clear now but night gusts spike later -> stay deployed, stow at sunset", () => {
+    // Current hour is clear (gusts below limit), but a later night hour
+    // has gusts above the limit. The recommendation must be "deployed"
+    // (don't stow now) with recommendedStateTime at the sunset before the
+    // spike — not "stowed" from the window-max gust.
+    const app = makeFakeApp();
+    app.setSelfPath("navigation.position", { latitude: 60, longitude: 18 });
+    app.setSelfPath("navigation.state", "moored");
+    const engine = new PredictionEngine({
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [
+        {
+          id: "flinsail",
+          type: "deployable",
+          capacityWp: 300,
+          gustLimitKnots: 20,
+          powerPath: "electrical.solar.flinsail.power",
+        },
+      ],
+      mechanicalGenerators: [],
+      getEfficiency: () => 0.7,
+      getSelfPath: (path) => app.getSelfPath(path),
+      app,
+    });
+
+    // 06:00Z start (night → sunrise ~06:00Z, daytime, sunset ~18:00Z).
+    // Hours 0-17 clear (10kn). Hour 18 (24:00Z next day, night) spikes to
+    // 25kn and stays high through hour 23.
+    const now = new Date("2026-03-20T06:00:00Z");
+    const forecast = Array.from({ length: 24 }, (_, h) => ({
+      time: new Date(now.getTime() + h * 3600000),
+      ghi: 500,
+      cloudCover: 0,
+      gustSpeedKnots: h >= 18 ? 25 : 10,
+      windSpeedKnots: 10,
+      windDirectionDeg: null,
+    }));
+    const realNow = Date.now;
+    Date.now = () => now.getTime();
+    try {
+      engine.runPrediction(forecast);
+      const rec = engine
+        .getDeploymentRecommendations()
+        .find((r) => r.id === "flinsail");
+      // Currently clear -> recommendation is deployed, NOT stowed
+      assert.strictEqual(
+        rec.recommendedState,
+        "deployed",
+        "should stay deployed when current gusts are below the limit",
+      );
+      // The stow should happen at sunset before the night spike, not now
+      assert.ok(rec.recommendedStateTime, "should schedule a future stow");
+      const changeTime = new Date(rec.recommendedStateTime);
+      // Stow time must be in the future (after now) and at/after the spike
+      assert.ok(
+        changeTime.getTime() > now.getTime(),
+        "stow should be scheduled in the future",
+      );
+      const spike = new Date(now.getTime() + 18 * 3600000);
+      // The stow is at the sunset before the night spike (not at the spike
+      // hour itself, and not now)
+      assert.ok(
+        changeTime.getTime() < spike.getTime(),
+        "stow should be at sunset before the night gust spike",
+      );
+      // And it should be a sunset (sun altitude ~0 at that time)
+      const { altitude } = sunPosition(changeTime, 60, 18);
+      assert.ok(
+        Math.abs(altitude) < 0.05,
+        `stow time should be near a sunset, altitude was ${altitude}`,
+      );
     } finally {
       Date.now = realNow;
     }

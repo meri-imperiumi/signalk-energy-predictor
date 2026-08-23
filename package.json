@@ -4,7 +4,6 @@
   "description": "Predictive energy management plugin for Signal K using offline-first incremental learning",
   "main": "plugin/index.js",
   "scripts": {
-    "lint": "npx @biomejs/biome check --use-editorconfig=true plugin/",
     "format": "npx @biomejs/biome check --use-editorconfig=true --write plugin/ tests/ bin/ public/",
     "lint": "npx @biomejs/biome check --use-editorconfig=true plugin/ public/",
     "test": "node --test --test-force-exit \"tests/*.test.js\"",

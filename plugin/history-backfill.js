@@ -18,6 +18,14 @@ const {
 const matrixPersistence = require("./matrix.js");
 const { parseManufacturerCurve } = require("./schema.js");
 const recorderModule = require("./recorder.js");
+const {
+  WindProtectionStore,
+  sectorFromDeg,
+  isNight: wpfIsNight,
+  toForecastReference,
+  DEFAULT_ANEMOMETER_HEIGHT_M,
+  DEFAULT_ROUGHNESS_LENGTH,
+} = require("./wind-protection.js");
 
 /**
  * Default history query resolution in seconds (5 minutes).
@@ -30,6 +38,9 @@ const DEFAULT_RESOLUTION = 300;
  * current/leeway drift so a vessel at anchor isn't mistaken for sailing.
  */
 const SAILING_STW_KN = 2;
+
+/** Conversion factor: 1 m/s = 1.943844 kn */
+const MS_TO_KN = 1.943844;
 
 /**
  * Signal K paths for engine running detection (any engine instance).
@@ -137,6 +148,24 @@ function columnValue(point, column) {
     return raw.value ?? null;
   }
   return raw;
+}
+
+/**
+ * Resolves a method-specific column index, preferring the explicit
+ * `path:method` key set by pathColumns and falling back to the bare path
+ * (for paths requested without a method suffix).
+ *
+ * @param {Map<string, number>} columns - From pathColumns
+ * @param {string} path - Bare Signal K path
+ * @param {string} [method] - Aggregate method (e.g. "max")
+ * @returns {number|null}
+ */
+function columnFor(columns, path, method) {
+  if (method) {
+    const specific = columns.get(`${path}:${method}`);
+    if (specific != null) return specific;
+  }
+  return columns.get(path) ?? null;
 }
 
 /**
@@ -371,6 +400,9 @@ function dailyPositionsFromHistory(historyData, from, to) {
 const CONTEXT_PATHS = [
   "navigation.state",
   "environment.wind.angleApparent",
+  "environment.wind.speedTrue",
+  "environment.wind.speedApparent",
+  "environment.wind.directionTrue",
   "navigation.speedThroughWater",
   "navigation.position",
 ];
@@ -416,7 +448,16 @@ function interpolateWeather(weather, time) {
 function pathColumns(historyData) {
   const columns = new Map();
   for (const [i, valueDef] of (historyData.values || []).entries()) {
+    // Bare path key: the default/average column (or the last column for a
+    // path that only ever appears with a method). Callers that don't care
+    // about the method keep using columns.get(path).
     columns.set(valueDef.path, i + 1);
+    // Method-specific key: lets callers request e.g. speedTrue with method
+    // "max" without colliding with its average column. Only set when the
+    // API reports a method.
+    if (valueDef.method) {
+      columns.set(`${valueDef.path}:${valueDef.method}`, i + 1);
+    }
   }
   return columns;
 }
@@ -937,6 +978,10 @@ async function populateFromHistory({
       ...generators.map((g) => g.powerPath),
       socPath,
       ...CONTEXT_PATHS,
+      // Measured gust source: there is no environment.wind.gust sensor, so
+      // the gust is taken as the max of true wind speed over each resolution
+      // bucket (History API :max aggregate).
+      "environment.wind.speedTrue:max",
       "electrical.venus.dcPower",
       "electrical.venus.acPower",
     ]),
@@ -1053,6 +1098,46 @@ async function populateFromHistory({
   });
   await matrixPersistence.saveLoadProfile(dataDir, loadProfile);
 
+  // Replay history through the Wind Protection Factor store so the
+  // per-place/per-sector EMAs are seeded from past anchorages (otherwise
+  // a revisited anchorage starts at factor 1.0 until enough live samples
+  // accumulate). Seed from disk to build on the live EMA, or start fresh
+  // under --fresh. Only runs when windProtection is enabled in config.
+  let windProtection = null;
+  let windProtectionSeeded = false;
+  let windProtectionStats = null;
+  if (config.windProtection?.enabled !== false) {
+    const wpfConfig = config.windProtection || {};
+    windProtection = new WindProtectionStore({
+      alpha: wpfConfig.emaAlpha,
+      maxPlaces: wpfConfig.maxPlaces,
+      learnGusts: wpfConfig.learnGusts !== false,
+      minForecastWindKnots: wpfConfig.minForecastWindKnots,
+    });
+    if (!fresh) {
+      try {
+        const saved = await matrixPersistence.loadWindProtection(dataDir);
+        if (saved) {
+          windProtection = WindProtectionStore.fromJSON(saved);
+          windProtectionSeeded = true;
+        }
+      } catch (_error) {
+        // No existing store: start fresh
+      }
+    }
+    windProtectionStats = replayWindProtection({
+      store: windProtection,
+      config,
+      historyData,
+      weather,
+      resolution,
+    });
+    await matrixPersistence.saveWindProtection(
+      dataDir,
+      windProtection.toJSON(),
+    );
+  }
+
   // Seed recordings with pre-install actuals (gap-fill merge: live
   // samples win, replayed ticks only fill the holes)
   const samplesWritten = await backfillSamples({
@@ -1076,6 +1161,13 @@ async function populateFromHistory({
       ...loadProfileStats,
       learnedBins: loadProfile.learnedBins().length,
     },
+    windProtection:
+      windProtection == null
+        ? null
+        : {
+            seeded: windProtectionSeeded,
+            ...windProtectionStats,
+          },
   };
 }
 
@@ -1414,6 +1506,193 @@ function replayLoadProfile({
   return { dataPoints, ingested, gated };
 }
 
+/**
+ * Replays history through the Wind Protection Factor store.
+ *
+ * For each resolution bucket where the vessel was at rest (anchored or
+ * moored) and dwelled long enough in a place cell, the measured wind
+ * (height-normalized to the 10 m forecast reference) is compared against
+ * the interpolated archive weather and the per-(place, sector) EMA is
+ * updated. Gusts are learned when both a measured gust and a forecast gust
+ * are present.
+ *
+ * The store is seeded from disk so backfill continues from the live EMA,
+ * unless `fresh` is set by the caller (handled in populateFromHistory).
+ *
+ * @param {object} params
+ * @param {WindProtectionStore} params.store - WPF store (mutated in place)
+ * @param {object} params.config - Plugin configuration (windProtection block)
+ * @param {object} params.historyData - History API /values response
+ * @param {Array} params.weather - Archive weather track (from
+ *        fetchHistoricalWeatherTrack)
+ * @param {number} [params.resolution=DEFAULT_RESOLUTION] - Bucket seconds
+ * @returns {{dataPoints: number, samples: number, skippedUnderway: number,
+ *          skippedDwell: number, places: number}}
+ */
+function replayWindProtection({
+  store,
+  config,
+  historyData,
+  weather,
+  resolution = DEFAULT_RESOLUTION,
+}) {
+  const columns = pathColumns(historyData);
+  const navStateColumn = columns.get("navigation.state");
+  const stwColumn = columns.get("navigation.speedThroughWater");
+  const propulsionCols = propulsionColumns(historyData);
+  const positionColumn = columns.get("navigation.position");
+  const speedTrueColumn = columns.get("environment.wind.speedTrue");
+  const speedApparentColumn = columns.get("environment.wind.speedApparent");
+  // Measured gust source: there is no environment.wind.gust sensor, so the
+  // gust is the max of true wind speed over the resolution bucket (History
+  // API :max aggregate, requested as environment.wind.speedTrue:max).
+  const gustMaxColumn = columnFor(columns, "environment.wind.speedTrue", "max");
+  const directionTrueColumn = columns.get("environment.wind.directionTrue");
+
+  const cfg = config?.windProtection || {};
+  const cellSizeM = cfg.cellSizeM ?? 500;
+  const dwellMinutes = cfg.dwellMinutes ?? 15;
+  const anemometerHeightM =
+    cfg.anemometerHeightM && cfg.anemometerHeightM > 0
+      ? cfg.anemometerHeightM
+      : DEFAULT_ANEMOMETER_HEIGHT_M;
+  const z0 = cfg.roughnessLength ?? DEFAULT_ROUGHNESS_LENGTH;
+
+  let dataPoints = 0;
+  let samples = 0;
+  let skippedUnderway = 0;
+  let skippedDwell = 0;
+  let lastExplicitNavState = null;
+
+  /** Pinned place key for the current at-rest session. */
+  let currentPlace = null;
+  let arrivedAt = null;
+  const bucketMs = resolution * 1000;
+  const dwellMs = dwellMinutes * 60000;
+
+  for (const point of historyData.data || []) {
+    const time = parseUtcTimestamp(point[0]);
+    if (time == null) continue;
+
+    const navStateResult = inferNavState(
+      point,
+      navStateColumn,
+      stwColumn,
+      propulsionCols,
+      columns,
+      lastExplicitNavState,
+    );
+    if (navStateResult.explicit) {
+      lastExplicitNavState = navStateResult.state;
+    }
+    const navState = navStateResult.state;
+    if (navState !== "anchored" && navState !== "moored") {
+      // Leaving rest resets the dwell window
+      currentPlace = null;
+      arrivedAt = null;
+      skippedUnderway++;
+      continue;
+    }
+
+    // Position (required for the place cell)
+    const posValue = columnValue(point, positionColumn);
+    if (!Array.isArray(posValue) || posValue.length < 2) continue;
+    const lat = posValue[1];
+    const lon = posValue[0];
+    if (lat == null || lon == null) continue;
+
+    // Resolve the anchorage for the current bucket. resolvePlace matches
+    // to the nearest known anchorage within the match radius, so a swing
+    // on the anchor (or a nearby re-drop / marina relocation) keeps the
+    // same key, while a real relocation beyond the match radius (e.g. the
+    // state flipping to moored during an approach, then moving 1.5 km to
+    // the slip) resolves to a different key and restarts the dwell window.
+    const key = store.resolvePlace(lat, lon, cellSizeM);
+
+    // Dwell gating: reset when the resolved place changes; only learn after
+    // the boat has been at this anchorage long enough to settle.
+    if (currentPlace !== key) {
+      currentPlace = key;
+      // The first bucket of a new place starts the dwell clock; we don't
+      // know precisely when the boat arrived within that bucket, so we
+      // start the clock at the bucket timestamp.
+      arrivedAt = time.getTime();
+      continue;
+    }
+    if (arrivedAt == null || time.getTime() - arrivedAt < dwellMs) {
+      skippedDwell++;
+      continue;
+    }
+
+    // Measured wind. Prefer true wind (current can bias apparent at
+    // anchor), then apparent, then over-ground-ish (not in history here).
+    const measuredMs =
+      columnNumber(point, speedTrueColumn) ??
+      columnNumber(point, speedApparentColumn);
+    if (measuredMs == null || !isFinite(measuredMs)) continue;
+    const measuredKnots = measuredMs * MS_TO_KN;
+
+    // Measured gust (optional): max of true wind speed over the bucket.
+    // Fall back to the average true speed when no :max column was returned.
+    const gustMs =
+      columnNumber(point, gustMaxColumn) ??
+      columnNumber(point, speedTrueColumn);
+    const measuredGustKnots =
+      gustMs != null && isFinite(gustMs) ? gustMs * MS_TO_KN : null;
+
+    // Forecast for this bucket
+    const wx = interpolateWeather(weather, time);
+    const forecastSpeed = wx.windSpeedKnots;
+    const forecastGust = wx.gustSpeedKnots;
+    // Forecast direction is degrees; fall back to the measured SK
+    // directionTrue (radians) when the forecast lacks it
+    let dirDeg = wx.windDirectionDeg;
+    if (dirDeg == null) {
+      const dirRad = columnNumber(point, directionTrueColumn);
+      if (dirRad != null && isFinite(dirRad)) {
+        dirDeg = (dirRad * 180) / Math.PI;
+      }
+    }
+    if (forecastSpeed == null) continue;
+
+    // Height-normalize the measured reading to the 10 m reference
+    const measured10m = toForecastReference(
+      measuredKnots,
+      anemometerHeightM,
+      z0,
+    );
+    const measuredGust10m =
+      measuredGustKnots != null
+        ? toForecastReference(measuredGustKnots, anemometerHeightM, z0)
+        : null;
+
+    const sector = sectorFromDeg(dirDeg);
+    const { altitude } = sunPosition(time, lat, lon);
+    const night = wpfIsNight(altitude);
+
+    const updated = store.learn({
+      placeKey: currentPlace,
+      sector,
+      night,
+      measuredSpeed: measured10m,
+      forecastSpeed,
+      measuredGust: measuredGust10m,
+      forecastGust,
+    });
+
+    dataPoints++;
+    if (updated) samples++;
+  }
+
+  return {
+    dataPoints,
+    samples,
+    skippedUnderway,
+    skippedDwell,
+    places: store.sizePlaces,
+  };
+}
+
 module.exports = {
   DEFAULT_RESOLUTION,
   DEFAULT_SOC_PATH,
@@ -1428,6 +1707,7 @@ module.exports = {
   replayHistory,
   replayGenerators,
   replayLoadProfile,
+  replayWindProtection,
   backfillSamples,
   populateFromHistory,
 };

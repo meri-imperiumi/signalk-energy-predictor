@@ -557,6 +557,68 @@ test.describe("Signal K API interactions", () => {
 
     await plugin.stop();
   });
+
+  test("prediction cycle caches forecast but skips output when nav state unknown", async () => {
+    // Until signalk-autostate derives navigation.state, the prediction
+    // output is skipped (WPF only applies at rest, deploy recs need a
+    // known state) — but the forecast must still be fetched and cached
+    // so the learning cycle's GHI lookup doesn't stall on a live API call.
+    const app = new FakeSignalKApp();
+    const plugin = makePlugin(app);
+    app.setSelfPath("navigation.position", {
+      latitude: 60.0,
+      longitude: 18.0,
+    });
+    app.setSelfPath("electrical.batteries.house.capacity.stateOfCharge", 0.6);
+    // NOTE: navigation.state intentionally not set -> "unknown"
+    const config = {
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [
+        { id: "cabin-roof", type: "fixed", capacityWp: 200, enabled: true },
+      ],
+      mechanicalGenerators: [],
+      weather: { openMeteoEnabled: false, useLogbook: false },
+    };
+    app.dataPath = tempDir;
+    await plugin.start(config, () => {});
+
+    const fsm = plugin.__getInternals().ingestionFSM;
+    // Seed position via a delta so ingestionFSM.position is populated
+    app.subscriptionmanager.subscriptions.forEach(({ deltaHandler }) => {
+      deltaHandler({
+        context: app.selfId,
+        updates: [
+          {
+            values: [
+              {
+                path: "navigation.position",
+                value: { latitude: 60.0, longitude: 18.0 },
+              },
+            ],
+          },
+        ],
+      });
+    });
+    // No forecast cached yet
+    assert.strictEqual(fsm.lastForecast.length, 0);
+    // navigation.state intentionally not set -> "unknown"
+    assert.strictEqual(
+      plugin.__getInternals().predictionEngine.getNavState(),
+      "unknown",
+    );
+
+    await plugin.__getInternals().runPredictionCycle();
+
+    // Prediction output is skipped while nav state is unknown: the engine
+    // must not have produced any hourly predictions.
+    assert.strictEqual(
+      plugin.__getInternals().predictionEngine.lastPrediction.length,
+      0,
+      "prediction output should be skipped while nav state is unknown",
+    );
+
+    await plugin.stop();
+  });
 });
 
 test.describe("Solar learning regression", () => {

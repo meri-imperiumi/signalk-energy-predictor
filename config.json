@@ -26,9 +26,13 @@
         "systemVoltage": {
           "type": "number",
           "title": "System Voltage",
-          "description": "System voltage in volts (12, 24, 48)",
+          "description": "System voltage in volts (12, 24, or 48)",
           "default": 12,
-          "enum": [12, 24, 48]
+          "enum": [
+            12,
+            24,
+            48
+          ]
         },
         "minSafeSoC": {
           "type": "number",
@@ -52,7 +56,11 @@
           "minimum": 50
         }
       },
-      "required": ["capacityAh", "systemVoltage", "minSafeSoC"]
+      "required": [
+        "capacityAh",
+        "systemVoltage",
+        "minSafeSoC"
+      ]
     },
     "solarArrays": {
       "type": "array",
@@ -78,7 +86,10 @@
             "type": "string",
             "title": "Array Type",
             "description": "Fixed panels or deployable sail-like array",
-            "enum": ["fixed", "deployable"],
+            "enum": [
+              "fixed",
+              "deployable"
+            ],
             "default": "fixed"
           },
           "powerPath": {
@@ -90,6 +101,11 @@
             "type": "string",
             "title": "Controller Mode Path",
             "description": "Signal K path for charge controller mode (optional, for sanitization)"
+          },
+          "deployStatePath": {
+            "type": "string",
+            "title": "Deploy State Path",
+            "description": "Signal K path for current deploy/stow state (optional). Used to detect if change is needed."
           },
           "gustLimitKnots": {
             "type": "number",
@@ -123,7 +139,10 @@
                   "minimum": 1
                 }
               },
-              "required": ["startDate", "capacityWp"]
+              "required": [
+                "startDate",
+                "capacityWp"
+              ]
             }
           },
           "capacityWp": {
@@ -139,7 +158,11 @@
             "default": true
           }
         },
-        "required": ["id", "type", "capacityWp"]
+        "required": [
+          "id",
+          "type",
+          "capacityWp"
+        ]
       }
     },
     "mechanicalGenerators": {
@@ -165,13 +188,22 @@
           "type": {
             "type": "string",
             "title": "Generator Type",
-            "enum": ["wind", "hydro"]
+            "enum": [
+              "wind",
+              "hydro"
+            ]
           },
           "deployable": {
             "type": "boolean",
             "title": "Deployable",
             "description": "Generator can be deployed/retracted (hydrogenerators are typically deployable)",
             "default": false
+          },
+          "deployableAtMoored": {
+            "type": "boolean",
+            "title": "Deployable at mooring",
+            "description": "Whether this wind generator can be deployed while moored (some vessels cannot due to proximity to dock or other boats). When false, the generator is predicted stowed at moored and only deployed at anchor.",
+            "default": true
           },
           "maxWindKnots": {
             "type": "number",
@@ -180,6 +212,13 @@
             "default": 30,
             "minimum": 20,
             "maximum": 60
+          },
+          "startupSpeedKnots": {
+            "type": "number",
+            "title": "Startup Wind Speed",
+            "description": "Minimum wind speed (knots) for the generator to produce power (wind generators only)",
+            "default": 5,
+            "minimum": 0
           },
           "minSpeedKnots": {
             "type": "number",
@@ -202,6 +241,11 @@
             "title": "Power Path",
             "description": "Signal K path for power output reading (watts)"
           },
+          "deployStatePath": {
+            "type": "string",
+            "title": "Deploy State Path",
+            "description": "Signal K path for current deploy/stow state (optional). Used to detect if change is needed."
+          },
           "manufacturerCurve": {
             "type": "string",
             "title": "Power Curve",
@@ -215,7 +259,11 @@
             "default": true
           }
         },
-        "required": ["id", "type", "manufacturerCurve"]
+        "required": [
+          "id",
+          "type",
+          "manufacturerCurve"
+        ]
       }
     },
     "learning": {
@@ -232,9 +280,9 @@
         "saveIntervalMinutes": {
           "type": "number",
           "title": "Save Interval",
-          "description": "How often to save learning matrices to disk (minutes). State is also saved on graceful plugin shutdown.",
-          "default": 15,
-          "minimum": 5,
+          "description": "How often to save learning matrices to disk (minutes)",
+          "default": 60,
+          "minimum": 10,
           "maximum": 1440
         },
         "minIntervalSeconds": {
@@ -264,10 +312,10 @@
         "defaultEfficiency": {
           "type": "number",
           "title": "Default Efficiency",
-          "description": "Starting efficiency for unlearned matrix bins (0-1)",
+          "description": "Starting efficiency for unlearned matrix bins (0.1-1.0)",
           "default": 0.7,
           "minimum": 0.1,
-          "maximum": 1.0
+          "maximum": 1
         }
       }
     },
@@ -297,13 +345,157 @@
         "forecastHours": {
           "type": "number",
           "title": "Forecast Horizon",
-          "description": "Hours of forecast to fetch and predict",
+          "description": "Hours to fetch and predict",
           "default": 48,
           "minimum": 24,
           "maximum": 168
         }
       }
+    },
+    "recording": {
+      "type": "object",
+      "title": "Recording Configuration",
+      "description": "Store predictions and measured values for the timeline webapp",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "title": "Enable Recording",
+          "description": "Record prediction cycles and measured samples to disk",
+          "default": true
+        },
+        "retentionDays": {
+          "type": "number",
+          "title": "Retention Days",
+          "description": "Number of days to keep recordings before pruning",
+          "default": 90,
+          "minimum": 1,
+          "maximum": 365
+        }
+      }
+    },
+    "windProtection": {
+      "type": "object",
+      "title": "Wind Protection Factor",
+      "description": "Learn local wind shelter at anchor and marina: a place- and direction-local correction between measured and forecast wind, applied to FLINsail gust gates and wind generator predictions",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "title": "Enable Wind Protection Learning",
+          "description": "Learn a place-local wind correction factor while anchored or moored and apply it to wind-dependent predictions",
+          "default": true
+        },
+        "learnGusts": {
+          "type": "boolean",
+          "title": "Learn Gust Factor",
+          "description": "Learn a gust factor (per place, direction, and day/night) in addition to the speed factor",
+          "default": true
+        },
+        "emaAlpha": {
+          "type": "number",
+          "title": "EMA Smoothing Factor",
+          "description": "Exponential moving average alpha for factor learning (lower = slower learning)",
+          "default": 0.05,
+          "minimum": 0.01,
+          "maximum": 0.2
+        },
+        "minForecastWindKnots": {
+          "type": "number",
+          "title": "Minimum Forecast Wind",
+          "description": "Discard learning samples when forecast wind is below this (ratios are noise in calm conditions), in knots",
+          "default": 5,
+          "minimum": 2,
+          "maximum": 15
+        },
+        "dwellMinutes": {
+          "type": "number",
+          "title": "Dwell Time",
+          "description": "Minimum time settled in a place before learning starts (excludes arrival maneuvers), in minutes",
+          "default": 15,
+          "minimum": 1,
+          "maximum": 120
+        },
+        "cellSizeM": {
+          "type": "number",
+          "title": "Place Cell Size",
+          "description": "Size of the grid cell used as the place identity (approximate meters). Smaller = more precise but slower to converge",
+          "default": 500,
+          "minimum": 100,
+          "maximum": 2000
+        },
+        "maxPlaces": {
+          "type": "number",
+          "title": "Max Stored Places",
+          "description": "LRU cap on the number of places kept (favorite anchorages and the home marina converge quickly)",
+          "default": 100,
+          "minimum": 10,
+          "maximum": 1000
+        },
+        "anemometerHeightM": {
+          "type": "number",
+          "title": "Anemometer Height",
+          "description": "Anemometer height above waterline in meters (masthead). Leave 0 to read from design.airHeight",
+          "default": 0,
+          "minimum": 0,
+          "maximum": 60
+        },
+        "deviceHeightM": {
+          "type": "number",
+          "title": "Device Height",
+          "description": "Height of solar panels / wind generator above waterline, in meters. Corrected wind is translated down to this height before hitting gust gates and the wind gen curve",
+          "default": 5,
+          "minimum": 1,
+          "maximum": 30
+        },
+        "roughnessLength": {
+          "type": "number",
+          "title": "Roughness Length (z₀)",
+          "description": "Log wind-profile roughness length in meters (0.0002 open water, 0.1 rough coast). Not observable per spot in v1",
+          "default": 0.0002,
+          "minimum": 0.00001,
+          "maximum": 1
+        }
+      }
+    },
+    "loadProfile": {
+      "type": "object",
+      "title": "Load Profile Configuration",
+      "description": "Learn sun-phase-based load patterns",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "title": "Enable Load Profile Learning",
+          "description": "Learn sun-phase-based load patterns instead of using flat averages",
+          "default": true
+        },
+        "alpha": {
+          "type": "number",
+          "title": "EMA Alpha",
+          "description": "Exponential moving average smoothing factor (lower = slower learning)",
+          "default": 0.05,
+          "minimum": 0.01,
+          "maximum": 0.2
+        },
+        "minDaysPerBin": {
+          "type": "number",
+          "title": "Minimum Days per Bin",
+          "description": "Minimum number of distinct days a bin needs samples from before it's used for prediction",
+          "default": 3,
+          "minimum": 1,
+          "maximum": 10
+        },
+        "outlierFactor": {
+          "type": "number",
+          "title": "Spike Gate Factor",
+          "description": "Samples above this factor × bin EMA are dropped as outliers",
+          "default": 3,
+          "minimum": 2,
+          "maximum": 10
+        }
+      }
     }
   },
-  "required": ["battery", "solarArrays"]
+  "required": [
+    "battery",
+    "solarArrays"
+  ]
 }

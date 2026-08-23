@@ -121,6 +121,80 @@ async function recordSample(app, dataDir, sample) {
 }
 
 /**
+ * Records a Wind Protection Factor learning observation.
+ *
+ * Each time the WPF engine updates a bin, we persist the raw comparison
+ * (measured vs forecast, normalized to the 10 m reference) so the factor
+ * history for a place is queryable later — both for the webapp timeline
+ * and as material for offline backfilling of factors from archived wind.
+ *
+ * @param {object} app - Signal K server API (for logging)
+ * @param {string} dataDir - Plugin data directory
+ * @param {object} obs - Observation
+ * @param {Date} obs.timestamp - Observation timestamp
+ * @param {string} obs.placeKey - Place cell key
+ * @param {number} obs.sector - Wind direction sector 0–7 (-1 unknown)
+ * @param {boolean} obs.night - Day/night bin
+ * @param {number} obs.measuredSpeedKnots - Measured wind at 10 m ref (knots)
+ * @param {number} obs.forecastSpeedKnots - Forecast wind speed (knots)
+ * @param {number|null} [obs.measuredGustKnots] - Measured gust at 10 m ref
+ * @param {number|null} [obs.forecastGustKnots] - Forecast gust (knots)
+ * @param {number|null} [obs.windDirectionDeg] - Forecast wind direction (deg)
+ * @param {number} obs.speedFactor - Resulting speed factor (post-update)
+ * @param {number} obs.gustFactor - Resulting gust factor (post-update)
+ * @param {{latitude: number, longitude: number}} obs.position - Vessel position
+ * @param {string} obs.navState - Navigation state
+ * @param {number} obs.anemometerHeightM - Anemometer height used (m)
+ * @returns {Promise<void>}
+ */
+async function recordWindProtection(app, dataDir, obs) {
+  await ensureRecordingsDir(dataDir);
+
+  const filePath = getRecordingsPath(dataDir, obs.timestamp);
+  const record = {
+    type: "wind-protection",
+    timestamp: obs.timestamp.toISOString(),
+    placeKey: obs.placeKey,
+    sector: obs.sector,
+    night: obs.night,
+    measuredSpeedKnots: round4(obs.measuredSpeedKnots),
+    forecastSpeedKnots: round4(obs.forecastSpeedKnots),
+    measuredGustKnots:
+      obs.measuredGustKnots != null ? round4(obs.measuredGustKnots) : null,
+    forecastGustKnots:
+      obs.forecastGustKnots != null ? round4(obs.forecastGustKnots) : null,
+    windDirectionDeg: obs.windDirectionDeg ?? null,
+    speedFactor: round4(obs.speedFactor),
+    gustFactor: round4(obs.gustFactor),
+    position: obs.position,
+    navState: obs.navState,
+    anemometerHeightM: obs.anemometerHeightM,
+  };
+
+  const line = `${JSON.stringify(record)}\n`;
+
+  try {
+    await fs.appendFile(filePath, line, { encoding: "utf-8" });
+    app.debug?.(
+      `Recorded wind-protection observation at ${obs.timestamp.toISOString()}`,
+    );
+  } catch (error) {
+    app.error?.(
+      `Failed to record wind-protection observation: ${error.message}`,
+    );
+  }
+}
+
+/**
+ * Rounds to 4 decimal places.
+ * @param {number} v
+ * @returns {number}
+ */
+function round4(v) {
+  return Math.round(v * 10000) / 10000;
+}
+
+/**
  * Prunes old recordings based on retention days.
  *
  * @param {object} app - Signal K server API (for logging)
@@ -418,6 +492,19 @@ class Recorder {
   }
 
   /**
+   * Records a Wind Protection Factor learning observation if enabled.
+   *
+   * @param {object} obs - Observation (see recordWindProtection)
+   * @returns {Promise<void>}
+   */
+  async recordWindProtection(obs) {
+    if (!this.enabled) {
+      return;
+    }
+    return recordWindProtection(this.app, this.dataDir, obs);
+  }
+
+  /**
    * Prunes old recordings if enabled.
    *
    * @returns {Promise<{deleted: number, errors: string[]}>}
@@ -491,6 +578,7 @@ module.exports = {
   Recorder,
   recordCycle,
   recordSample,
+  recordWindProtection,
   pruneOldRecordings,
   overwriteStickyFields,
   getRecordings,

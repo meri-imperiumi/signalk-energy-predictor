@@ -723,7 +723,10 @@ async function loadRecords(readRecordings, from, to, type) {
  *   configuration (for device→source typing)
  * @param {string} params.dataDir - Plugin data directory with recordings
  */
-function registerApiRoutes(router, { app, getConfig, dataDir }) {
+function registerApiRoutes(
+  router,
+  { app, getConfig, dataDir, getWindProtection },
+) {
   const readRecordings = (from, to, type) =>
     require("./recorder.js").getRecordings(dataDir, from, to, type);
 
@@ -780,6 +783,28 @@ function registerApiRoutes(router, { app, getConfig, dataDir }) {
       loadRecords(readRecordings, from, to, "cycle").then((cycles) =>
         buildSummary(cycles, samples, sourceTypes, from, to),
       ),
+    ).catch((error) => handleError(error, res)),
+  );
+
+  // Wind Protection Factor: the live learned store (all places/sectors)
+  router.get("/api/wind-protection", (_req, res) => {
+    const store = getWindProtection?.();
+    if (!store) {
+      res.json({
+        enabled: false,
+        places: [],
+        speedFactors: {},
+        gustFactors: {},
+      });
+      return;
+    }
+    res.json(store.toJSON());
+  });
+
+  // Wind Protection Factor: recorded learning observations in a window
+  router.get("/api/wind-protection/history", (req, res) =>
+    handle(req, res, "wind-protection", (records, _sourceTypes, from, to) =>
+      buildWindProtectionHistory(records, from, to),
     ).catch((error) => handleError(error, res)),
   );
 
@@ -1009,6 +1034,49 @@ async function buildRetroPredicted(samples, config, dataDir, from, to) {
   };
 }
 
+/**
+ * Builds the /api/wind-protection/history response: the raw WPF learning
+ * observations recorded while at rest, each carrying the measured vs
+ * forecast comparison and the resulting factors.
+ *
+ * Observations are returned in time order, filtered to the query window
+ * by the recorder. They are the material for the webapp timeline and for
+ * offline backfilling of factors from archived wind.
+ *
+ * @param {object[]} records - wind-protection records from the recorder
+ * @param {Date} from - Window start
+ * @param {Date} to - Window end
+ * @returns {{window: {from: string, to: string}, observations: object[]}}
+ */
+function buildWindProtectionHistory(records, from, to) {
+  const observations = records
+    .filter((r) => r.type === "wind-protection")
+    .map((r) => ({
+      timestamp: r.timestamp,
+      placeKey: r.placeKey,
+      sector: r.sector,
+      night: r.night,
+      measuredSpeedKnots: r.measuredSpeedKnots,
+      forecastSpeedKnots: r.forecastSpeedKnots,
+      measuredGustKnots: r.measuredGustKnots ?? null,
+      forecastGustKnots: r.forecastGustKnots ?? null,
+      windDirectionDeg: r.windDirectionDeg ?? null,
+      speedFactor: r.speedFactor,
+      gustFactor: r.gustFactor,
+      position: r.position,
+      navState: r.navState,
+      anemometerHeightM: r.anemometerHeightM,
+    }))
+    .sort(
+      (a, b) =>
+        new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
+    );
+  return {
+    window: { from: from.toISOString(), to: to.toISOString() },
+    observations,
+  };
+}
+
 module.exports = {
   MAX_WINDOW_DAYS,
   ApiError,
@@ -1025,6 +1093,7 @@ module.exports = {
   buildEnvironment,
   buildSummary,
   buildRetroPredicted,
+  buildWindProtectionHistory,
   registerApiRoutes,
   cycleHorizonMs,
 };

@@ -14,6 +14,7 @@ const {
   Recorder,
   recordCycle,
   recordSample,
+  recordWindProtection,
   pruneOldRecordings,
   overwriteStickyFields,
   getRecordings,
@@ -701,6 +702,107 @@ test.describe("recorder", () => {
       // The cycle record survives unchanged
       const cycles = all.filter((r) => r.type === "cycle");
       assert.strictEqual(cycles.length, 1);
+    });
+  });
+
+  test.describe("recordWindProtection", () => {
+    test("writes a wind-protection record with factors and position", async () => {
+      const obs = {
+        timestamp: new Date("2024-08-21T13:00:00Z"),
+        placeKey: "geohash-cell-abc",
+        sector: 2,
+        night: false,
+        measuredSpeedKnots: 7.77,
+        forecastSpeedKnots: 15,
+        measuredGustKnots: 11.66,
+        forecastGustKnots: 20,
+        windDirectionDeg: 90,
+        speedFactor: 0.5,
+        gustFactor: 0.58,
+        position: { latitude: -18.86, longitude: -159.8 },
+        navState: "anchored",
+        anemometerHeightM: 10,
+      };
+      await recordWindProtection(mockApp, tempDir, obs);
+      const filePath = getRecordingsPath(tempDir, obs.timestamp);
+      const content = await fs.readFile(filePath, "utf-8");
+      const lines = content.trim().split("\n");
+      assert.strictEqual(lines.length, 1);
+      const record = JSON.parse(lines[0]);
+      assert.strictEqual(record.type, "wind-protection");
+      assert.strictEqual(record.timestamp, "2024-08-21T13:00:00.000Z");
+      assert.strictEqual(record.placeKey, "geohash-cell-abc");
+      assert.strictEqual(record.sector, 2);
+      assert.strictEqual(record.night, false);
+      assert.strictEqual(record.measuredSpeedKnots, 7.77);
+      assert.strictEqual(record.forecastSpeedKnots, 15);
+      assert.strictEqual(record.measuredGustKnots, 11.66);
+      assert.strictEqual(record.forecastGustKnots, 20);
+      assert.strictEqual(record.windDirectionDeg, 90);
+      assert.strictEqual(record.speedFactor, 0.5);
+      assert.strictEqual(record.gustFactor, 0.58);
+      assert.deepStrictEqual(record.position, obs.position);
+      assert.strictEqual(record.navState, "anchored");
+      assert.strictEqual(record.anemometerHeightM, 10);
+    });
+
+    test("accepts null gusts and null position", async () => {
+      const obs = {
+        timestamp: new Date("2024-08-21T13:05:00Z"),
+        placeKey: "cell-x",
+        sector: 0,
+        night: true,
+        measuredSpeedKnots: 5,
+        forecastSpeedKnots: 10,
+        measuredGustKnots: null,
+        forecastGustKnots: null,
+        windDirectionDeg: null,
+        speedFactor: 0.5,
+        gustFactor: 1,
+        position: null,
+        navState: "moored",
+        anemometerHeightM: 12,
+      };
+      await recordWindProtection(mockApp, tempDir, obs);
+      const filePath = getRecordingsPath(tempDir, obs.timestamp);
+      const content = await fs.readFile(filePath, "utf-8");
+      const record = JSON.parse(content.trim());
+      assert.strictEqual(record.measuredGustKnots, null);
+      assert.strictEqual(record.forecastGustKnots, null);
+      assert.strictEqual(record.windDirectionDeg, null);
+      assert.strictEqual(record.position, null);
+      assert.strictEqual(record.navState, "moored");
+    });
+
+    test("Recorder.recordWindProtection delegates to the module function", async () => {
+      const recorder = new Recorder(mockApp, tempDir);
+      await recorder.recordWindProtection({
+        timestamp: new Date("2024-08-21T13:10:00Z"),
+        placeKey: "cell-y",
+        sector: 4,
+        night: false,
+        measuredSpeedKnots: 3,
+        forecastSpeedKnots: 12,
+        measuredGustKnots: 4,
+        forecastGustKnots: 18,
+        windDirectionDeg: 180,
+        speedFactor: 0.25,
+        gustFactor: 0.2222,
+        position: { latitude: 1, longitude: 2 },
+        navState: "anchored",
+        anemometerHeightM: 10,
+      });
+      const filePath = getRecordingsPath(
+        tempDir,
+        new Date("2024-08-21T13:10:00Z"),
+      );
+      const content = await fs.readFile(filePath, "utf-8");
+      const record = JSON.parse(content.trim());
+      assert.strictEqual(record.type, "wind-protection");
+      assert.strictEqual(record.placeKey, "cell-y");
+      assert.strictEqual(record.sector, 4);
+      // round4(0.2222) = 0.2222
+      assert.strictEqual(record.gustFactor, 0.2222);
     });
   });
 });

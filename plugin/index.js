@@ -12,8 +12,24 @@
 
 const { IngestionFSM, Tier } = require("./ingestion.js");
 const { SolarMatrix } = require("./learning.js");
+const {
+  WindProtectionStore,
+  sectorFromDeg,
+  isNight: wpfIsNight,
+  toForecastReference,
+  toDeviceHeight,
+  DEFAULT_FACTOR,
+  DEFAULT_ANEMOMETER_HEIGHT_M,
+  DEFAULT_DEVICE_HEIGHT_M,
+  DEFAULT_ROUGHNESS_LENGTH,
+} = require("./wind-protection.js");
 const matrixModule = require("./matrix.js");
-const { PredictionEngine, toNumber, toKnots } = require("./prediction.js");
+const {
+  PredictionEngine,
+  toNumber,
+  toKnots,
+  unwrapPosition,
+} = require("./prediction.js");
 const { AdvisoryPublisher } = require("./advisory.js");
 const {
   buildPluginSchema,
@@ -116,6 +132,8 @@ const SUBSCRIPTION_PATHS = [
   "environment.wind.angleApparent",
   "environment.wind.speedApparent",
   "environment.wind.speedOverGround",
+  "environment.wind.speedTrue",
+  "environment.wind.directionTrue",
   "electrical.batteries.house.capacity.stateOfCharge",
   "electrical.venus.dcPower",
   "electrical.venus.acPower",
@@ -137,6 +155,9 @@ const deps = {
   saveMatrices: matrixModule.saveMatrices,
   loadLoadProfile: matrixModule.loadLoadProfile,
   saveLoadProfile: matrixModule.saveLoadProfile,
+  loadWindProtection: matrixModule.loadWindProtection,
+  saveWindProtection: matrixModule.saveWindProtection,
+  WindProtectionStore,
   validateConfig,
 };
 
@@ -149,6 +170,9 @@ const deps = {
 module.exports = (app) => {
   /** @type {Map<string, SolarMatrix>} */
   const solarMatrices = new Map();
+
+  /** @type {WindProtectionStore|null} */
+  let windProtection = null;
 
   /** @type {IngestionFSM|null} */
   let ingestionFSM = null;
@@ -261,6 +285,236 @@ module.exports = (app) => {
   }
 
   /**
+   * Resolves the anemometer height in meters.
+   *
+   * Preference order: explicit config override, then the Signal K
+   * `design.airHeight` path (the standard path for mast height above
+   * waterline, where the anemometer typically sits at the masthead), then
+   * the built-in default.
+   *
+   * @returns {number} Anemometer height in meters
+   */
+  function resolveAnemometerHeight() {
+    const cfg = pluginConfig?.windProtection || {};
+    if (cfg.anemometerHeightM && cfg.anemometerHeightM > 0) {
+      return cfg.anemometerHeightM;
+    }
+    const airHeight = toNumber(app.getSelfPath("design.airHeight"));
+    if (airHeight != null && airHeight > 0) {
+      return airHeight;
+    }
+    return DEFAULT_ANEMOMETER_HEIGHT_M;
+  }
+
+  /**
+   * Resolves the full Wind Protection Factor context for the vessel's
+   * current place and a forecast wind direction.
+   *
+   * Shared by getWindProtection (which needs only the corrected wind/gusts)
+   * and publishWindProtection (which also needs the place/sector/factors for
+   * the Signal K paths).
+   *
+   * @param {number} forecastSpeedKnots - Forecast wind speed in knots
+   * @param {number|null} forecastGustKnots - Forecast gust in knots
+   * @param {number} windDirectionDeg - Forecast wind direction in degrees
+   *   (where the wind comes FROM)
+   * @param {number} sunElevationRad - Sun elevation in radians (day/night)
+   * @returns {{applies: boolean, placeKey: string|null, sector: number,
+   *           night: boolean, speedFactor: number, gustFactor: number,
+   *           correctedSpeed: number, correctedGust: number|null}|
+   *          {applies: false}}
+   */
+  function resolveWindProtectionContext(
+    forecastSpeedKnots,
+    forecastGustKnots,
+    windDirectionDeg,
+    sunElevationRad,
+  ) {
+    const disabled = {
+      applies: false,
+      placeKey: null,
+      sector: -1,
+      night: false,
+      speedFactor: DEFAULT_FACTOR,
+      gustFactor: DEFAULT_FACTOR,
+      correctedSpeed: forecastSpeedKnots,
+      correctedGust: forecastGustKnots,
+    };
+    if (!windProtection) return disabled;
+
+    const pos = unwrapPosition(
+      deltaState.get("navigation.position") ||
+        app.getSelfPath("navigation.position"),
+    );
+    if (!pos || pos.latitude == null || pos.longitude == null) return disabled;
+
+    const navStateRaw =
+      deltaState.get("navigation.state") || app.getSelfPath("navigation.state");
+    const navState =
+      navStateRaw && typeof navStateRaw === "object"
+        ? navStateRaw.value
+        : navStateRaw;
+    if (
+      navState === "sailing" ||
+      navState === "motoring" ||
+      navState === "under way"
+    ) {
+      return disabled;
+    }
+
+    const cfg = pluginConfig?.windProtection || {};
+    const cellSizeM = cfg.cellSizeM ?? 500;
+    const deviceHeightM = cfg.deviceHeightM ?? DEFAULT_DEVICE_HEIGHT_M;
+    const z0 = cfg.roughnessLength ?? DEFAULT_ROUGHNESS_LENGTH;
+
+    const key =
+      wpfState.placeKey ??
+      windProtection.resolvePlace(pos.latitude, pos.longitude, cellSizeM);
+    const sector = sectorFromDeg(windDirectionDeg);
+    const night = wpfIsNight(sunElevationRad);
+    const { speed: speedFactor, gust: gustFactor } = windProtection.getFactors(
+      key,
+      sector,
+      night,
+    );
+
+    // No learned correction for this place/sector → leave forecast as-is
+    if (speedFactor === DEFAULT_FACTOR && gustFactor === DEFAULT_FACTOR) {
+      return {
+        applies: false,
+        placeKey: key,
+        sector,
+        night,
+        speedFactor,
+        gustFactor,
+        correctedSpeed: forecastSpeedKnots,
+        correctedGust: forecastGustKnots,
+      };
+    }
+
+    // Scale at the 10 m reference, then translate down to device height
+    const correctedSpeed10m = forecastSpeedKnots * speedFactor;
+    const correctedGust10m =
+      forecastGustKnots != null ? forecastGustKnots * gustFactor : null;
+
+    const correctedSpeed = toDeviceHeight(correctedSpeed10m, deviceHeightM, z0);
+    const correctedGust =
+      correctedGust10m != null
+        ? toDeviceHeight(correctedGust10m, deviceHeightM, z0)
+        : null;
+    return {
+      applies: true,
+      placeKey: key,
+      sector,
+      night,
+      speedFactor,
+      gustFactor,
+      correctedSpeed,
+      correctedGust,
+    };
+  }
+
+  /**
+   * Gets wind protection correction for the current place.
+   *
+   * Returns null when WPF is disabled, the boat is under way, there is no
+   * position, or no factors have been learned for this place — in all those
+   * cases the prediction engine applies no correction (factor 1.0).
+   *
+   * @param {number} forecastSpeedKnots - Forecast wind speed in knots
+   * @param {number|null} forecastGustKnots - Forecast gust in knots
+   * @param {number} windDirectionDeg - Forecast wind direction in degrees
+   *   (where the wind comes FROM)
+   * @param {number} sunElevationRad - Sun elevation in radians (day/night)
+   * @returns {{speed: number, gust: number}|null} corrected wind/gusts at
+   *   device height, in knots; null means "no correction"
+   */
+  function getWindProtection(
+    forecastSpeedKnots,
+    forecastGustKnots,
+    windDirectionDeg,
+    sunElevationRad,
+  ) {
+    const ctx = resolveWindProtectionContext(
+      forecastSpeedKnots,
+      forecastGustKnots,
+      windDirectionDeg,
+      sunElevationRad,
+    );
+    if (!ctx.applies) return null;
+    return { speed: ctx.correctedSpeed, gust: ctx.correctedGust };
+  }
+
+  /**
+   * Publishes the current Wind Protection Factor at Signal K paths under
+   * `electrical.energy.prediction.windProtection.*` so other consumers and
+   * the instrument panel can see the learned correction for this place.
+   *
+   * Only meaningful at rest with a learned place; under way or with no
+   * learned factor the paths are cleared (values set to null) so stale
+   * numbers don't linger.
+   *
+   * @returns {void}
+   */
+  function publishWindProtection() {
+    if (!advisoryPublisher) return;
+    const base = "electrical.energy.prediction.windProtection";
+
+    // Resolve the current forecast point (nearest now) for direction + sun
+    const forecast = predictionEngine?.lastForecast || [];
+    const now = new Date();
+    const current = forecast.find(
+      (p) => Math.abs(p.time.getTime() - now.getTime()) < 1800000,
+    );
+    const pos = unwrapPosition(
+      deltaState.get("navigation.position") ||
+        app.getSelfPath("navigation.position"),
+    );
+
+    const updates = {
+      [`${base}.enabled`]: windProtection ? true : false,
+      [`${base}.placeKey`]: null,
+      [`${base}.sector`]: null,
+      [`${base}.night`]: null,
+      [`${base}.speedFactor`]: null,
+      [`${base}.gustFactor`]: null,
+      [`${base}.forecastSpeedKnots`]: null,
+      [`${base}.forecastGustKnots`]: null,
+      [`${base}.correctedSpeedKnots`]: null,
+      [`${base}.correctedGustKnots`]: null,
+      [`${base}.position`]: pos || null,
+    };
+
+    if (windProtection && current && pos) {
+      const { sunPosition } = require("./solar.js");
+      const sunPos = sunPosition(now, pos.latitude, pos.longitude);
+      const ctx = resolveWindProtectionContext(
+        current.windSpeedKnots ?? 0,
+        current.gustSpeedKnots ?? null,
+        current.windDirectionDeg ?? 0,
+        sunPos.altitude,
+      );
+      if (ctx.placeKey != null) {
+        updates[`${base}.placeKey`] = ctx.placeKey;
+        updates[`${base}.sector`] = ctx.sector >= 0 ? ctx.sector : null;
+        updates[`${base}.night`] = ctx.night;
+        updates[`${base}.speedFactor`] = ctx.speedFactor;
+        updates[`${base}.gustFactor`] = ctx.gustFactor;
+        updates[`${base}.forecastSpeedKnots`] = current.windSpeedKnots ?? null;
+        updates[`${base}.forecastGustKnots`] = current.gustSpeedKnots ?? null;
+        updates[`${base}.correctedSpeedKnots`] = ctx.applies
+          ? ctx.correctedSpeed
+          : null;
+        updates[`${base}.correctedGustKnots`] = ctx.applies
+          ? ctx.correctedGust
+          : null;
+      }
+    }
+
+    advisoryPublisher.publishDelta(updates);
+  }
+
+  /**
    * Creates or updates solar matrices for configured arrays.
    *
    * @param {object} config - Plugin configuration
@@ -316,6 +570,48 @@ module.exports = (app) => {
       }
     } catch (error) {
       app.error(`Failed to load load profile: ${error.message}`);
+    }
+  }
+
+  /**
+   * Initializes the wind protection factor store from disk.
+   *
+   * @param {object} config - Plugin configuration
+   * @returns {Promise<void>}
+   */
+  async function initializeWindProtection(config) {
+    const wpfConfig = config.windProtection || {};
+    if (wpfConfig.enabled === false) {
+      windProtection = null;
+      app.debug("Wind Protection Factor disabled in config");
+      return;
+    }
+
+    const dataDir = app.getDataDirPath();
+    try {
+      const saved = await deps.loadWindProtection(dataDir);
+      if (saved) {
+        windProtection = deps.WindProtectionStore.fromJSON(saved);
+        app.debug(
+          `Loaded wind protection store: ${windProtection.sizePlaces} places, ${windProtection.sizeSpeed} speed bins, ${windProtection.sizeGust} gust bins`,
+        );
+      } else {
+        windProtection = new deps.WindProtectionStore({
+          alpha: wpfConfig.emaAlpha,
+          maxPlaces: wpfConfig.maxPlaces,
+          learnGusts: wpfConfig.learnGusts !== false,
+          minForecastWindKnots: wpfConfig.minForecastWindKnots,
+        });
+        app.debug(`No wind protection store found, starting fresh`);
+      }
+    } catch (error) {
+      app.error(`Failed to load wind protection store: ${error.message}`);
+      windProtection = new deps.WindProtectionStore({
+        alpha: wpfConfig.emaAlpha,
+        maxPlaces: wpfConfig.maxPlaces,
+        learnGusts: wpfConfig.learnGusts !== false,
+        minForecastWindKnots: wpfConfig.minForecastWindKnots,
+      });
     }
   }
 
@@ -462,9 +758,21 @@ module.exports = (app) => {
         `Got forecast with ${forecast.length} points, source: ${ingestionFSM.getSourceInfo().source}`,
       );
 
-      // Build map of current deploy states from deltaState (before runPrediction
-      // so the detected-state yield track can use it)
-      const navState = deltaState.get("navigation.state");
+      // navigation.state drives WPF application (only at rest) and deploy
+      // recommendations (can't deploy while under way or when state is
+      // unknown). signalk-autostate derives it from GPS movement shortly
+      // after position arrives; until it's known, skip the prediction
+      // output but keep the forecast cached (the learning cycle's GHI
+      // lookup depends on it).
+      const navState = predictionEngine
+        ? predictionEngine.getNavState()
+        : "unknown";
+      if (navState === "unknown") {
+        app.debug(
+          "Prediction output skipped: navigation.state unknown yet (forecast cached)",
+        );
+        return;
+      }
       const underway =
         navState === "sailing" ||
         navState === "motoring" ||
@@ -484,7 +792,10 @@ module.exports = (app) => {
           }
           // No solar output during daytime means array is stowed
           if (powerVal != null && powerVal === 0) {
-            const pos = deltaState.get("navigation.position");
+            const pos = unwrapPosition(
+              deltaState.get("navigation.position") ||
+                app.getSelfPath("navigation.position"),
+            );
             if (pos && pos.latitude != null) {
               const { sunPosition } = require("./solar.js");
               const sunPos = sunPosition(
@@ -643,6 +954,12 @@ module.exports = (app) => {
 
       app.debug(`Prediction cycle complete: ${hourly.length} hours forecasted`);
 
+      // Publish the current Wind Protection Factor at its own Signal K
+      // path so other consumers and the instrument panel can see the
+      // learned correction for this place. Only meaningful at rest; under
+      // way the paths are cleared (no correction).
+      publishWindProtection();
+
       // Update status line
       updateStatus();
     } catch (error) {
@@ -677,6 +994,18 @@ module.exports = (app) => {
     } catch (error) {
       app.error(`Failed to save load profile: ${error.message}`);
     }
+
+    // Save wind protection store
+    if (windProtection) {
+      try {
+        await deps.saveWindProtection(dataDir, windProtection.toJSON());
+        app.debug(
+          `Saved wind protection store: ${windProtection.sizePlaces} places`,
+        );
+      } catch (error) {
+        app.error(`Failed to save wind protection store: ${error.message}`);
+      }
+    }
   }
 
   /**
@@ -695,6 +1024,32 @@ module.exports = (app) => {
   const windHistory = new Map();
   const WIND_HISTORY_MS = 5 * 60 * 1000; // 5 minutes
   const WIND_SAMPLE_INTERVAL_MS = 30 * 1000; // 30 seconds
+
+  /**
+   * Wind Protection Factor learning state.
+   *
+   * Tracks the place the boat is currently resting in and when it arrived,
+   * so learning only starts after the configured dwell time (excluding
+   * arrival maneuvers). Reset whenever the boat leaves the resting state
+   * or moves to a different place cell.
+   */
+  const wpfState = {
+    /** @type {string|null} place key resolved at anchor-drop */
+    placeKey: null,
+    /** @type {number|null} timestamp (ms) the boat settled in this place */
+    arrivedAt: null,
+    /** @type {number|null} last WPF learning tick (ms), throttled */
+    lastLearn: 0,
+  };
+  const WPF_LEARN_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+
+  /**
+   * Delay before the first prediction cycle at startup, so
+   * signalk-autostate has time to derive and publish navigation.state.
+   * Without a known nav state the prediction is skipped (WPF only applies
+   * at rest, and deploy recommendations need a known state).
+   */
+  const INITIAL_PREDICTION_DELAY_MS = 10 * 1000; // 10 seconds
 
   /**
    * Rolling solar power samples per path for running averages.
@@ -742,11 +1097,12 @@ module.exports = (app) => {
               v.path === "navigation.state" ||
               v.path === "navigation.position" ||
               PROPULSION_STATE_RE.test(v.path);
-            if (
-              sticky &&
-              (v.value == null || v.value === "") &&
-              deltaState.has(v.path)
-            ) {
+            // Sticky signals persist until a real new value arrives: an
+            // empty/null update (some providers emit "" when the source
+            // drops out) must never clear or initialize a sticky value,
+            // otherwise downstream `?? app.getSelfPath(...)` falls through
+            // to the (wrapped) server value while `deltaState` holds "".
+            if (sticky && (v.value == null || v.value === "")) {
               continue;
             }
             deltaState.set(v.path, v.value);
@@ -828,6 +1184,21 @@ module.exports = (app) => {
               }
             }
           }
+        }
+      }
+
+      // Wind Protection Factor learning: triggered by any wind reading
+      // (speed, gust, or direction) while at rest. Throttled and
+      // dwell-gated inside the learning function itself.
+      const wpfConfig = pluginConfig?.windProtection;
+      if (wpfConfig?.enabled !== false && ingestionFSM && windProtection) {
+        const sawWind = delta.updates?.some((u) =>
+          u.values?.some((v) => v.path.startsWith("environment.wind.")),
+        );
+        if (sawWind) {
+          runWindProtectionLearning().catch((error) => {
+            app.error(`Wind protection learning error: ${error.message}`);
+          });
         }
       }
 
@@ -921,7 +1292,9 @@ module.exports = (app) => {
         deltaState.get("navigation.state") ||
         app.getSelfPath("navigation.state");
       const navState =
-        typeof navStateRaw === "string" ? navStateRaw : "unknown";
+        navStateRaw && typeof navStateRaw === "object"
+          ? navStateRaw.value
+          : navStateRaw;
       const isSailing = navState === "sailing";
 
       // Get AWA if sailing
@@ -971,9 +1344,10 @@ module.exports = (app) => {
         app.debug(`Array ${array.id}: learning with ${actualPowerW}W output`);
 
         // Get sun position (prefer delta state, fall back to app.getSelfPath)
-        const pos =
+        const pos = unwrapPosition(
           deltaState.get("navigation.position") ||
-          app.getSelfPath("navigation.position");
+            app.getSelfPath("navigation.position"),
+        );
         if (!pos || pos.latitude == null || pos.longitude == null) {
           app.debug(`Array ${array.id}: no GPS position, skipping learning`);
           continue;
@@ -1033,6 +1407,207 @@ module.exports = (app) => {
       learningCycleCount++;
     } catch (error) {
       app.error(`Failed to process learning cycle: ${error.message}`);
+    }
+  }
+
+  /**
+   * Runs one Wind Protection Factor learning pass: compares measured wind
+   * (height-normalized to the 10 m forecast reference) against the current
+   * forecast for this hour and updates the per-place/per-sector EMA.
+   *
+   * Only learns while at rest (anchored or moored) and only after the boat
+   * has dwelled in the current place cell for the configured dwell time,
+   * so arrival maneuvers don't contaminate the factor. Under way, no
+   * learning and no application (getWindProtection returns null).
+   *
+   * @returns {Promise<void>}
+   */
+  async function runWindProtectionLearning() {
+    if (!windProtection || !ingestionFSM) return;
+
+    const cfg = pluginConfig?.windProtection || {};
+
+    // Only learn at rest
+    const navStateRaw =
+      deltaState.get("navigation.state") || app.getSelfPath("navigation.state");
+    const navState =
+      navStateRaw && typeof navStateRaw === "object"
+        ? navStateRaw.value
+        : navStateRaw;
+    if (navState !== "anchored" && navState !== "moored") {
+      wpfState.placeKey = null;
+      wpfState.arrivedAt = null;
+      return;
+    }
+
+    // Throttle: don't learn more often than the WPF interval
+    const now = Date.now();
+    if (now - wpfState.lastLearn < WPF_LEARN_INTERVAL_MS) {
+      return;
+    }
+
+    // Resolve position
+    const pos = unwrapPosition(
+      deltaState.get("navigation.position") ||
+        app.getSelfPath("navigation.position"),
+    );
+    if (!pos || pos.latitude == null || pos.longitude == null) {
+      return;
+    }
+
+    const cellSizeM = cfg.cellSizeM ?? 500;
+
+    // Resolve the anchorage for the current position. resolvePlace matches
+    // to the nearest known anchorage within the match radius, so a swing
+    // on the anchor (or a nearby re-drop on a revisit) keeps the same key,
+    // while a real relocation within a continuous at-rest session (e.g.
+    // motoring into a marina, state flipping to moored early, then moving
+    // to the slip 1.5 km away) resolves to a different key and restarts
+    // the dwell window.
+    const key = windProtection.resolvePlace(
+      pos.latitude,
+      pos.longitude,
+      cellSizeM,
+    );
+
+    // Dwell gating: reset when the resolved place changes (the boat moved
+    // to a different anchorage); only learn after the boat has been at this
+    // anchorage long enough to exclude maneuvers and settle on the rode.
+    const dwellMinutes = cfg.dwellMinutes ?? 15;
+    if (wpfState.placeKey !== key) {
+      wpfState.placeKey = key;
+      wpfState.arrivedAt = now;
+      app.debug(
+        `WPF: at anchorage ${key} (${navState}), dwelling ${dwellMinutes}min before learning`,
+      );
+      return;
+    }
+    if (
+      wpfState.arrivedAt == null ||
+      now - wpfState.arrivedAt < dwellMinutes * 60000
+    ) {
+      return;
+    }
+
+    // Resolve measured wind. Preference chain (mirrors the rest of the
+    // plugin): true wind first (at anchor apparent≈true, but current can
+    // bias apparent wind, so true is preferred), then over-ground, then
+    // apparent. All converted to knots.
+    const measuredSpeedKnots =
+      toKnots(
+        deltaState.get("environment.wind.speedTrue") ||
+          app.getSelfPath("environment.wind.speedTrue"),
+      ) ??
+      toKnots(
+        deltaState.get("environment.wind.speedOverGround") ||
+          app.getSelfPath("environment.wind.speedOverGround"),
+      ) ??
+      toKnots(
+        deltaState.get("environment.wind.speedApparent") ||
+          app.getSelfPath("environment.wind.speedApparent"),
+      );
+    if (measuredSpeedKnots == null) return;
+
+    // Measured gust: there is no environment.wind.gust sensor on this
+    // vessel, so the gust is taken as the max of recent wind speed
+    // samples (mirroring signalk-meshtastic, which reports windGust as the
+    // max of its speedOverGround sample window). We use the rolling
+    // windHistory buffer across all wind speed paths, limited to a gust
+    // window comparable to a forecast gust.
+    const allWindHistory = [
+      ...(windHistory.get("environment.wind.speedTrue") || []),
+      ...(windHistory.get("environment.wind.speedOverGround") || []),
+      ...(windHistory.get("environment.wind.speedApparent") || []),
+    ];
+    const gustWindowSamples = allWindHistory.filter(
+      (s) => s.time >= now - WIND_HISTORY_MS,
+    );
+    const measuredGustKnots =
+      gustWindowSamples.length >= 2
+        ? Math.max(...gustWindowSamples.map((s) => s.speed))
+        : null;
+
+    // Forecast for the current hour: fetch (cached, fresh) and find the
+    // point nearest now
+    let forecast;
+    try {
+      forecast = await ingestionFSM.getForecast();
+    } catch (error) {
+      app.debug(`WPF: forecast unavailable, skipping: ${error.message}`);
+      return;
+    }
+    const current = forecast.find(
+      (p) => Math.abs(p.time.getTime() - now) < 1800000, // within 30 min
+    );
+    if (!current) return;
+
+    const forecastSpeed = current.windSpeedKnots;
+    const forecastGust = current.gustSpeedKnots;
+    const windDirectionDeg = current.windDirectionDeg;
+    if (forecastSpeed == null) return;
+
+    // Height-normalize the measured reading from anemometer height to the
+    // 10 m forecast reference before taking the ratio, so the factor
+    // reflects place shelter rather than the masthead→10m offset
+    const anemometerHeightM = resolveAnemometerHeight();
+    const z0 = cfg.roughnessLength ?? DEFAULT_ROUGHNESS_LENGTH;
+    const measuredSpeed10m = toForecastReference(
+      measuredSpeedKnots,
+      anemometerHeightM,
+      z0,
+    );
+    const measuredGust10m =
+      measuredGustKnots != null
+        ? toForecastReference(measuredGustKnots, anemometerHeightM, z0)
+        : null;
+
+    // Day/night bin from the sun elevation at the vessel
+    const { sunPosition } = require("./solar.js");
+    const sunPos = sunPosition(new Date(now), pos.latitude, pos.longitude);
+    const night = wpfIsNight(sunPos.altitude);
+
+    const sector = sectorFromDeg(windDirectionDeg);
+
+    const updated = windProtection.learn({
+      placeKey: wpfState.placeKey,
+      sector,
+      night,
+      measuredSpeed: measuredSpeed10m,
+      forecastSpeed,
+      measuredGust: measuredGust10m,
+      forecastGust,
+    });
+
+    wpfState.lastLearn = now;
+    if (updated) {
+      // Pull the post-update factors so the record shows the learned
+      // state of this place/sector after absorbing this observation
+      const { speed: speedFactor, gust: gustFactor } =
+        windProtection.getFactors(wpfState.placeKey, sector, night);
+      app.debug(
+        `WPF: learned ${wpfState.placeKey} sector ${sector} ${night ? "night" : "day"}: measured ${measuredSpeed10m.toFixed(1)}kn vs forecast ${forecastSpeed.toFixed(1)}kn (dir ${windDirectionDeg != null ? Math.round(windDirectionDeg) : "?"}°) → speed×${speedFactor.toFixed(2)} gust×${gustFactor.toFixed(2)}`,
+      );
+
+      // Record the observation so past anchorage wind protection is
+      // queryable later (timeline webapp + offline backfill material)
+      if (recorder) {
+        await recorder.recordWindProtection({
+          timestamp: new Date(now),
+          placeKey: wpfState.placeKey,
+          sector,
+          night,
+          measuredSpeedKnots: measuredSpeed10m,
+          forecastSpeedKnots: forecastSpeed,
+          measuredGustKnots: measuredGust10m,
+          forecastGustKnots: forecastGust,
+          windDirectionDeg: windDirectionDeg ?? null,
+          speedFactor,
+          gustFactor,
+          position: { latitude: pos.latitude, longitude: pos.longitude },
+          navState: navState,
+          anemometerHeightM,
+        });
+      }
     }
   }
 
@@ -1109,16 +1684,18 @@ module.exports = (app) => {
       null;
 
     // Get navigation state
+    const navStateRaw =
+      deltaState.get("navigation.state") || app.getSelfPath("navigation.state");
     const navState =
-      deltaState.get("navigation.state") ||
-      app.getSelfPath("navigation.state") ||
-      "unknown";
+      navStateRaw && typeof navStateRaw === "object"
+        ? navStateRaw.value
+        : navStateRaw || "unknown";
 
     // Get position
-    const position =
+    const position = unwrapPosition(
       deltaState.get("navigation.position") ||
-      app.getSelfPath("navigation.position") ||
-      null;
+        app.getSelfPath("navigation.position"),
+    );
 
     // Get speed through water (for hydro generator prediction)
     const stwKnots =
@@ -1267,13 +1844,16 @@ module.exports = (app) => {
         mechanicalGenerators: getActiveGenerators(config),
         getEfficiency,
         getSelfPath: (path) => deltaState.get(path) ?? app.getSelfPath(path),
+        getWindProtection,
         getDisplayName,
         app,
         loadProfileConfig: config.loadProfile || {},
+        windProtectionConfig: config.windProtection || {},
         predictionHours: config.weather?.forecastHours,
       });
 
       await initializeLoadProfile();
+      await initializeWindProtection(config);
 
       // Subscribe to Signal K updates
       subscribeToDeltas();
@@ -1316,9 +1896,19 @@ module.exports = (app) => {
         });
       }, sampleIntervalMs);
 
-      // Run initial prediction
-      app.debug(`Running initial prediction cycle...`);
-      await runPredictionCycle();
+      // Run initial prediction after a short delay so signalk-autostate
+      // (which derives navigation.state from GPS movement) has had time to
+      // start and publish. Without nav state the prediction would be
+      // skipped (WPF only applies at rest, deploy recommendations need a
+      // known state) and the first cycle would emit nothing useful.
+      app.debug(
+        `Scheduling initial prediction in ${INITIAL_PREDICTION_DELAY_MS}ms...`,
+      );
+      setTimeout(() => {
+        runPredictionCycle().catch((error) => {
+          app.error(`Initial prediction cycle error: ${error.message}`);
+        });
+      }, INITIAL_PREDICTION_DELAY_MS);
 
       // Set initial status
       const activeSolar = getActiveSolarArrays(pluginConfig).filter(
@@ -1420,6 +2010,7 @@ module.exports = (app) => {
         app,
         getConfig: () => pluginConfig,
         dataDir: app.getDataDirPath(),
+        getWindProtection: () => windProtection,
       });
       app.debug("REST API routes registered");
     },

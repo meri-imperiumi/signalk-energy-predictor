@@ -251,6 +251,14 @@ async function runPopulate(args) {
       `Load profile: ${lp.ingested} ingested, ${lp.gated} gated (${lp.learnedBins} bins learned${lp.seeded ? ", built on saved profile" : ", fresh"})`,
     );
   }
+  if (result.windProtection) {
+    const wp = result.windProtection;
+    console.log(
+      `Wind protection: ${wp.samples} samples learned (${wp.dataPoints} data points, ${wp.skippedUnderway} under-way, ${wp.skippedDwell} dwell-skipped) across ${wp.places} anchorage(s)${wp.seeded ? ", built on saved store" : ", fresh"}`,
+    );
+  } else {
+    console.log("Wind protection: disabled in config");
+  }
   if (args.fresh) {
     console.log("Matrices rebuilt from scratch (fresh)");
   } else {
