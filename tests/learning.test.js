@@ -246,8 +246,21 @@ test.describe("SolarMatrix", () => {
 
     test("returns default efficiency for unknown sailing bin", () => {
       const matrix = new SolarMatrix("test-array");
+      // No anchored bin learned either -> flat default
       const eff = matrix.getSailing(0, Math.PI / 4, Math.PI / 2);
       assert.strictEqual(eff, 0.7);
+    });
+
+    test("falls back to anchored bin for unknown sailing bin", () => {
+      // Rig shading is shared between at-rest and under-sail conditions, so
+      // an unlearned sailing bin inherits the anchored eta for the same sun
+      // position instead of the flat 0.7 default. This avoids over-prediction
+      // on sparse sailing bins (the anchored matrix converges faster because
+      // it sees far more ticks).
+      const matrix = new SolarMatrix("test-array");
+      matrix.anchored.set("0_40", 0.42);
+      const eff = matrix.getSailing(0, Math.PI / 4, Math.PI / 2);
+      assert.strictEqual(eff, 0.42);
     });
 
     test("updates anchored matrix on valid tick", () => {

@@ -257,6 +257,19 @@ class SolarMatrix {
   /**
    * Gets efficiency from sailing matrix.
    *
+   * The sailing matrix is sparsely populated (few under-sail ticks per
+   * az/elev/AWA bin) and an unlearned bin used to fall back to the flat
+   * DEFAULT_EFFICIENCY (0.7), which over-predicts: the rig shading that's
+   * already encoded in the anchored matrix for the same sun position is
+   * ignored, and 0.7 is higher than the true under-sail efficiency of a
+   * shade-affected array. Instead we fall back to the anchored bin for the
+   * same azimuth/elevation first — that carries the shared rig shading
+   * (mast, boom, standing rigging present whether sailing or not) — and
+   * only use DEFAULT_EFFICIENCY when the anchored bin is also unlearned.
+   * Sailing then only needs to learn the *delta* from sail-cloth shading
+   * and heeling (which can be positive when heeling sun-side), not the
+   * whole shading profile from scratch.
+   *
    * @param {number} azimuthRad - Sun azimuth in radians
    * @param {number} elevationRad - Sun elevation in radians
    * @param {number} awaRad - Apparent Wind Angle in radians
@@ -264,7 +277,11 @@ class SolarMatrix {
    */
   getSailing(azimuthRad, elevationRad, awaRad) {
     const key = sailingKey(azimuthRad, elevationRad, awaRad);
-    return this.sailing.get(key) ?? DEFAULT_EFFICIENCY;
+    const learned = this.sailing.get(key);
+    if (learned != null) {
+      return learned;
+    }
+    return this.getAnchored(azimuthRad, elevationRad);
   }
 
   /**
@@ -310,7 +327,15 @@ class SolarMatrix {
     // Update appropriate matrix based on navigation state
     if (navState === "sailing" && awaRad != null) {
       const key = sailingKey(sunAzimuthRad, sunElevationRad, awaRad);
-      const existing = this.sailing.get(key) ?? DEFAULT_EFFICIENCY;
+      // Seed from the anchored bin for the same sun position: the rig
+      // shading is already learned there, so the sailing EMA only needs to
+      // pick up the delta from sail-cloth shading and heeling (see
+      // getSailing). Falls back to DEFAULT_EFFICIENCY when the anchored bin
+      // is also unlearned.
+      const existing =
+        this.sailing.get(key) ??
+        this.anchored.get(anchoredKey(sunAzimuthRad, sunElevationRad)) ??
+        DEFAULT_EFFICIENCY;
       const updated = emaUpdate(existing, etaObserved);
       this.sailing.set(key, updated);
     } else {
