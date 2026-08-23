@@ -12,6 +12,7 @@ const path = require("node:path");
 
 const {
   fetchHistoricalWeather,
+  fetchHistoricalWeatherTrack,
   interpolateWeather,
   replayHistory,
   replayGenerators,
@@ -23,6 +24,10 @@ const {
   historyHeaders,
   queryHistory,
 } = require("../plugin/history-backfill.js");
+const {
+  writeWeatherCache,
+  readWeatherCache,
+} = require("../plugin/weather-cache.js");
 const { SolarMatrix } = require("../plugin/learning.js");
 const {
   LoadProfile,
@@ -1549,4 +1554,126 @@ test.describe("populateFromHistory: wind protection", () => {
       await fs.rm(dataDir, { recursive: true, force: true });
     }
   });
+});
+
+test("fetchHistoricalWeatherTrack is cache-first: cached days make zero requests", async () => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "backfill-cache-"));
+  try {
+    const bucket = { latitude: 60.17, longitude: 21.39 };
+    // Pre-seed the cache for one day.
+    await writeWeatherCache(
+      dataDir,
+      "2026-08-20",
+      bucket,
+      [
+        {
+          time: new Date("2026-08-20T12:00:00Z"),
+          ghi: 800,
+          cloudCover: 0,
+          windSpeedKnots: 5,
+          gustSpeedKnots: 8,
+          windDirectionDeg: 90,
+          tier: 1,
+        },
+      ],
+      1,
+    );
+    const urls = [];
+    const fetchImpl = async (url) => {
+      urls.push(String(url));
+      return { ok: true, json: async () => ({ hourly: { time: [] } }) };
+    };
+    const out = await fetchHistoricalWeatherTrack({
+      dailyPositions: [
+        { date: "2026-08-20", latitude: 60.174, longitude: 21.386 },
+        { date: "2026-08-21", latitude: 60.174, longitude: 21.386 },
+      ],
+      fetchImpl,
+      dataDir,
+    });
+    // The cached day produced no network call; only the uncached day did.
+    assert.strictEqual(urls.length, 1);
+    assert.match(urls[0], /2026-08-21/);
+    // The cached day's hour is returned alongside the fetched day's.
+    assert.ok(out.some((p) => p.time.getUTCHours() === 12));
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("fetchHistoricalWeatherTrack persists-as-you-go (resumable after rate-limit)", async () => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "backfill-cache-"));
+  try {
+    let calls = 0;
+    const fetchImpl = async (url) => {
+      calls++;
+      // First day succeeds, second day rate-limits past retries.
+      if (calls === 1) {
+        return {
+          ok: true,
+          json: async () => ({
+            hourly: {
+              time: ["2026-08-20T12:00"],
+              shortwave_radiation: [800],
+              cloud_cover: [0],
+              wind_speed_10m: [10],
+              wind_gusts_10m: [15],
+              wind_direction_10m: [90],
+            },
+          }),
+        };
+      }
+      return { ok: false, status: 429, headers: new Map() };
+    };
+    // Small backoff so the test stays fast.
+    const out = await fetchHistoricalWeatherTrack({
+      dailyPositions: [
+        { date: "2026-08-20", latitude: 60.174, longitude: 21.386 },
+        { date: "2026-08-21", latitude: 60.174, longitude: 21.386 },
+      ],
+      fetchImpl,
+      dataDir,
+      app: { debug: () => {} },
+    });
+    // First day's hour is present; second day failed but didn't abort.
+    assert.ok(out.some((p) => p.time.getUTCHours() === 12));
+    // The successful day was persisted, so a re-run with no network still
+    // returns it.
+    const cached = await readWeatherCache(dataDir, "2026-08-20", {
+      latitude: 60.17,
+      longitude: 21.39,
+    });
+    assert.ok(cached && cached.length > 0);
+    assert.strictEqual(cached[0].tier, 1);
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("fetchHistoricalWeatherTrack without dataDir is pure fetch (no cache)", async () => {
+  let calls = 0;
+  const fetchImpl = async () => {
+    calls++;
+    return {
+      ok: true,
+      json: async () => ({
+        hourly: {
+          time: ["2026-08-20T12:00"],
+          shortwave_radiation: [800],
+          cloud_cover: [0],
+          wind_speed_10m: [10],
+          wind_gusts_10m: [15],
+          wind_direction_10m: [90],
+        },
+      }),
+    };
+  };
+  const out = await fetchHistoricalWeatherTrack({
+    dailyPositions: [
+      { date: "2026-08-20", latitude: 60.174, longitude: 21.386 },
+    ],
+    fetchImpl,
+  });
+  assert.strictEqual(calls, 1);
+  assert.strictEqual(out.length, 1);
 });

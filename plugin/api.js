@@ -771,7 +771,7 @@ function registerApiRoutes(
     const config = getConfig();
     loadRecords(readRecordings, from, to, "sample")
       .then((samples) =>
-        buildRetroPredicted(samples, config, dataDir, from, to),
+        buildRetroPredicted(samples, config, dataDir, from, to, app),
       )
       .then((body) => res.json(body))
       .catch((error) => handleError(error, res));
@@ -858,7 +858,7 @@ function registerApiRoutes(
  * @param {Date} to - Window end
  * @returns {Promise<object>} Response body
  */
-async function buildRetroPredicted(samples, config, dataDir, from, to) {
+async function buildRetroPredicted(samples, config, dataDir, from, to, app) {
   const backfill = require("./history-backfill.js");
   const { SolarMatrix, theoreticalPower } = require("./learning.js");
   const { sunPosition, irradianceFromCloudCover } = require("./solar.js");
@@ -910,7 +910,11 @@ async function buildRetroPredicted(samples, config, dataDir, from, to) {
 
   const weather =
     dailyPositions.length > 0
-      ? await backfill.fetchHistoricalWeatherTrack({ dailyPositions })
+      ? await backfill.fetchHistoricalWeatherTrack({
+          dailyPositions,
+          dataDir,
+          app,
+        })
       : [];
 
   // Per-hour state: take the latest sample at or before each hour

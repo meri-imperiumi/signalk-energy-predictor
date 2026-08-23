@@ -16,6 +16,7 @@ const {
   irradianceFromCloudCover,
   oktasToFraction,
 } = require("./solar.js");
+const weatherCache = require("./weather-cache.js");
 
 /** @typedef {import("@signalk/server-api").ServerAPI} ServerAPI */
 
@@ -414,8 +415,13 @@ function synthesizeGHI(point, latitude, longitude) {
 class IngestionFSM {
   /**
    * @param {ServerAPI} app - Signal K server API
+   * @param {object} [opts]
+   * @param {number} [opts.forecastHours]
+   * @param {string} [opts.dataDir] - Plugin data directory; when set, freshly
+   *        fetched forecasts are cached to disk so retro-predicted can reuse
+   *        them offline (same store/format as the historical backfill cache)
    */
-  constructor(app, { forecastHours } = {}) {
+  constructor(app, { forecastHours, dataDir } = {}) {
     this.app = app;
     this.currentTier = Tier.OPEN_METEO;
     this.forecastHours = Math.min(
@@ -428,6 +434,7 @@ class IngestionFSM {
     this.minFetchIntervalMs = 60000; // Don't retry more often than once per minute
     this.position = { latitude: null, longitude: null };
     this.cachedCloudCover = []; // From logbook, used as fallback for future hours
+    this.dataDir = dataDir || null;
   }
 
   /**
@@ -583,6 +590,55 @@ class IngestionFSM {
   }
 
   /**
+   * Caches the freshly fetched forecast into the on-disk weather store so
+   * retro-predicted can reuse it offline. Points are grouped by UTC date and
+   * written at the vessel's current position bucket — the same store/format
+   * the historical backfill uses — so live forecasts (any tier, including
+   * Clear Sky) and backfilled archive weather are interchangeable.
+   *
+   * Best-effort: a cache write failure must not break the prediction cycle.
+   * @returns {Promise<void>}
+   */
+  async cacheForecast() {
+    if (!this.dataDir || this.lastForecast.length === 0) return;
+    const { latitude, longitude } = this.position;
+    if (latitude == null || longitude == null) return;
+    const bucket = weatherCache.weatherPositionBucket(latitude, longitude);
+    // Group points by UTC date (YYYY-MM-DD) so each day lands in its own file.
+    const byDate = new Map();
+    for (const p of this.lastForecast) {
+      const d = p.time;
+      const key = `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
+      let arr = byDate.get(key);
+      if (!arr) {
+        arr = [];
+        byDate.set(key, arr);
+      }
+      arr.push({
+        time: d,
+        ghi: p.ghi ?? null,
+        cloudCover: p.cloudCover ?? null,
+        windSpeedKnots: p.windSpeedKnots ?? null,
+        gustSpeedKnots: p.gustSpeedKnots ?? null,
+        windDirectionDeg: p.windDirectionDeg ?? null,
+      });
+    }
+    try {
+      for (const [dateKey, hours] of byDate) {
+        await weatherCache.writeWeatherCache(
+          this.dataDir,
+          dateKey,
+          bucket,
+          hours,
+          this.currentTier,
+        );
+      }
+    } catch (error) {
+      this.app.debug?.(`Failed to cache forecast weather: ${error.message}`);
+    }
+  }
+
+  /**
    * Fetches a new forecast using the fallback FSM.
    *
    * @returns {Promise<ForecastPoint[]>} Forecast points
@@ -623,6 +679,7 @@ class IngestionFSM {
         this.app.debug(
           `Got ${this.lastForecast.length} forecast points from ${this.getTierName(tier)}`,
         );
+        await this.cacheForecast();
         return this.lastForecast;
       }
     }
@@ -638,6 +695,7 @@ class IngestionFSM {
       this.position.longitude,
     );
     this.app.debug(`Generated ${this.lastForecast.length} clear sky points`);
+    await this.cacheForecast();
     return this.lastForecast;
   }
 

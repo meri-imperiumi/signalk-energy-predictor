@@ -2003,6 +2003,7 @@ module.exports = (app) => {
       // Initialize components
       ingestionFSM = new deps.IngestionFSM(app, {
         forecastHours: config.weather?.forecastHours,
+        dataDir: app.getDataDirPath(),
       });
       advisoryPublisher = new deps.AdvisoryPublisher(app, plugin.id);
 

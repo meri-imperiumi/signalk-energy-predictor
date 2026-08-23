@@ -12,11 +12,16 @@
  *   from existing files in the data dir, replays the remote history
  *   through them, persists results via the standard matrix persistence,
  *   and gap-fills the recordings store with pre-install samples
+ * - Weather-only: `--weather-only --data-dir=<plugin data dir>` just fills
+ *   the offline weather cache for the date range (one Open-Meteo archive
+ *   request per uncached day, resumable). No matrices, no samples.
  *
  * Usage:
  *   node bin/backtest.js --from=2026-08-01 --to=2026-08-21 \
  *     --provider=signalk-history-sqlite
  *   node bin/backtest.js --populate --data-dir=~/.signalk/plugin-config-data/signalk-energy-predictor
+ *   node bin/backtest.js --weather-only --from=2026-07-01 --to=2026-08-31 \
+ *     --data-dir=~/.signalk/plugin-config-data/signalk-energy-predictor
  *
  * Environment:
  *   SIGNALK_TOKEN   bearer token for the History API (security-enabled servers)
@@ -71,6 +76,7 @@ function parseArguments() {
       },
       output: { type: "string" },
       populate: { type: "boolean", default: false },
+      "weather-only": { type: "boolean", default: false },
       fresh: { type: "boolean", default: false },
       "data-dir": { type: "string" },
       "base-url": {
@@ -183,9 +189,16 @@ async function runBacktest(args) {
     resolution: parseInt(args.resolution, 10),
   });
   const dailyPositions = dailyPositionsFromHistory(historyData, from, to);
+  const backtestDataDir = args["data-dir"]
+    ? args["data-dir"].replace("~", process.env.HOME || "~")
+    : undefined;
   const weather =
     dailyPositions.length > 0
-      ? await fetchHistoricalWeatherTrack({ dailyPositions })
+      ? await fetchHistoricalWeatherTrack({
+          dailyPositions,
+          dataDir: backtestDataDir,
+          app: { debug: (m) => console.error(m) },
+        })
       : [];
 
   const results = [];
@@ -271,9 +284,59 @@ async function runPopulate(args) {
   }
 }
 
+/**
+ * Runs weather-only mode: fetches historical weather for each UTC day in
+ * the range at the vessel's position that day and writes it to the offline
+ * cache. No matrices, no samples, no predictions — just fills
+ * `<dataDir>/weather/<date>/<bucket>.json` so the webapp's week/month views
+ * and `/api/retro-predicted` work offline and don't re-hit Open-Meteo.
+ *
+ * Resumable: cached days are skipped (zero requests), so re-running after a
+ * rate-limit just picks up the remaining days.
+ */
+async function runWeatherOnly(args) {
+  if (!args["data-dir"]) {
+    console.error("Weather-only mode needs --data-dir=<plugin data dir>");
+    process.exit(1);
+  }
+  const dataDir = args["data-dir"].replace("~", process.env.HOME || "~");
+  const from = new Date(`${args.from}T00:00:00Z`);
+  const to = new Date(`${args.to}T23:59:59Z`);
+
+  // Only navigation.position is needed to anchor each day's weather query.
+  const historyData = await queryHistory({
+    baseUrl: args["base-url"],
+    provider: args.provider || undefined,
+    from,
+    to,
+    paths: ["navigation.position"],
+    resolution: parseInt(args.resolution, 10),
+  });
+
+  const dailyPositions = dailyPositionsFromHistory(historyData, from, to);
+  if (dailyPositions.length === 0) {
+    console.error(
+      "No vessel positions found in the window — the weather cache needs navigation.position history.",
+    );
+    process.exit(1);
+  }
+
+  console.log(
+    `Fetching weather for ${dailyPositions.length} days (${args.from} → ${args.to}) into ${dataDir}/weather/`,
+  );
+  const weather = await fetchHistoricalWeatherTrack({
+    dailyPositions,
+    dataDir,
+    app: { debug: (m) => console.error(m) },
+  });
+  console.log(`Cached ${weather.length} hourly weather points.`);
+}
+
 const args = parseArguments();
 if (args.populate) {
   await runPopulate(args);
+} else if (args["weather-only"]) {
+  await runWeatherOnly(args);
 } else {
   await runBacktest(args);
 }

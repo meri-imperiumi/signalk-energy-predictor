@@ -19,6 +19,7 @@ const {
 const matrixPersistence = require("./matrix.js");
 const { parseManufacturerCurve } = require("./schema.js");
 const recorderModule = require("./recorder.js");
+const weatherCache = require("./weather-cache.js");
 const {
   detectSolarArrayState,
   detectGeneratorState,
@@ -266,7 +267,68 @@ async function queryHistory({
 }
 
 /**
- * Fetches historical weather data from the Open-Meteo archive API.
+ * Sleep helper for rate-limit spacing and backoff.
+ * @param {number} ms
+ * @returns {Promise<void>}
+ */
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Max retry attempts for a transient Open-Meteo archive failure (429 / 5xx /
+ * network). A rate-limited backfill backs off rather than aborting, so a
+ * long backfill survives a temporary 429.
+ */
+const WEATHER_MAX_RETRIES = 4;
+
+/**
+ * Base backoff (ms) for exponential retry: 2s, 4s, 8s, 16s.
+ */
+const WEATHER_BACKOFF_BASE_MS = 2000;
+
+/**
+ * Spacing between successful daily archive requests, so a long backfill
+ * isn't bursty enough to trip the rate limiter in the first place.
+ */
+const WEATHER_REQUEST_GAP_MS = 500;
+
+/**
+ * Defensive cap on archive requests per `fetchHistoricalWeatherTrack` call.
+ * A cached day makes zero requests, so re-runs after a partial backfill are
+ * cheap; this bounds a single fresh run so an enormous window doesn't fire
+ * thousands of requests in one session — bail with a clear message and
+ * resume later from cache.
+ */
+const WEATHER_MAX_REQUESTS_PER_RUN = 500;
+
+/**
+ * Whether an Open-Meteo archive response is transient and worth retrying.
+ * 429 (rate limit) and 5xx (server) are retryable; 4xx client errors are not.
+ * @param {number} status
+ * @returns {boolean}
+ */
+function isArchiveRetryableStatus(status) {
+  return status === 429 || status >= 500;
+}
+
+/**
+ * Parses the Retry-After header (seconds) from a 429 response, clamped to a
+ * sane ceiling so a hostile value can't stall a backfill indefinitely.
+ * @param {Response} response
+ * @returns {number} milliseconds to wait, or 0 if absent/invalid
+ */
+function retryAfterMs(response) {
+  const raw = response.headers?.get?.("retry-after");
+  if (raw == null) return 0;
+  const seconds = Number.parseInt(raw, 10);
+  if (!Number.isFinite(seconds)) return 0;
+  return Math.min(Math.max(seconds, 0), 60) * 1000;
+}
+
+/**
+ * Fetches historical weather data from the Open-Meteo archive API, retrying
+ * transient failures (429 / 5xx / network) with exponential backoff.
  *
  * @param {object} params
  * @param {number} params.latitude - Latitude in degrees
@@ -294,58 +356,143 @@ async function fetchHistoricalWeather({
   );
   url.searchParams.set("timezone", "UTC");
 
-  const response = await fetchImpl(url);
+  let lastError = null;
+  for (let attempt = 0; attempt <= WEATHER_MAX_RETRIES; attempt++) {
+    let response;
+    try {
+      response = await fetchImpl(url);
+    } catch (error) {
+      // Network-level failure: retry (offline is handled by the cache layer)
+      lastError = error;
+      if (attempt === WEATHER_MAX_RETRIES) throw error;
+      await sleep(WEATHER_BACKOFF_BASE_MS * 2 ** attempt);
+      continue;
+    }
 
-  if (!response.ok) {
-    throw new Error(`Open-Meteo Archive API returned ${response.status}`);
+    if (response.ok) {
+      const data = await response.json();
+      if (!data.hourly?.time) {
+        return [];
+      }
+      /** km/h → knots */
+      const kmhToKn = (v) => (v == null ? null : v * 0.539957);
+      return data.hourly.time.map((time, i) => ({
+        time: parseUtcTimestamp(time),
+        ghi: data.hourly.shortwave_radiation?.[i] ?? null,
+        cloudCover: data.hourly.cloud_cover?.[i] ?? null,
+        windSpeedKnots: kmhToKn(data.hourly.wind_speed_10m?.[i] ?? null),
+        gustSpeedKnots: kmhToKn(data.hourly.wind_gusts_10m?.[i] ?? null),
+        windDirectionDeg: data.hourly.wind_direction_10m?.[i] ?? null,
+      }));
+    }
+
+    const status = response.status;
+    if (!isArchiveRetryableStatus(status)) {
+      throw new Error(`Open-Meteo Archive API returned ${status}`);
+    }
+    // Transient: back off. Honor Retry-After on 429, else exponential.
+    lastError = new Error(`Open-Meteo Archive API returned ${status}`);
+    if (attempt === WEATHER_MAX_RETRIES) break;
+    const wait =
+      status === 429
+        ? retryAfterMs(response) || WEATHER_BACKOFF_BASE_MS * 2 ** attempt
+        : WEATHER_BACKOFF_BASE_MS * 2 ** attempt;
+    await sleep(wait);
   }
-
-  const data = await response.json();
-
-  if (!data.hourly?.time) {
-    return [];
-  }
-
-  /** km/h → knots */
-  const kmhToKn = (v) => (v == null ? null : v * 0.539957);
-
-  return data.hourly.time.map((time, i) => ({
-    time: parseUtcTimestamp(time),
-    ghi: data.hourly.shortwave_radiation?.[i] ?? null,
-    cloudCover: data.hourly.cloud_cover?.[i] ?? null,
-    windSpeedKnots: kmhToKn(data.hourly.wind_speed_10m?.[i] ?? null),
-    gustSpeedKnots: kmhToKn(data.hourly.wind_gusts_10m?.[i] ?? null),
-    windDirectionDeg: data.hourly.wind_direction_10m?.[i] ?? null,
-  }));
+  throw lastError;
 }
 
 /**
- * Fetches historical weather along a vessel track, one archive query per day
- * at that day's position (Open-Meteo archive is daily-granular and location-
- * specific). Calls run in parallel; results merge into a single time-sorted
- * array. The boat's daily displacement is small relative to the model grid.
+ * Fetches historical weather along a vessel track, cache-first.
+ *
+ * Each (UTC date, ~0.01° position bucket) is fetched at most once and
+ * persisted to `<dataDir>/weather/<date>/<bucket>.json`; repeat queries and
+ * re-runs read straight from disk (zero network, works offline). Only days
+ * not present in the cache are fetched from Open-Meteo, one day at a time
+ * with spacing + 429 backoff (see `fetchHistoricalWeather`), and each freshly
+ * fetched day is written to the cache **immediately** so a backfill that's
+ * rate-limited partway keeps what it got — the next run resumes from cache.
+ *
+ * Offline-first: when the network is unavailable the per-day fetch throws;
+ * this function catches it and returns whatever cached days exist for the
+ * window (even a partial track) instead of failing the whole call.
  *
  * @param {object} params
  * @param {Array<{date: string, latitude: number, longitude: number}>} params.dailyPositions - UTC date → position
- * @param {typeof fetch} [params.fetchImpl]
+ * @param {typeof fetch} [params.fetchImpl] - Fetch implementation (tests)
+ * @param {string} [params.dataDir] - Plugin data directory; when set the
+ *        on-disk cache is used. Without it the function is pure fetch (no
+ *        cache), preserving the behavior the backtest CLI and tests rely on.
+ * @param {object} [params.app] - Signal K server API for debug logging
  * @returns {Promise<Array<{time: Date, ghi: number|null, cloudCover: number|null, windSpeedKnots: number|null, gustSpeedKnots: number|null, windDirectionDeg: number|null}>>}
  */
 async function fetchHistoricalWeatherTrack({
   dailyPositions,
   fetchImpl = fetch,
+  dataDir,
+  app,
 }) {
-  // Serialize per-day calls to stay within Open-Meteo's rate limit
-  // (parallel calls get 429). Daily archive queries are cheap.
+  const useCache = Boolean(dataDir);
   const all = [];
+  let requestsThisRun = 0;
   for (const { date, latitude, longitude } of dailyPositions) {
-    const dayWeather = await fetchHistoricalWeather({
-      latitude,
-      longitude,
-      from: new Date(`${date}T00:00:00Z`),
-      to: new Date(`${date}T23:59:59Z`),
-      fetchImpl,
-    });
-    all.push(...dayWeather);
+    const bucket = weatherCache.weatherPositionBucket(latitude, longitude);
+
+    if (useCache) {
+      const cached = await weatherCache.readWeatherCache(dataDir, date, bucket);
+      if (cached) {
+        all.push(...cached);
+        continue;
+      }
+    }
+
+    if (requestsThisRun >= WEATHER_MAX_REQUESTS_PER_RUN) {
+      app?.debug?.(
+        `Weather backfill cap reached (${WEATHER_MAX_REQUESTS_PER_RUN} requests); ` +
+          "remaining days will be fetched on the next run from cache",
+      );
+      continue;
+    }
+
+    try {
+      const dayWeather = await fetchHistoricalWeather({
+        latitude,
+        longitude,
+        from: new Date(`${date}T00:00:00Z`),
+        to: new Date(`${date}T23:59:59Z`),
+        fetchImpl,
+      });
+      requestsThisRun++;
+      if (useCache) {
+        // Persist-as-you-go: write the day before merging so a rate-limited
+        // backfill keeps what it fetched; the next run resumes from here.
+        // Archive Open-Meteo is tier 1 (best) — it seeds each day.
+        await weatherCache.writeWeatherCache(
+          dataDir,
+          date,
+          bucket,
+          dayWeather,
+          1,
+        );
+      }
+      all.push(...dayWeather);
+    } catch (error) {
+      // Offline / rate-limited past retries: don't abort the whole track.
+      // Cached days still cover the rest; a fully uncached, offline day
+      // simply contributes no weather (callers tolerate empty weather).
+      if (useCache) {
+        app?.debug?.(
+          `Weather fetch failed for ${date} at ${bucket.latitude},${bucket.longitude}: ${error.message}`,
+        );
+        continue;
+      }
+      throw error;
+    }
+
+    if (useCache) {
+      // Space successful requests so a long backfill isn't bursty.
+      await sleep(WEATHER_REQUEST_GAP_MS);
+    }
   }
   return all.sort((a, b) => a.time - b.time);
 }
@@ -1036,7 +1183,11 @@ async function populateFromHistory({
   const dailyPositions = dailyPositionsFromHistory(historyData, from, to);
   const weather =
     dailyPositions.length > 0
-      ? await fetchHistoricalWeatherTrack({ dailyPositions, fetchImpl })
+      ? await fetchHistoricalWeatherTrack({
+          dailyPositions,
+          fetchImpl,
+          dataDir,
+        })
       : [];
 
   const results = [];
