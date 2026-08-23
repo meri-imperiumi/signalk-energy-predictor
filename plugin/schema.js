@@ -520,6 +520,13 @@ function buildPluginSchema() {
             minimum: 0.00001,
             maximum: 1,
           },
+          crossBinGustFallback: {
+            type: "boolean",
+            title: "Cross Day/Night Gust Fallback",
+            description:
+              "When a gust bin is unlearned, borrow from the same sector's other day/night bin (clamped to ≤ 1.0 so a borrowed daytime factor only ever reduces a night forecast, never inflates one). Off by default: katabatic night gusts can exceed 1.0 at places whose daytime gust factor is well below 1.0, so cross-bin borrowing can under-state real night risk",
+            default: false,
+          },
         },
       },
       loadProfile: {

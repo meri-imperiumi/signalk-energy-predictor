@@ -40,6 +40,35 @@ const DEFAULT_EMA_ALPHA = 0.05;
 const DEFAULT_FACTOR = 1.0;
 
 /**
+ * Source labels describing where a resolved factor came from.
+ *
+ * - `learned`           — this exact (place, sector[, night]) bin has an
+ *   accepted sample; the factor is the learned EMA.
+ * - `adjacent-sector`   — the bin is unlearned; the factor was borrowed
+ *   from a *learned* neighboring sector (averaged if both neighbors are
+ *   learned).
+ * - `place-average`     — no learned neighbor; the factor is the mean of
+ *   all *learned* factors for this place (speed: across sectors; gust:
+ *   across sectors in the same day/night bin).
+ * - `cross-bin`         — (gust only) borrowed from the same sector's other
+ *   day/night bin, clamped to ≤ 1.0. Opt-in, default off.
+ * - `none`              — nothing learned for the place; factor 1.0 (the
+ *   forecast passes through unchanged).
+ *
+ * Crucially, `adjacent-sector` and `place-average` may **only borrow from
+ * genuinely `learned` bins**, never from a neighbor that is itself a
+ * fallback. This keeps the fallback non-cascading: if sector 2 inherits
+ * sector 1's value, sector 3 must not then inherit sector 2's borrowed
+ * value — it looks at its other neighbor (sector 4) and the place average
+ * instead.
+ */
+const SOURCE_LEARNED = "learned";
+const SOURCE_ADJACENT = "adjacent-sector";
+const SOURCE_PLACE_AVERAGE = "place-average";
+const SOURCE_CROSS_BIN = "cross-bin";
+const SOURCE_NONE = "none";
+
+/**
  * Minimum forecast wind speed (knots) for a sample to be usable. Ratios
  * are meaningless noise in calm conditions.
  */
@@ -328,6 +357,18 @@ class WindProtectionStore {
     /** @type {Map<string, number>} placeSectorNightKey → gust factor */
     this.gustFactors = new Map();
 
+    /**
+     * Keys that have at least one accepted sample, split by factor family
+     * so the fallback resolver can tell a real donor apart from a bin that
+     * only carries a fallback value. This is what makes the fallback
+     * non-cascading: a bin's value is a valid donor only if its key is in
+     * the matching set below.
+     * @type {Set<string>}
+     */
+    this.learnedSpeedKeys = new Set();
+    /** @type {Set<string>} */
+    this.learnedGustKeys = new Set();
+
     /** LRU of place keys (most-recently-used at the end) */
     /** @type {string[]} */
     this.placeLru = [];
@@ -474,6 +515,7 @@ class WindProtectionStore {
     const existing = this.speedFactors.get(key) ?? DEFAULT_FACTOR;
     const updated = this.alpha * observed + (1 - this.alpha) * existing;
     this.speedFactors.set(key, clampSpeedFactor(updated));
+    this.learnedSpeedKeys.add(key);
     return true;
   }
 
@@ -486,6 +528,7 @@ class WindProtectionStore {
     const existing = this.gustFactors.get(key) ?? DEFAULT_FACTOR;
     const updated = this.alpha * observed + (1 - this.alpha) * existing;
     this.gustFactors.set(key, clampGustFactor(updated));
+    this.learnedGustKeys.add(key);
     return true;
   }
 
@@ -517,28 +560,344 @@ class WindProtectionStore {
     for (const k of [...this.gustFactors.keys()]) {
       if (k.startsWith(prefix)) this.gustFactors.delete(k);
     }
+    for (const k of [...this.learnedSpeedKeys]) {
+      if (k.startsWith(prefix)) this.learnedSpeedKeys.delete(k);
+    }
+    for (const k of [...this.learnedGustKeys]) {
+      if (k.startsWith(prefix)) this.learnedGustKeys.delete(k);
+    }
     this.anchorages.delete(placeKey);
   }
 
   /**
-   * Gets the correction factors for a place/sector/night bin.
+   * Gets the correction factors for a place/sector/night bin, reporting
+   * whether each factor is genuinely *learned* (has an accepted sample) or
+   * at the default (1.0).
+   *
+   * This is the read path for callers that want only real learning — the
+   * learning loop and the recorder use it so they never record or
+   * re-learn a fallback value as if it were observed. For the prediction
+   * application path that *fills* unlearned bins, use
+   * {@link WindProtectionStore#getFactorsWithFallback}.
    *
    * Unknown place, unknown sector, or unlearned bins return the default
-   * (1.0 — no correction).
+   * (1.0 — no correction) with `speed === DEFAULT_FACTOR`/
+   * `gust === DEFAULT_FACTOR` and source `"learned"` when the bin has a
+   * sample, else `"none"`.
    *
    * @param {string} key - Place cell key
    * @param {number} sector - Wind direction sector 0–7, or -1
    * @param {boolean} night - Day/night bin (for the gust factor)
-   * @returns {{speed: number, gust: number}}
+   * @returns {{speed: number, gust: number, speedSource: string, gustSource: string}}
    */
   getFactors(key, sector, night) {
-    if (key == null) return { speed: DEFAULT_FACTOR, gust: DEFAULT_FACTOR };
+    if (key == null) {
+      return {
+        speed: DEFAULT_FACTOR,
+        gust: DEFAULT_FACTOR,
+        speedSource: SOURCE_NONE,
+        gustSource: SOURCE_NONE,
+      };
+    }
+    const sKey = placeSectorKey(key, sector);
+    const gKey = placeSectorNightKey(key, sector, night);
+    if (this.learnedSpeedKeys.has(sKey)) {
+      return {
+        speed: this.speedFactors.get(sKey),
+        gust: this.learnedGustKeys.has(gKey)
+          ? this.gustFactors.get(gKey)
+          : DEFAULT_FACTOR,
+        speedSource: SOURCE_LEARNED,
+        gustSource: this.learnedGustKeys.has(gKey)
+          ? SOURCE_LEARNED
+          : SOURCE_NONE,
+      };
+    }
+    // No learned speed bin for this sector; the gust bin (if any) is also
+    // reported learned/default on its own merits.
+    const gustLearned = this.learnedGustKeys.has(gKey);
+    return {
+      speed: DEFAULT_FACTOR,
+      gust: gustLearned ? this.gustFactors.get(gKey) : DEFAULT_FACTOR,
+      speedSource: SOURCE_NONE,
+      gustSource: gustLearned ? SOURCE_LEARNED : SOURCE_NONE,
+    };
+  }
+
+  /**
+   * Resolves correction factors for an unlearned bin by falling back to
+   * learned neighbors, with a precedence that favors the most specific
+   * signal first. **Donors are always genuinely learned bins** — a neighbor
+   * that is itself a fallback is never borrowed from, so the fallback
+   * does not cascade (e.g. if sector 2 borrows from sector 1, sector 3 does
+   * not then borrow sector 2's borrowed value).
+   *
+   * Speed factor precedence (unlearned sector):
+   *   1. `adjacent-sector` — the two neighboring sectors (±1, wrapping 8
+   *      sectors), averaged when both are learned, the single learned one
+   *      otherwise.
+   *   2. `place-average` — the mean of all *learned* speed factors for this
+   *      place (across sectors), the "this anchorage is generally
+   *      sheltered" signal stripped of direction.
+   *   3. `none` — 1.0 (no correction).
+   *
+   * Gust factor precedence (unlearned place/sector/night):
+   *   1. `cross-bin` — the same sector's other day/night bin, clamped to
+   *      ≤ 1.0. Only used when `opts.crossBinGustFallback` is true (default
+   *      false): katabatic night gusts can exceed 1.0 at places whose
+   *      daytime gust factor is well below 1.0, so blindly borrowing a
+   *      daytime factor into a night bin would under-state real risk; the
+   *      clamp makes a borrowed value only ever *reduce* a forecast gust.
+   *   2. `adjacent-sector` — learned neighbors, same night bin.
+   *   3. `place-average` — mean of learned gust factors, same night bin.
+   *   4. `none` — 1.0.
+   *
+   * A bin that has any accepted sample always resolves to `learned` and
+   * never uses a fallback — the fallback only fills read-time gaps until
+   * the real bin is sampled, and never contaminates the learned value.
+   *
+   * @param {string} key - Place cell key
+   * @param {number} sector - Wind direction sector 0–7, or -1
+   * @param {boolean} night - Day/night bin (for the gust factor)
+   * @param {object} [opts]
+   * @param {boolean} [opts.crossBinGustFallback] - Enable the same-sector
+   *   day↔night gust fallback (default false).
+   * @returns {{speed: number, gust: number, speedSource: string, gustSource: string}}
+   */
+  getFactorsWithFallback(key, sector, night, opts = {}) {
+    const learned = this.getFactors(key, sector, night);
+    const speedSource =
+      learned.speedSource === SOURCE_LEARNED
+        ? SOURCE_LEARNED
+        : this._fallbackSpeedSource(key, sector);
     const speed =
-      this.speedFactors.get(placeSectorKey(key, sector)) ?? DEFAULT_FACTOR;
+      speedSource === SOURCE_LEARNED
+        ? learned.speed
+        : this._fallbackSpeed(key, sector, speedSource);
+
+    const gustSource =
+      learned.gustSource === SOURCE_LEARNED
+        ? SOURCE_LEARNED
+        : this._fallbackGustSource(key, sector, night, opts);
     const gust =
-      this.gustFactors.get(placeSectorNightKey(key, sector, night)) ??
-      DEFAULT_FACTOR;
-    return { speed, gust };
+      gustSource === SOURCE_LEARNED
+        ? learned.gust
+        : this._fallbackGust(key, sector, night, gustSource, opts);
+
+    return { speed, gust, speedSource, gustSource };
+  }
+
+  /**
+   * Picks the fallback source for an unlearned speed bin: adjacent learned
+   * sector if any, else place-average if any speed bin is learned for the
+   * place, else `none`. Donors must be genuinely learned.
+   *
+   * @private
+   * @param {string} key - Place cell key
+   * @param {number} sector - Wind direction sector 0–7, or -1
+   * @returns {string} `adjacent-sector` | `place-average` | `none`
+   */
+  _fallbackSpeedSource(key, sector) {
+    if (
+      this._adjacentLearnedSectors(key, sector, this.learnedSpeedKeys).length >
+      0
+    ) {
+      return SOURCE_ADJACENT;
+    }
+    if (this._placeHasLearnedSpeed(key)) return SOURCE_PLACE_AVERAGE;
+    return SOURCE_NONE;
+  }
+
+  /**
+   * @private
+   */
+  _fallbackSpeed(key, sector, source) {
+    if (source === SOURCE_ADJACENT) {
+      return this._meanAdjacent(
+        key,
+        sector,
+        this.speedFactors,
+        this.learnedSpeedKeys,
+        placeSectorKey,
+      );
+    }
+    if (source === SOURCE_PLACE_AVERAGE) {
+      return this._placeAverage(key, this.speedFactors, this.learnedSpeedKeys);
+    }
+    return DEFAULT_FACTOR;
+  }
+
+  /**
+   * Picks the fallback source for an unlearned gust bin, honoring the
+   * precedence above. Donors must be genuinely learned.
+   *
+   * @private
+   * @param {string} key - Place cell key
+   * @param {number} sector - Wind direction sector 0–7, or -1
+   * @param {boolean} night - Day/night bin
+   * @param {object} opts - `{ crossBinGustFallback }`
+   * @returns {string} `cross-bin` | `adjacent-sector` | `place-average` | `none`
+   */
+  _fallbackGustSource(key, sector, night, { crossBinGustFallback } = {}) {
+    if (crossBinGustFallback) {
+      const otherKey = placeSectorNightKey(key, sector, !night);
+      if (this.learnedGustKeys.has(otherKey)) return SOURCE_CROSS_BIN;
+    }
+    if (this._adjacentLearnedSectorsNight(key, sector, night).length > 0) {
+      return SOURCE_ADJACENT;
+    }
+    if (this._placeHasLearnedGust(key, night)) return SOURCE_PLACE_AVERAGE;
+    return SOURCE_NONE;
+  }
+
+  /**
+   * @private
+   */
+  _fallbackGust(key, sector, night, source) {
+    if (source === SOURCE_CROSS_BIN) {
+      // Borrowed across the day/night bin only ever *reduces* a forecast
+      // gust, never inflates one (katabatic risk lives in the night bin).
+      const borrowed = this.gustFactors.get(
+        placeSectorNightKey(key, sector, !night),
+      );
+      return Math.min(borrowed ?? DEFAULT_FACTOR, DEFAULT_FACTOR);
+    }
+    if (source === SOURCE_ADJACENT) {
+      return this._meanAdjacentNight(key, sector, night);
+    }
+    if (source === SOURCE_PLACE_AVERAGE) {
+      return this._placeAverageGust(key, night);
+    }
+    return DEFAULT_FACTOR;
+  }
+
+  /**
+   * Returns the learned adjacent sectors (±1, wrapping) for a sector, only
+   * those whose factor key is in the given `learned` set. Used for the
+   * speed fallback (sector-only keys) so the same machinery serves any
+   * sector-only factor map with its own learned set.
+   *
+   * @private
+   * @param {string} key - Place cell key
+   * @param {number} sector - 0–7, or -1 (unknown sector → no neighbors)
+   * @param {Set<string>} learned - Learned key set for the factor family
+   * @returns {number[]} Learned neighboring sector indices
+   */
+  _adjacentLearnedSectors(key, sector, learned) {
+    if (sector < 0 || sector >= SECTORS) return [];
+    const out = [];
+    for (const delta of [-1, 1]) {
+      const s = (sector + delta + SECTORS) % SECTORS;
+      if (learned.has(placeSectorKey(key, s))) out.push(s);
+    }
+    return out;
+  }
+
+  /**
+   * Learned adjacent sectors for the gust family (per sector+night keys).
+   * @private
+   */
+  _adjacentLearnedSectorsNight(key, sector, night) {
+    if (sector < 0 || sector >= SECTORS) return [];
+    const out = [];
+    for (const delta of [-1, 1]) {
+      const s = (sector + delta + SECTORS) % SECTORS;
+      if (this.learnedGustKeys.has(placeSectorNightKey(key, s, night)))
+        out.push(s);
+    }
+    return out;
+  }
+
+  /**
+   * Mean of the learned adjacent-sector factors. Averages both neighbors
+   * when both are learned, uses the single learned one otherwise. Only
+   * genuinely learned neighbors contribute (non-cascading).
+   *
+   * @private
+   * @param {string} key - Place cell key
+   * @param {number} sector - 0–7
+   * @param {Map<string, number>} factors - Factor map (speed or gust)
+   * @param {Set<string>} learned - Learned key set for this family
+   * @param {(key: string, sector: number) => string} keyFn - sector key fn
+   * @returns {number}
+   */
+  _meanAdjacent(key, sector, factors, learned, keyFn) {
+    const neighbors = this._adjacentLearnedSectors(key, sector, learned);
+    let sum = 0;
+    for (const s of neighbors) sum += factors.get(keyFn(key, s));
+    return neighbors.length ? sum / neighbors.length : DEFAULT_FACTOR;
+  }
+
+  /** @private */
+  _meanAdjacentNight(key, sector, night) {
+    const neighbors = this._adjacentLearnedSectorsNight(key, sector, night);
+    let sum = 0;
+    for (const s of neighbors)
+      sum += this.gustFactors.get(placeSectorNightKey(key, s, night));
+    return neighbors.length ? sum / neighbors.length : DEFAULT_FACTOR;
+  }
+
+  /**
+   * Does the place have any *learned* speed bin? (place-wide average
+   * candidate.)
+   * @private
+   */
+  _placeHasLearnedSpeed(key) {
+    const prefix = `${key}_`;
+    for (const k of this.learnedSpeedKeys)
+      if (k.startsWith(prefix)) return true;
+    return false;
+  }
+
+  /**
+   * Does the place have any *learned* gust bin in the given night bin?
+   * @private
+   */
+  _placeHasLearnedGust(key, night) {
+    const prefix = `${key}_`;
+    const suffix = night ? "_n" : "_d";
+    for (const k of this.learnedGustKeys)
+      if (k.startsWith(prefix) && k.endsWith(suffix)) return true;
+    return false;
+  }
+
+  /**
+   * Mean of all *learned* speed factors for a place (across sectors).
+   * @private
+   */
+  _placeAverage(key, factors, learned) {
+    const prefix = `${key}_`;
+    let sum = 0;
+    let n = 0;
+    for (const [k, v] of factors) {
+      if (k.startsWith(prefix) && learned.has(k)) {
+        sum += v;
+        n++;
+      }
+    }
+    return n ? sum / n : DEFAULT_FACTOR;
+  }
+
+  /**
+   * Mean of all *learned* gust factors for a place in the given night bin.
+   * @private
+   */
+  _placeAverageGust(key, night) {
+    const prefix = `${key}_`;
+    const suffix = night ? "_n" : "_d";
+    let sum = 0;
+    let n = 0;
+    for (const [k, v] of this.gustFactors) {
+      if (
+        k.startsWith(prefix) &&
+        k.endsWith(suffix) &&
+        this.learnedGustKeys.has(k)
+      ) {
+        sum += v;
+        n++;
+      }
+    }
+    return n ? sum / n : DEFAULT_FACTOR;
   }
 
   /**
@@ -576,6 +935,8 @@ class WindProtectionStore {
       minForecastWindKnots: this.minForecastWindKnots,
       speedFactors: Object.fromEntries(this.speedFactors),
       gustFactors: Object.fromEntries(this.gustFactors),
+      learnedSpeedKeys: [...this.learnedSpeedKeys],
+      learnedGustKeys: [...this.learnedGustKeys],
       placeLru: this.placeLru,
       anchorages: Object.fromEntries(this.anchorages),
     };
@@ -599,6 +960,19 @@ class WindProtectionStore {
     }
     if (data?.gustFactors) {
       store.gustFactors = new Map(Object.entries(data.gustFactors));
+    }
+    // Reconstruct the learned-key sets. New stores (pre-fallback) have no
+    // persisted sets; treat every existing factor as learned so the
+    // fallback does not suddenly classify a populated bin as a gap.
+    if (Array.isArray(data?.learnedSpeedKeys)) {
+      store.learnedSpeedKeys = new Set(data.learnedSpeedKeys);
+    } else if (data?.speedFactors) {
+      store.learnedSpeedKeys = new Set(Object.keys(data.speedFactors));
+    }
+    if (Array.isArray(data?.learnedGustKeys)) {
+      store.learnedGustKeys = new Set(data.learnedGustKeys);
+    } else if (data?.gustFactors) {
+      store.learnedGustKeys = new Set(Object.keys(data.gustFactors));
     }
     if (Array.isArray(data?.placeLru)) {
       store.placeLru = [...data.placeLru];
@@ -629,4 +1003,10 @@ module.exports = {
   DEFAULT_DEVICE_HEIGHT_M,
   DEFAULT_ROUGHNESS_LENGTH,
   FORECAST_REFERENCE_HEIGHT_M,
+  // Factor-source labels (see SOURCE_* docs)
+  SOURCE_LEARNED,
+  SOURCE_ADJACENT,
+  SOURCE_PLACE_AVERAGE,
+  SOURCE_CROSS_BIN,
+  SOURCE_NONE,
 };

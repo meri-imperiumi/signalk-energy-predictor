@@ -22,6 +22,7 @@ const {
   DEFAULT_ANEMOMETER_HEIGHT_M,
   DEFAULT_DEVICE_HEIGHT_M,
   DEFAULT_ROUGHNESS_LENGTH,
+  SOURCE_NONE,
 } = require("./wind-protection.js");
 const matrixModule = require("./matrix.js");
 const {
@@ -346,6 +347,8 @@ module.exports = (app) => {
       night: false,
       speedFactor: DEFAULT_FACTOR,
       gustFactor: DEFAULT_FACTOR,
+      speedSource: SOURCE_NONE,
+      gustSource: SOURCE_NONE,
       correctedSpeed: forecastSpeedKnots,
       correctedGust: forecastGustKnots,
     };
@@ -381,14 +384,24 @@ module.exports = (app) => {
       windProtection.resolvePlace(pos.latitude, pos.longitude, cellSizeM);
     const sector = sectorFromDeg(windDirectionDeg);
     const night = wpfIsNight(sunElevationRad);
-    const { speed: speedFactor, gust: gustFactor } = windProtection.getFactors(
-      key,
-      sector,
-      night,
-    );
 
-    // No learned correction for this place/sector → leave forecast as-is
-    if (speedFactor === DEFAULT_FACTOR && gustFactor === DEFAULT_FACTOR) {
+    // Resolve with the sector fallback: an unlearned bin borrows from a
+    // *learned* neighbor (never from a neighbor that is itself a fallback)
+    // so a wind shift into an unsampled sector keeps the shelter the user
+    // already has, instead of dropping to 1.0 for the whole tail of the
+    // forecast. Each factor is resolved independently and scaled only when
+    // its source is not "none".
+    const {
+      speed: speedFactor,
+      gust: gustFactor,
+      speedSource,
+      gustSource,
+    } = windProtection.getFactorsWithFallback(key, sector, night, {
+      crossBinGustFallback: cfg.crossBinGustFallback === true,
+    });
+
+    // No correction of any kind for this place/sector → pass through.
+    if (speedSource === SOURCE_NONE && gustSource === SOURCE_NONE) {
       return {
         applies: false,
         placeKey: key,
@@ -396,15 +409,22 @@ module.exports = (app) => {
         night,
         speedFactor,
         gustFactor,
+        speedSource,
+        gustSource,
         correctedSpeed: forecastSpeedKnots,
         correctedGust: forecastGustKnots,
       };
     }
 
-    // Scale at the 10 m reference, then translate down to device height
-    const correctedSpeed10m = forecastSpeedKnots * speedFactor;
+    // Scale at the 10 m reference, then translate down to device height.
+    // A factor whose source is "none" stays at 1.0 so it doesn't move the
+    // forecast; the other factor (learned or fallback) still applies.
+    const speedScale =
+      speedSource === SOURCE_NONE ? DEFAULT_FACTOR : speedFactor;
+    const gustScale = gustSource === SOURCE_NONE ? DEFAULT_FACTOR : gustFactor;
+    const correctedSpeed10m = forecastSpeedKnots * speedScale;
     const correctedGust10m =
-      forecastGustKnots != null ? forecastGustKnots * gustFactor : null;
+      forecastGustKnots != null ? forecastGustKnots * gustScale : null;
 
     const correctedSpeed = toDeviceHeight(correctedSpeed10m, deviceHeightM, z0);
     const correctedGust =
@@ -427,6 +447,8 @@ module.exports = (app) => {
       night,
       speedFactor,
       gustFactor,
+      speedSource,
+      gustSource,
       correctedSpeed,
       correctedGust: flooredGust,
     };
@@ -436,8 +458,9 @@ module.exports = (app) => {
    * Gets wind protection correction for the current place.
    *
    * Returns null when WPF is disabled, the boat is under way, there is no
-   * position, or no factors have been learned for this place — in all those
-   * cases the prediction engine applies no correction (factor 1.0).
+   * position, or no factor (learned or sector fallback) exists for this
+   * place/sector — in all those cases the prediction engine applies no
+   * correction (factor 1.0).
    *
    * @param {number} forecastSpeedKnots - Forecast wind speed in knots
    * @param {number|null} forecastGustKnots - Forecast gust in knots
@@ -496,6 +519,8 @@ module.exports = (app) => {
       [`${base}.night`]: null,
       [`${base}.speedFactor`]: null,
       [`${base}.gustFactor`]: null,
+      [`${base}.speedFactorSource`]: null,
+      [`${base}.gustFactorSource`]: null,
       [`${base}.forecastSpeedKnots`]: null,
       [`${base}.forecastGustKnots`]: null,
       [`${base}.correctedSpeedKnots`]: null,
@@ -518,6 +543,8 @@ module.exports = (app) => {
         updates[`${base}.night`] = ctx.night;
         updates[`${base}.speedFactor`] = ctx.speedFactor;
         updates[`${base}.gustFactor`] = ctx.gustFactor;
+        updates[`${base}.speedFactorSource`] = ctx.speedSource;
+        updates[`${base}.gustFactorSource`] = ctx.gustSource;
         updates[`${base}.forecastSpeedKnots`] = current.windSpeedKnots ?? null;
         updates[`${base}.forecastGustKnots`] = current.gustSpeedKnots ?? null;
         updates[`${base}.correctedSpeedKnots`] = ctx.applies
@@ -2498,6 +2525,7 @@ module.exports = (app) => {
     runPredictionCycle,
     recordSample,
     resolveWindProtectionContext,
+    publishWindProtection,
     get windProtection() {
       return windProtection;
     },
