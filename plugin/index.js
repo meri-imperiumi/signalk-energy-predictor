@@ -644,14 +644,18 @@ module.exports = (app) => {
    * empty and `detectedState` publishes as `null` even though the array
    * was last known to be, say, "deployed". The 5-minute sample recordings
    * already persist `deployStates` per device, so we recover the last
-   * known state from the most recent sample as a fallback.
+   * known state per device as a fallback.
    *
-   * Only samples within `SEED_FRESHNESS_MS` are honoured, so a stale state
-   * from a multi-day outage is not carried forward indefinitely (it may
-   * have changed since). Returns the raw `{ deviceId: "deployed"|"stowed" }`
-   * object from the recording, or `null`.
+   * The most recent sample may lack a device whose state can't be
+   * inferred right now (e.g. FLINsail at night), so rather than only reading
+   * the single newest sample we walk backwards through the recent samples
+   * and take, per device, the most recent definite entry within
+   * `SEED_FRESHNESS_MS`. This recovers a device that last produced a
+   * definite reading a few hours ago (e.g. the last daytime "deployed"
+   * before sunset) without carrying forward indefinitely across a
+   * multi-day outage.
    *
-   * @returns {Promise<object|null>}
+   * @returns {Promise<object|null>} `{ deviceId: "deployed"|"stowed" }` or null
    */
   async function getLastDeployStates() {
     if (!recorder) return null;
@@ -661,14 +665,24 @@ module.exports = (app) => {
       const to = new Date(now);
       const samples = await recorder.getRecordings(from, to, "sample");
       if (samples.length === 0) return null;
-      const last = samples[samples.length - 1];
-      const ts = new Date(last.timestamp).getTime();
-      if (Number.isNaN(ts) || now - ts > SEED_FRESHNESS_MS) {
-        return null; // Too stale to trust as carry-forward
+      // Walk newest-first; take the most recent definite state per device
+      // within the freshness window. A device absent from the newest sample
+      // (e.g. FLINsail at night) is recovered from an earlier sample.
+      const result = {};
+      const cutoff = now - SEED_FRESHNESS_MS;
+      for (let i = samples.length - 1; i >= 0; i--) {
+        const s = samples[i];
+        const ts = new Date(s.timestamp).getTime();
+        if (Number.isNaN(ts) || ts < cutoff) break; // older than freshness
+        const states = s.deployStates;
+        if (!states || typeof states !== "object") continue;
+        for (const [id, state] of Object.entries(states)) {
+          if (state === "deployed" || state === "stowed") {
+            if (result[id] == null) result[id] = state;
+          }
+        }
       }
-      const states = last.deployStates;
-      if (!states || typeof states !== "object") return null;
-      return states;
+      return Object.keys(result).length > 0 ? result : null;
     } catch (error) {
       app.debug(`getLastDeployStates: failed (${error.message})`);
       return null;
@@ -1262,6 +1276,18 @@ module.exports = (app) => {
   const windHistory = new Map();
   const WIND_HISTORY_MS = 5 * 60 * 1000; // 5 minutes
   const WIND_SAMPLE_INTERVAL_MS = 30 * 1000; // 30 seconds
+
+  /**
+   * Last known detected deploy state per device, carried forward across
+   * null (unknown) inference gaps. At night a deployable solar array
+   * produces ~0 W so the per-sample inference yields null; without
+   * carry-forward the 5-minute recordings would lose the pre-sunset state,
+   * and a restart's recovery window would find no state to seed. We keep
+   * the last known state here and write it into every recorded sample so
+   * the recordings (and thus the restart seed) reflect the carried-forward
+   * state rather than the raw per-sample inference.
+   */
+  const lastKnownDeployStates = new Map();
 
   /**
    * Wind Protection Factor learning state.
@@ -1998,9 +2024,11 @@ module.exports = (app) => {
 
     // Compute detected deploy/stow states for deployable devices using the
     // shared inference (same logic as runPredictionCycle's
-    // currentDeployStates, but per-sample for persistence). Carry-forward of
-    // the last known state across unknown gaps is applied at read time
-    // (API), not here, so the raw per-sample inference is stored.
+    // currentDeployStates, but per-sample for persistence). Carry-forward
+    // of the last known state across unknown (null) gaps is applied here so
+    // the recording reflects the carried-forward state: a night-time sample
+    // (0 W, sun down) keeps the last known deploy state instead of dropping
+    // it, so a restart's recovery window can reseed it.
     const underway =
       navState === "sailing" ||
       navState === "motoring" ||
@@ -2036,7 +2064,12 @@ module.exports = (app) => {
         sunUp,
         underway,
       });
-      if (state != null) deployStates[array.id] = state;
+      if (state != null) {
+        deployStates[array.id] = state;
+        lastKnownDeployStates.set(array.id, state);
+      } else if (lastKnownDeployStates.has(array.id)) {
+        deployStates[array.id] = lastKnownDeployStates.get(array.id);
+      }
     }
     for (const gen of getActiveGenerators(pluginConfig)) {
       if (!gen.deployable) continue;
@@ -2059,7 +2092,12 @@ module.exports = (app) => {
         navState,
         underway,
       });
-      if (state != null) deployStates[gen.id] = state;
+      if (state != null) {
+        deployStates[gen.id] = state;
+        lastKnownDeployStates.set(gen.id, state);
+      } else if (lastKnownDeployStates.has(gen.id)) {
+        deployStates[gen.id] = lastKnownDeployStates.get(gen.id);
+      }
     }
 
     // Per-array charge controller modes (for the learning sanitization gate).
@@ -2264,6 +2302,21 @@ module.exports = (app) => {
       // lose the carried-forward state the plugin had before the restart.
       // app.getSelfPath may also be empty if autostate hasn't published yet.
       await seedStickyStateFromRecordings(config);
+
+      // Seed the in-memory carry-forward for detected deploy states from
+      // the most recent sample recording, so the post-restart 5-minute
+      // samples continue the carried-forward chain (a night-time sample
+      // with no live evidence keeps the last known state). Without this,
+      // a restart at night would lose the chain until the next definite
+      // (daytime) reading.
+      const seededDeploy = await getLastDeployStates();
+      if (seededDeploy) {
+        for (const [id, state] of Object.entries(seededDeploy)) {
+          if (state === "deployed" || state === "stowed") {
+            lastKnownDeployStates.set(id, state);
+          }
+        }
+      }
 
       // Subscribe to Signal K updates
       subscribeToDeltas();

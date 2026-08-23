@@ -327,4 +327,76 @@ test.describe("detected deploy state carry-forward across restart", () => {
     await plugin.stop();
     await rm(testDir, { recursive: true, force: true });
   });
+
+  test("night restart: recovers a device absent from the newest sample from an earlier within-window sample", async () => {
+    const app = new FakeSignalKApp();
+    const plugin = makePlugin(app);
+    const testDir = await mkdtemp(join(tmpdir(), "seed-merge-"));
+
+    app.dataPath = testDir;
+    const config = baseConfig();
+    await plugin.start(config, () => {});
+
+    const longitude = midnightLongitude();
+    app.setSelfPath("navigation.position", { latitude: 0, longitude });
+    emit(app, [
+      { path: "navigation.position", value: { latitude: 0, longitude } },
+    ]);
+    app.setSelfPath("navigation.state", "anchored");
+    emit(app, [{ path: "navigation.state", value: "anchored" }]);
+    app.setSelfPath(SOC_PATH, 0.6);
+    emit(app, [{ path: SOC_PATH, value: 0.6 }]);
+    app.setSelfPath(FLINSAIL_POWER, 0);
+    emit(app, [{ path: FLINSAIL_POWER, value: 0 }]);
+
+    const recorder = plugin.__getInternals().recorder;
+
+    // 3 hours ago: FLINsail was definitely deployed (last daytime reading).
+    // Within the 6h freshness window but older than the newest sample.
+    await recorder.recordSample({
+      timestamp: new Date(Date.now() - 3 * 3600000),
+      arrays: { flinsail: 50 },
+      generators: {},
+      soc: 0.6,
+      houseLoadW: 100,
+      windSpeedKnots: 5,
+      navState: "anchored",
+      position: { latitude: 0, longitude },
+      stwKnots: null,
+      deployStates: { flinsail: "deployed" },
+      controllerModes: {},
+      awaRad: null,
+    });
+    // Now (newest sample): night, FLINsail can't be inferred -> no flinsail
+    // entry, only sailinggen. Mirrors the real failure case.
+    await recorder.recordSample({
+      timestamp: new Date(),
+      arrays: { flinsail: 0 },
+      generators: {},
+      soc: 0.6,
+      houseLoadW: 100,
+      windSpeedKnots: 5,
+      navState: "anchored",
+      position: { latitude: 0, longitude },
+      stwKnots: null,
+      deployStates: { sailinggen: "stowed" },
+      controllerModes: {},
+      awaRad: null,
+    });
+
+    injectForecast(plugin);
+
+    await plugin.__getInternals().runPredictionCycle();
+
+    // The newest sample lacks flinsail, but the 3h-old sample (within the
+    // freshness window) had it -> flinsail must be recovered as "deployed".
+    assert.strictEqual(
+      lastDetectedState(app, "flinsail"),
+      "deployed",
+      "a device absent from the newest sample must be recovered from an earlier within-window sample",
+    );
+
+    await plugin.stop();
+    await rm(testDir, { recursive: true, force: true });
+  });
 });

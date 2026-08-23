@@ -1841,19 +1841,42 @@ class PredictionEngine {
 
     // FLINsail (deployable solar arrays). The current recommendedState is
     // the *current hour's* ideal state (from computeDeployableSolarStates,
-    // which uses the WPF-corrected current gust and the night-block max),
-    // NOT the max over the whole forecast window — otherwise a gust spike
-    // 18h from now would say "stow now" even though it's clear right now.
-    // When the state should change later, recommendedStateTime (computed
-    // below) carries the future timestamp.
+    // which uses the WPF-corrected current gust and the night-block max).
+    //
+    // The window is sized to cover the rest of the *current* night block
+    // (until next sunrise), not the whole forecast: a night hour's verdict
+    // must reflect the worst gust over the upcoming night (stow before dark
+    // if any hour of tonight breaches the limit), but a gust in a *later*
+    // night — after a full day — must NOT drive a "stow now". So if the
+    // current hour is night, extend the window to the next sunrise; for a
+    // daytime hour a single hour suffices (night-block logic only applies
+    // to night hours). When the state should change later,
+    // recommendedStateTime (computed below) carries the future timestamp.
+    const startTime = this.lastPrediction[0].time;
+    const recLat = this.getSelfPath("navigation.position")?.latitude ?? 0;
+    const recLon = this.getSelfPath("navigation.position")?.longitude ?? 0;
+    let currentHours = 1;
+    const startSun = sunPosition(startTime, recLat, recLon);
+    if (startSun.altitude <= 0) {
+      // Current hour is night: include the rest of this night so the
+      // night-block max captures tonight's worst gust. Cap at the
+      // forecast horizon so we never scan beyond available data.
+      const sunrise = nextSunrise(startTime, recLat, recLon);
+      if (sunrise) {
+        const untilSunrise = Math.ceil(
+          (sunrise.getTime() - startTime.getTime()) / 3600000,
+        );
+        if (untilSunrise > currentHours) currentHours = untilSunrise;
+      }
+    }
     const currentSolarStates =
       this.lastPrediction.length > 0
         ? this.computeDeployableSolarStates(
             this.lastForecast,
-            this.getSelfPath("navigation.position")?.latitude ?? 0,
-            this.getSelfPath("navigation.position")?.longitude ?? 0,
-            this.lastPrediction[0].time,
-            1,
+            recLat,
+            recLon,
+            startTime,
+            currentHours,
             underway,
           )
         : null;
