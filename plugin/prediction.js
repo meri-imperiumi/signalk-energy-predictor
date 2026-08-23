@@ -775,6 +775,40 @@ function insertActionIntoBucket(predictions, startTimeMs, targetTime, action) {
 }
 
 /**
+ * Rephrases a deployable-solar action's reason after it has been shifted
+ * from a night hour to a sun boundary (deploy → next sunrise, stow → last
+ * sunset). The night-hour reason (e.g. "no night gusts" for a carry-over
+ * deploy, or "forecast night gusts up to 23kn ≥ limit 20kn" for a before-
+ * dark stow) is phrased for the dark hours; at the boundary it would read
+ * oddly (a *morning* deploy saying "no night gusts"). This keeps the gust
+ * figure where present and reframes the reason for the boundary hour.
+ *
+ * @param {string} reason - The night-hour reason to rephrase
+ * @param {boolean} isStow - Whether the shifted action is a stow (to sunset)
+ * @returns {string} Reason rephrased for the sun-boundary hour
+ */
+function rephraseShiftedSolarReason(reason, isStow) {
+  if (!reason) return reason;
+  // Pull any gust figure (e.g. "23kn") out of the night reason so the
+  // rephrased reason keeps the concrete number the crew cares about.
+  const gustMatch = reason.match(/(\d+)kn/);
+  const gust = gustMatch ? gustMatch[1] : null;
+  if (isStow) {
+    // Stow moved to the sunset that starts the night: the point is to
+    // secure the sail before dark because of the night's gusts.
+    return gust
+      ? `stow before dark — night gusts up to ${gust}kn`
+      : "stow before dark — night gusts forecast";
+  }
+  // Deploy moved to the next sunrise: the sail was safe overnight, deploy
+  // at first light. "no night gusts" and neutral carry-forward reasons
+  // ("no forecast for this hour") both collapse to this.
+  return gust
+    ? `no overnight gusts (max ${gust}kn) — deploy at sunrise`
+    : "no overnight gusts — deploy at sunrise";
+}
+
+/**
  * Formats a bearing (radians) as a compass bearing string (e.g. "090°").
  * @param {number} rad - Bearing in radians
  * @returns {string} Bearing in degrees, 3-digit
@@ -2553,11 +2587,19 @@ class PredictionEngine {
       p.actions = p.actions.filter((a) => a.type !== "solar-deployable");
 
       for (const action of solarActions) {
-        const target =
-          action.idealAction === "stow"
-            ? lastSunset(p.time, latitude, longitude)
-            : nextSunrise(p.time, latitude, longitude);
+        const isStow = action.idealAction === "stow";
+        const target = isStow
+          ? lastSunset(p.time, latitude, longitude)
+          : nextSunrise(p.time, latitude, longitude);
         if (!target) continue; // Polar edge case: leave in place
+        // The action was decided at a night hour, where its reason was
+        // phrased for the night (e.g. "no night gusts" for a carry-over
+        // deploy, or "forecast night gusts ..." for a before-dark stow).
+        // Now that the action is moved to a sun boundary — sunrise for a
+        // deploy, sunset for a stow — rephrase the reason so it reads
+        // correctly at the boundary hour rather than leaking a
+        // night-specific explanation into a morning/evening advisory.
+        action.reason = rephraseShiftedSolarReason(action.reason, isStow);
         insertActionIntoBucket(predictions, startTime, target, action);
       }
     }

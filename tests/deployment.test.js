@@ -3268,6 +3268,19 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
         24.94,
       );
       assert.strictEqual(sunsetBucket.time, expectedSunset.toISOString());
+      // The stow was decided at a night hour ("forecast night gusts up to
+      // 25kn ...") but is surfaced at sunset: rephrase for before-dark, and
+      // keep the gust figure.
+      assert.match(
+        sunsetBucket.reason,
+        /before dark/,
+        "sunset stow reason should say 'before dark'",
+      );
+      assert.match(
+        sunsetBucket.reason,
+        /25/,
+        "sunset stow reason keeps the gust figure",
+      );
     } finally {
       Date.now = realNow;
     }
@@ -3328,6 +3341,19 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       assert.strictEqual(sunriseBucket.idealAction, "deploy");
       const expectedSunrise = nextSunrise(now, 60.17, 24.94);
       assert.strictEqual(sunriseBucket.time, expectedSunrise.toISOString());
+      // The action was decided at a night hour (reason "no night gusts"),
+      // but it's surfaced at sunrise: the reason must be rephrased for the
+      // morning, not leak the night-specific "no night gusts" phrasing.
+      assert.match(
+        sunriseBucket.reason,
+        /sunrise/,
+        "sunrise deploy reason should reference sunrise, not night gusts",
+      );
+      assert.doesNotMatch(
+        sunriseBucket.reason,
+        /no night gusts/,
+        "sunrise deploy must not carry the stale night-hour reason",
+      );
     } finally {
       Date.now = realNow;
     }
