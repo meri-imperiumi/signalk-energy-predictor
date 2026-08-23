@@ -86,6 +86,16 @@ test("chart fetches against the plugin API base used by ep-app", () => {
   assert.match(source, /\/api\/retro-predicted/);
 });
 
+test("app clears the chart and events list together on window change", () => {
+  const source = readFileSync(path.join(PUBLIC_DIR, "ep-app.js"), "utf8");
+  // refresh() nulls both the chart and the actions (events) list up front so
+  // the previous window's data doesn't linger while the new fetch is in flight
+  assert.match(
+    source,
+    /this\.chartEl\.data = null;\n\s*this\.actionsEl\.data = null;/,
+  );
+});
+
 test("chart overlays retro-predicted when no recorded cycle covers the window", () => {
   const source = readFileSync(
     path.join(PUBLIC_DIR, "ep-timeline-chart.js"),

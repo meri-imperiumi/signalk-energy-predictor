@@ -109,6 +109,7 @@ class EpApp extends HTMLElement {
   async refresh(spec) {
     this.errorEl.textContent = "";
     this.chartEl.data = null;
+    this.actionsEl.data = null;
     try {
       const [summary, actuals, predictions, retroPredicted, deployStates] =
         await Promise.all([
