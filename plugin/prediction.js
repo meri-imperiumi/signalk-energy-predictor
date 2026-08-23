@@ -2041,13 +2041,27 @@ class PredictionEngine {
     // the SoC projection still runs (load-only forecast).
     let effectiveHours = this.predictionHours;
     if (correctedForecast.length > 0) {
-      // Cap to the number of forecast points. Forecast points are hourly;
-      // a prediction hour needs a matching point (within 30 min) to carry
-      // real wind/gust data. Hours beyond the last point are no-data noise.
-      if (correctedForecast.length < effectiveHours) {
-        effectiveHours = correctedForecast.length;
+      // Cap to the forecast horizon. Different sources have different
+      // horizons (Open-Meteo may return fewer hours than requested, the
+      // Signal K Weather API may differ, the clear-sky fallback is fixed)
+      // and a source may start later than now or have a non-integer-hour
+      // first point. Use the last point's time relative to the prediction
+      // start: a prediction hour needs a matching point (within 30 min) to
+      // carry real wind/gust data, so hours beyond the last point are
+      // no-data noise and are dropped.
+      const lastFcstTime = correctedForecast.reduce((max, fp) => {
+        const t =
+          fp.time instanceof Date
+            ? fp.time.getTime()
+            : new Date(fp.time).getTime();
+        return t > max ? t : max;
+      }, 0);
+      const coveredHours =
+        Math.floor((lastFcstTime - startTime.getTime()) / 3600000) + 1;
+      if (coveredHours > 0 && coveredHours < effectiveHours) {
+        effectiveHours = coveredHours;
         this.app?.debug?.(
-          `  capping prediction to ${effectiveHours}h (forecast has ${correctedForecast.length}pts of ${this.predictionHours}h)`,
+          `  capping prediction to ${effectiveHours}h (forecast covers ${coveredHours}h of ${this.predictionHours}h)`,
         );
       }
     }
