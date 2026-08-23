@@ -18,6 +18,44 @@ const {
 } = require("./solar.js");
 const weatherCache = require("./weather-cache.js");
 
+/** m/s → knots, matching prediction.js's MS_TO_KN. */
+const MS_TO_KN = 1.94384;
+
+/**
+ * Unwraps a Signal K path value to a number, handling both the bare number
+ * (as stored in live delta state) and the wrapped `{value: number}` form
+ * returned by `app.getSelfPath`. Returns null for missing/non-numeric data.
+ * @param {unknown} v
+ * @returns {number|null}
+ */
+function toNumber(v) {
+  if (v == null) return null;
+  if (typeof v === "number") return Number.isNaN(v) ? null : v;
+  if (typeof v === "object" && typeof v.value === "number")
+    return Number.isNaN(v.value) ? null : v.value;
+  return null;
+}
+
+/**
+ * Converts a Signal K wind speed (m/s) to knots, or null if missing.
+ * @param {unknown} v
+ * @returns {number|null}
+ */
+function toKnots(v) {
+  const ms = toNumber(v);
+  return ms == null ? null : ms * MS_TO_KN;
+}
+
+/**
+ * Converts a Signal K wind direction (radians, true) to degrees, or null.
+ * @param {unknown} v
+ * @returns {number|null}
+ */
+function windDirectionDeg(v) {
+  const rad = toNumber(v);
+  return rad == null ? null : (rad * 180) / Math.PI;
+}
+
 /** @typedef {import("@signalk/server-api").ServerAPI} ServerAPI */
 
 /**
@@ -46,6 +84,34 @@ const FORECAST_HOURS = 48;
 
 /** Maximum configurable forecast horizon in hours (matches schema) */
 const MAX_FORECAST_HOURS = 168;
+
+/**
+ * How long a tier-1/tier-2 forecast (live or restored from disk) stays usable
+ * as the primary in-memory source before the FSM tries to re-fetch. Sailing
+ * offshore typically has Internet once per day, so the default keeps a
+ * real forecast for 24 h after it was fetched (work doc #15). Tier-3/4 keep
+ * the short reuse window — they are cheap to regenerate and carry no
+ * forward-looking wind.
+ */
+const DEFAULT_FORECAST_CACHE_HOURS = 24;
+
+/**
+ * Reuse window for low-quality tiers (logbook oktas, clear sky). Short: they
+ * are cheap to regenerate and carry no forward-looking wind, so there is no
+ * value in caching them long. In minutes to match `getForecast`'s units.
+ */
+const LOW_TIER_CACHE_MINUTES = 15;
+
+/**
+ * Fetch-cadence constants driven by uplink status (work doc #15 update #1).
+ * The uplink signal decides how often to *attempt* a fetch; the staleness
+ * window decides whether a refresh is *eligible*. These are the *maximum*
+ * attempt frequency above the 60 s `minFetchIntervalMs` floor.
+ */
+/** While an uplink is online, refetch at most this often (ms). */
+const UPLINK_ONLINE_FETCH_INTERVAL_MS = 60 * 60 * 1000; // 1 h
+/** With no uplink, probe the network at most this often (ms) — a safety net. */
+const UPLINK_OFFLINE_PROBE_MS = 24 * 60 * 60 * 1000; // 24 h
 
 /**
  * Current tier in the fallback FSM.
@@ -417,17 +483,25 @@ class IngestionFSM {
    * @param {ServerAPI} app - Signal K server API
    * @param {object} [opts]
    * @param {number} [opts.forecastHours]
+   * @param {number} [opts.forecastCacheHours] - How long a tier-1/tier-2
+   *        forecast (live or restored from disk) stays usable as the primary
+   *        in-memory source before the FSM tries to re-fetch. Default 24 h
+   *        (offshore: Internet once per day). Tier-3/4 keep a short window.
    * @param {string} [opts.dataDir] - Plugin data directory; when set, freshly
    *        fetched forecasts are cached to disk so retro-predicted can reuse
-   *        them offline (same store/format as the historical backfill cache)
+   *        them offline (same store/format as the historical backfill cache),
+   *        and a cold-start/offline FSM can restore the last good forecast
+   *        from it instead of falling straight to clear-sky (work doc #15).
    */
-  constructor(app, { forecastHours, dataDir } = {}) {
+  constructor(app, { forecastHours, forecastCacheHours, dataDir } = {}) {
     this.app = app;
     this.currentTier = Tier.OPEN_METEO;
     this.forecastHours = Math.min(
       MAX_FORECAST_HOURS,
       Math.max(FORECAST_HOURS, forecastHours ?? FORECAST_HOURS),
     );
+    this.forecastCacheHours =
+      forecastCacheHours ?? DEFAULT_FORECAST_CACHE_HOURS;
     this.lastForecast = [];
     this.lastFetchTime = null;
     this.lastFetchAttempt = null; // Timestamp of last fetch attempt (even if failed)
@@ -435,6 +509,19 @@ class IngestionFSM {
     this.position = { latitude: null, longitude: null };
     this.cachedCloudCover = []; // From logbook, used as fallback for future hours
     this.dataDir = dataDir || null;
+    /**
+     * Uplink status driving fetch cadence (work doc #15 update #1). True if
+     * either Starlink (`network.providers.starlink.status === "online"`) or
+     * LTE (`networking.lte.connectionText` not `No service`) is online.
+     * Mirrored from deltas via `setUplinkStatus`.
+     */
+    this.uplinkOnline = false;
+    /**
+     * Timestamp (ms) of the last fetch attempt made *while uplink was online*.
+     * Used to cap online refetches to ~1 h even if the staleness window would
+     * allow a fetch sooner.
+     */
+    this.lastOnlineFetchAttempt = 0;
   }
 
   /**
@@ -448,6 +535,55 @@ class IngestionFSM {
         longitude: pos.longitude,
       };
     }
+  }
+
+  /**
+   * Mirrors uplink status from deltas (work doc #15 update #1).
+   *
+   * Online if either Starlink (`network.providers.starlink.status ===
+   * "online"`) or LTE (`networking.lte.connectionText` not `No service`,
+   * case-insensitive) is online. Returns true if the offline→online edge
+   * happened on this call so the caller can trigger an immediate fetch.
+   *
+   * @param {object} status
+   * @param {unknown} [status.starlink] - `network.providers.starlink.status`
+   * @param {unknown} [status.lte] - `networking.lte.connectionText`
+   * @returns {boolean} true if this call flipped uplink from offline to online
+   */
+  setUplinkStatus({ starlink, lte } = {}) {
+    const starlinkOnline =
+      typeof starlink === "string" && starlink.trim() === "online";
+    const lteOnline =
+      typeof lte === "string" &&
+      lte.trim().length > 0 &&
+      lte.trim().toLowerCase() !== "no service";
+    const online = starlinkOnline || lteOnline;
+    const becameOnline = online && !this.uplinkOnline;
+    this.uplinkOnline = online;
+    if (becameOnline) {
+      this.app.debug("Uplink came online — fetch eligible immediately");
+      // Reset the online-cadence cap so the transition triggers a fetch now.
+      this.lastOnlineFetchAttempt = 0;
+    }
+    return becameOnline;
+  }
+
+  /**
+   * Returns the in-memory reuse window (ms) for the current tier.
+   *
+   * Tier 1/2 (real forecasts, incl. restored-from-disk) stay usable for
+   * `forecastCacheHours`; tier 3/4 (logbook oktas, clear sky) keep the short
+   * window — cheap to regenerate and carry no forward-looking wind.
+   *
+   * @returns {number} max age in ms
+   */
+  forecastMaxAgeMs() {
+    const lowTier =
+      this.currentTier === Tier.LOGBOOK || this.currentTier === Tier.CLEAR_SKY;
+    const hours = lowTier
+      ? LOW_TIER_CACHE_MINUTES / 60
+      : this.forecastCacheHours;
+    return hours * 3600000;
   }
 
   /**
@@ -656,10 +792,20 @@ class IngestionFSM {
       `Fetching forecast for position: ${latitude.toFixed(4)}, ${longitude.toFixed(4)}`,
     );
 
-    // Try tiers in order until one succeeds with actual data.
-    // Note: empty forecast counts as failure (an empty array is truthy in JS,
-    // but carries no data - fall through to the next tier instead).
-    for (let tier = Tier.OPEN_METEO; tier <= Tier.CLEAR_SKY; tier++) {
+    // Try real network forecast tiers in order until one succeeds with
+    // actual data. Note: empty forecast counts as failure (an empty array is
+    // truthy in JS, but carries no data - fall through to the next tier
+    // instead). Tier 3 (Logbook) and tier 4 (Clear Sky) are intentionally NOT
+    // in this loop:
+    //   - Logbook carries no wind, so a logbook-only "success" would shadow
+    //     the on-disk restore path, which can produce logbook solar *plus*
+    //     latest-known wind (the stale-boundary hybrid, work doc #15 update
+    //     #2) — strictly better. Logbook cloud cover is still used as the
+    //     hybrid's solar source.
+    //   - Clear Sky always succeeds (pure sun geometry), so it would shadow
+    //     a restored real (stale) forecast, which is strictly better.
+    // Both are reached only via the restore/hybrid/clear-sky fallback below.
+    for (let tier = Tier.OPEN_METEO; tier < Tier.LOGBOOK; tier++) {
       this.app.debug(`Trying tier ${tier}: ${this.getTierName(tier)}`);
       let forecast;
       try {
@@ -684,18 +830,216 @@ class IngestionFSM {
       }
     }
 
-    // All tiers failed - generate clear sky fallback
-    this.app.debug("All forecast tiers failed, falling back to clear sky");
-    this.currentTier = Tier.CLEAR_SKY;
-    this.lastFetchTime = new Date();
-    this.lastForecast = generateClearSkyForecast(
-      new Date(),
-      this.forecastHours,
-      this.position.latitude,
-      this.position.longitude,
+    // All real network tiers failed. Fall through the offline ladder
+    // (work doc #15):
+    //   1. Restore the last real forecast from the on-disk cache if it is
+    //      still within its staleness window (a stale tier-1/2 forecast is
+    //      strictly better than the synthesized alternatives below).
+    //   2. Otherwise build the stale-boundary hybrid: solar from logbook
+    //      oktas, wind from latest-known live SK. This runs even with no
+    //      on-disk cache (logbook doesn't need it); it falls to Clear Sky
+    //      internally when logbook has no observations.
+    //   3. If even logbook is empty, the hybrid produces Clear Sky (the floor).
+    const restored = await this.restoreForecastFromCache();
+    if (restored) {
+      return restored;
+    }
+    return this.buildStaleHybridForecast();
+  }
+
+  /**
+   * Restores the most recent forecast from the on-disk weather cache for the
+   * vessel's current ~1° restore bucket, filtered to the live forecast
+   * horizon [now, now + forecastHours] (work doc #15).
+   *
+   * Used when all live network tiers fail: a stale real forecast (any tier)
+   * found on disk is preferred over a synthesized Clear Sky one. Reads every
+   * fine-bucket cache file that falls inside the coarse restore bucket across
+   * the horizon's UTC dates, merges them by tier (best wins per hour), and
+   * takes the newest file `mtime` as the fetch-time proxy for staleness.
+   *
+   * Sets `currentTier` to the best (lowest) tier present across the restored
+   * points so diagnostics reflect that this is a real (if stale) forecast.
+   *
+   * Never throws: a missing/empty/corrupt cache degrades to `null`, letting
+   * the caller fall through to Clear Sky.
+   *
+   * @returns {Promise<ForecastPoint[]|null>} Restored forecast, or null
+   */
+  async restoreForecastFromCache() {
+    if (!this.dataDir) return null;
+    const { latitude, longitude } = this.position;
+    if (latitude == null || longitude == null) return null;
+
+    const coarse = weatherCache.weatherRestoreBucket(latitude, longitude);
+    const now = Date.now();
+    const horizonEnd = now + this.forecastHours * 3600000;
+
+    // Enumerate the UTC dates that the horizon spans and restore each.
+    const dateKeys = new Set();
+    for (let t = now; t <= horizonEnd; t += 3600000) {
+      const d = new Date(t);
+      dateKeys.add(
+        `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`,
+      );
+    }
+
+    let merged = null;
+    let newestFetchAt = 0;
+    for (const dateKey of dateKeys) {
+      try {
+        const got = await weatherCache.readWeatherCacheCoarse(
+          this.dataDir,
+          dateKey,
+          coarse,
+        );
+        if (!got) continue;
+        merged = weatherCache.mergeHours(merged, got.hours);
+        if (got.fetchedAt.getTime() > newestFetchAt) {
+          newestFetchAt = got.fetchedAt.getTime();
+        }
+      } catch (error) {
+        this.app.debug?.(
+          `Restore: failed to read cache for ${dateKey}: ${error.message}`,
+        );
+      }
+    }
+    if (!merged || merged.length === 0) {
+      this.app.debug("Restore: no on-disk forecast found in restore bucket");
+      return null;
+    }
+
+    // Filter to the live horizon and skip points already in the past.
+    const inHorizon = merged.filter(
+      (p) =>
+        p.time.getTime() >= now - 3600000 && p.time.getTime() <= horizonEnd,
     );
-    this.app.debug(`Generated ${this.lastForecast.length} clear sky points`);
-    await this.cacheForecast();
+    if (inHorizon.length === 0) {
+      this.app.debug(
+        "Restore: cached forecast is entirely outside the horizon",
+      );
+      return null;
+    }
+
+    // Best (lowest) tier present — this is a real forecast, not Clear Sky.
+    let bestTier = Infinity;
+    for (const p of inHorizon) {
+      const t = p.tier ?? Infinity;
+      if (t < bestTier) bestTier = t;
+    }
+    if (bestTier === Infinity) bestTier = Tier.CLEAR_SKY;
+
+    // Stale-boundary gate (work doc #15 update #2). If the restored forecast
+    // is older than `forecastCacheHours`, it has outlived its useful life as
+    // a real prediction — return null so the caller builds the stale hybrid
+    // (logbook solar + latest-known wind) instead of serving a stale real
+    // forecast as if it were fresh.
+    const fetchedAt = newestFetchAt || now;
+    if (now - fetchedAt > this.forecastCacheHours * 3600000) {
+      this.app.debug(
+        `Restore: cached forecast is ${Math.round((now - fetchedAt) / 3600000)}h old (older than ${this.forecastCacheHours}h) — leaving for the stale hybrid`,
+      );
+      return null;
+    }
+
+    this.currentTier = bestTier;
+    // Use the newest file mtime as the fetch-time proxy (the cache stores no
+    // fetch timestamp; writeWeatherCache rewrites the file on every fetch).
+    this.lastFetchTime = new Date(fetchedAt);
+    this.lastForecast = this.postProcessForecast(inHorizon);
+    this.app.debug(
+      `Restored ${this.lastForecast.length} forecast points from disk (best tier ${bestTier}, fetched ~${Math.round((now - this.lastFetchTime.getTime()) / 3600000)}h ago)`,
+    );
+    return this.lastForecast;
+  }
+
+  /**
+   * Builds the stale-boundary hybrid forecast (work doc #15 update #2).
+   *
+   * Used when the on-disk cache is older than `forecastCacheHours` and there
+   * is no uplink: no real (forward) forecast is available, so we produce an
+   * honest "what we know now" forecast:
+   *
+   *   - **Solar (GHI):** synthesized from the latest logbook cloud-cover
+   *     observation via Kasten-Czeplak (reuses the tier-3 logbook path). Falls
+   *     to Clear Sky if logbook has no observations.
+   *   - **Wind:** latest-known live Signal K wind (`environment.wind.speedTrue`,
+   *     `directionTrue`, gust) held constant across the horizon. Not a
+   *     forecast — a nowcast assumed to persist — tagged `source: "latest-known"`
+   *     so downstream consumers (WPF, advisories) can down-weight.
+   *
+   * Each point carries a `source` field (`"logbook"` / `"latest-known"` /
+   * `"clear-sky"`) so callers can distinguish a real prediction from this
+   * nowcast. `currentTier` is set to LOGBOOK (or CLEAR_SKY if no logbook),
+   * never to a real-forecast tier.
+   *
+   * @returns {Promise<ForecastPoint[]>} Hybrid forecast points
+   */
+  async buildStaleHybridForecast() {
+    const { latitude, longitude } = this.position;
+    const now = new Date();
+    const nowMs = now.getTime();
+
+    // Latest-known wind from live SK state (held constant across horizon).
+    const latestWind = {
+      speedKnots: toKnots(this.app.getSelfPath("environment.wind.speedTrue")),
+      gustKnots: toKnots(this.app.getSelfPath("environment.wind.gust")),
+      directionDeg: windDirectionDeg(
+        this.app.getSelfPath("environment.wind.directionTrue"),
+      ),
+    };
+
+    // Solar: try logbook cloud cover first (tier-3 path reuses cached).
+    let cloudCover = null;
+    let tier = Tier.CLEAR_SKY;
+    try {
+      // Reuse any cached cloud cover from a prior logbook fetch this session.
+      if (this.cachedCloudCover.length > 0) {
+        cloudCover =
+          this.cachedCloudCover[this.cachedCloudCover.length - 1].cloudCover;
+        tier = Tier.LOGBOOK;
+      } else {
+        const readings = await fetchLogbookCloudCover(this.app, 48);
+        this.cachedCloudCover = readings;
+        if (readings.length > 0) {
+          cloudCover = readings[readings.length - 1].cloudCover;
+          tier = Tier.LOGBOOK;
+        }
+      }
+    } catch (error) {
+      this.app.debug?.(`Stale hybrid: logbook unavailable: ${error.message}`);
+    }
+
+    const points = [];
+    for (let i = 0; i < this.forecastHours; i++) {
+      const time = new Date(nowMs + i * 3600000);
+      const { altitude } = sunPosition(time, latitude, longitude);
+      let ghi;
+      let source;
+      if (cloudCover != null) {
+        ghi = irradianceFromCloudCover(altitude, cloudCover);
+        source = "logbook";
+      } else {
+        ghi = maxIrradiance(altitude);
+        source = "clear-sky";
+      }
+      points.push({
+        time,
+        ghi,
+        cloudCover,
+        windSpeedKnots: latestWind.speedKnots,
+        gustSpeedKnots: latestWind.gustKnots,
+        windDirectionDeg: latestWind.directionDeg,
+        source,
+      });
+    }
+
+    this.currentTier = tier;
+    this.lastFetchTime = new Date(nowMs);
+    this.lastForecast = points;
+    this.app.debug(
+      `Stale hybrid: ${points.length} points (solar: ${cloudCover != null ? "logbook oktas" : "clear sky"}, wind: latest-known ${latestWind.speedKnots ?? "?"}kn)`,
+    );
     return this.lastForecast;
   }
 
@@ -720,34 +1064,69 @@ class IngestionFSM {
   /**
    * Gets the current forecast (cached if fresh, otherwise fetches new).
    *
-   * @param {number} maxAgeMinutes - Maximum age of cached forecast in minutes
+   * Two-layer freshness gate (work doc #15):
+   *
+   * 1. **Staleness window** (`forecastMaxAgeMs`): tier-1/2 stay usable for
+   *    `forecastCacheHours` (default 24 h); tier-3/4 for 15 min. If the
+   *    in-memory forecast is younger than its window, serve it.
+   * 2. **Uplink cadence**: when the window says a refresh is eligible, the
+   *    *attempt* frequency is capped by uplink status — immediate on the
+   *    offline→online edge, ~1 h while online, ~24 h probe while offline.
+   *    The 60 s `minFetchIntervalMs` floor still applies.
+   *
+   * The `maxAgeMinutes` argument is kept for backward compatibility but
+   * ignored in favor of the tier-aware window — callers should not pass it.
+   *
+   * @param {number} [_maxAgeMinutes] - ignored (tier-aware window is used)
    * @returns {Promise<ForecastPoint[]>} Forecast points
    */
-  async getForecast(maxAgeMinutes = 15) {
-    const maxAge = maxAgeMinutes * 60000;
+  async getForecast(_maxAgeMinutes) {
+    const maxAge = this.forecastMaxAgeMs();
 
-    // Return cached forecast if still fresh
+    // Return cached forecast if still within its tier's staleness window.
     if (
       this.lastFetchTime &&
       this.lastForecast.length > 0 &&
       Date.now() - this.lastFetchTime.getTime() < maxAge
     ) {
       this.app.debug(
-        `Using cached forecast (age: ${Math.round((Date.now() - this.lastFetchTime.getTime()) / 60000)}min, points: ${this.lastForecast.length}, first: ${this.lastForecast[0]?.time.toISOString()})`,
+        `Using cached forecast (age: ${Math.round((Date.now() - this.lastFetchTime.getTime()) / 60000)}min, tier: ${this.currentTier}, points: ${this.lastForecast.length}, first: ${this.lastForecast[0]?.time.toISOString()})`,
       );
       return this.lastForecast;
     }
 
-    // Rate limit fetch attempts to avoid spamming the API
+    // A refresh is eligible. Gate the *attempt* by uplink cadence so we
+    // don't hammer a dead network all day offshore (work doc #15 update #1).
+    const now = Date.now();
+    if (this.uplinkOnline) {
+      if (now - this.lastOnlineFetchAttempt < UPLINK_ONLINE_FETCH_INTERVAL_MS) {
+        this.app.debug(
+          `Forecast eligible but uplink refetched recently; serving stale in-memory forecast`,
+        );
+        return this.lastForecast;
+      }
+    } else {
+      if (
+        this.lastFetchAttempt &&
+        now - this.lastFetchAttempt.getTime() < UPLINK_OFFLINE_PROBE_MS
+      ) {
+        this.app.debug(
+          `Forecast eligible but no uplink and offline probe rate-limited; serving stale in-memory forecast`,
+        );
+        return this.lastForecast;
+      }
+    }
+
+    // 60 s floor: a failed fetch must not be retried more than once a minute.
     if (
       this.lastFetchAttempt &&
-      Date.now() - this.lastFetchAttempt.getTime() < this.minFetchIntervalMs
+      now - this.lastFetchAttempt.getTime() < this.minFetchIntervalMs
     ) {
-      // We recently tried to fetch, return whatever we have
       return this.lastForecast;
     }
 
-    this.lastFetchAttempt = new Date();
+    this.lastFetchAttempt = new Date(now);
+    if (this.uplinkOnline) this.lastOnlineFetchAttempt = now;
     return await this.fetchForecast();
   }
 
@@ -818,4 +1197,7 @@ module.exports = {
   OPEN_METEO_MAX_ATTEMPTS,
   FORECAST_HOURS,
   MAX_FORECAST_HOURS,
+  DEFAULT_FORECAST_CACHE_HOURS,
+  UPLINK_ONLINE_FETCH_INTERVAL_MS,
+  UPLINK_OFFLINE_PROBE_MS,
 };

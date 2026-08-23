@@ -370,6 +370,15 @@ function buildPluginSchema() {
             minimum: 24,
             maximum: 168,
           },
+          forecastCacheHours: {
+            type: "number",
+            title: "Offline Forecast Reuse (hours)",
+            description:
+              "How long a tier-1/tier-2 forecast (live or restored from disk) stays usable as the primary source before the FSM falls back to logbook oktas / clear-sky. Offshore with Internet once a day, keep this at 24h.",
+            default: 24,
+            minimum: 1,
+            maximum: 168,
+          },
         },
       },
       recording: {

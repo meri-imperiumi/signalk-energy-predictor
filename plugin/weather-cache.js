@@ -44,9 +44,19 @@ const path = require("node:path");
 /**
  * Bucket precision in decimal degrees (~0.01° ≈ ~1 km). Coarse enough that an
  * anchored vessel hits the same bucket across days, fine enough that a
- * passage gets distinct weather along the track.
+ * passage gets distinct weather along the track. Used for **writing**
+ * forecasts to disk (dedup along a track).
  */
 const BUCKET_DECIMALS = 2;
+
+/**
+ * Coarser bucket precision (~1° ≈ ~60 NM) used only for **restoring** a
+ * forecast from the on-disk cache when offline. A vessel making 5 kn crosses
+ * a fine write-bucket every ~12 min but stays in one ~1° restore-bucket for
+ * ~12 h, so a forecast fetched anywhere in that ~60 NM square a day earlier
+ * is still regionally valid as a fallback. See `readWeatherCacheCoarse`.
+ */
+const RESTORE_BUCKET_DECIMALS = 0;
 
 /**
  * Rounds a number to a fixed precision.
@@ -69,6 +79,23 @@ function weatherPositionBucket(latitude, longitude) {
   return {
     latitude: roundTo(latitude, BUCKET_DECIMALS),
     longitude: roundTo(longitude, BUCKET_DECIMALS),
+  };
+}
+
+/**
+ * Coarser position bucket (~1° ≈ ~60 NM) used to **restore** a forecast from
+ * the on-disk cache when offline. Distinct from `weatherPositionBucket`
+ * (the fine write key) so a moving vessel can still find a forecast fetched
+ * earlier in the same ~1° square even after it has crossed many fine
+ * write-buckets. See work doc #15.
+ * @param {number} latitude
+ * @param {number} longitude
+ * @returns {{latitude: number, longitude: number}}
+ */
+function weatherRestoreBucket(latitude, longitude) {
+  return {
+    latitude: roundTo(latitude, RESTORE_BUCKET_DECIMALS),
+    longitude: roundTo(longitude, RESTORE_BUCKET_DECIMALS),
   };
 }
 
@@ -267,11 +294,120 @@ async function writeWeatherCache(dataDir, dateKey, bucket, hours, tier) {
   await fs.writeFile(filePath, JSON.stringify(serializeHours(merged)), "utf-8");
 }
 
+/**
+ * Inverse of `coordToFile`: parses a sanitized coordinate token back to a
+ * number. `m16-05` → -16.05, `p142-38` → 142.38. Returns null for a token
+ * that doesn't match the expected shape (e.g. a stray file in the directory).
+ * @param {string} token
+ * @returns {number|null}
+ */
+function fileToCoord(token) {
+  if (typeof token !== "string" || token.length < 2) return null;
+  const sign = token[0];
+  if (sign !== "m" && sign !== "p") return null;
+  const rest = token.slice(1).replace("-", ".");
+  const v = Number(rest);
+  return Number.isNaN(v) ? null : sign === "m" ? -v : v;
+}
+
+/**
+ * Parses a cache filename (`<lat>_<lon>.json`) back into a fine bucket.
+ * Returns null if the name can't be parsed (non-cache files, partial writes).
+ * @param {string} basename
+ * @returns {{latitude: number, longitude: number}|null}
+ */
+function parseCacheFilename(basename) {
+  if (!basename.endsWith(".json")) return null;
+  const stem = basename.slice(0, -5);
+  const sep = stem.lastIndexOf("_");
+  if (sep <= 0) return null;
+  const lat = fileToCoord(stem.slice(0, sep));
+  const lon = fileToCoord(stem.slice(sep + 1));
+  if (lat == null || lon == null) return null;
+  return { latitude: lat, longitude: lon };
+}
+
+/**
+ * Returns true if a fine (write) bucket falls inside a coarse (restore)
+ * bucket. Both are compared at the restore precision by rounding.
+ * @param {{latitude: number, longitude: number}} fine
+ * @param {{latitude: number, longitude: number}} coarse - already rounded
+ *        to `RESTORE_BUCKET_DECIMALS`
+ * @returns {boolean}
+ */
+function fineBucketInCoarse(fine, coarse) {
+  return (
+    roundTo(fine.latitude, RESTORE_BUCKET_DECIMALS) === coarse.latitude &&
+    roundTo(fine.longitude, RESTORE_BUCKET_DECIMALS) === coarse.longitude
+  );
+}
+
+/**
+ * Restores a day's weather from the on-disk cache for a **coarse** (~1°)
+ * restore bucket, by scanning the date directory and merging every fine
+ * (~0.01°) cache file that falls inside the coarse bucket. Used by the
+ * live ingestion FSM when the network is down: a moving vessel can still
+ * find a forecast fetched earlier in the same ~60 NM square even after it
+ * has crossed many fine write-buckets (work doc #15).
+ *
+ * Returns the merged hourly points (best tier per hour) plus the newest
+ * file `mtime` across the read files — the caller uses `mtime` as a proxy
+ * for when the forecast was fetched (the cache stores no fetch timestamp,
+ * but `writeWeatherCache` rewrites the file on every successful fetch).
+ *
+ * Never throws: a missing/empty directory or corrupt files degrade to a
+ * miss (`null`).
+ *
+ * @param {string} dataDir
+ * @param {string} dateKey - YYYY-MM-DD
+ * @param {{latitude: number, longitude: number}} coarseBucket - a value from
+ *        `weatherRestoreBucket` (rounded to ~1°)
+ * @returns {Promise<{hours: WeatherPoint[], fetchedAt: Date}|null>}
+ */
+async function readWeatherCacheCoarse(dataDir, dateKey, coarseBucket) {
+  const dir = path.join(dataDir, "weather", dateKey);
+  let entries;
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch (error) {
+    if (error.code === "ENOENT") return null;
+    return null;
+  }
+
+  let merged = null;
+  let newestMtime = 0;
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
+    const fine = parseCacheFilename(entry.name);
+    if (!fine || !fineBucketInCoarse(fine, coarseBucket)) continue;
+    const filePath = path.join(dir, entry.name);
+    let hours;
+    let stat;
+    try {
+      hours = deserializeHours(
+        JSON.parse(await fs.readFile(filePath, "utf-8")),
+      );
+      stat = await fs.stat(filePath);
+    } catch (error) {
+      // Corrupt or vanished between readdir/read: skip this file
+      continue;
+    }
+    if (!hours || hours.length === 0) continue;
+    merged = mergeHours(merged, hours);
+    if (stat.mtimeMs > newestMtime) newestMtime = stat.mtimeMs;
+  }
+  if (!merged || merged.length === 0) return null;
+  return { hours: merged, fetchedAt: new Date(newestMtime) };
+}
+
 module.exports = {
   BUCKET_DECIMALS,
+  RESTORE_BUCKET_DECIMALS,
   weatherPositionBucket,
+  weatherRestoreBucket,
   weatherCachePath,
   mergeHours,
   readWeatherCache,
+  readWeatherCacheCoarse,
   writeWeatherCache,
 };

@@ -122,6 +122,7 @@ const DEFAULT_CONFIG = {
     openMeteoEnabled: true,
     useLogbook: true,
     forecastHours: 48,
+    forecastCacheHours: 24,
   },
 };
 
@@ -144,6 +145,8 @@ const SUBSCRIPTION_PATHS = [
   "electrical.venus.acPower",
   "propulsion.*.state",
   "propulsion.*.revolutions",
+  "network.providers.starlink.status",
+  "networking.lte.connectionText",
 ];
 
 /**
@@ -1240,6 +1243,33 @@ module.exports = (app) => {
               }
             }
 
+            // Mirror uplink status into the ingestion FSM and trigger a
+            // forecast fetch on the offline→online edge (work doc #15
+            // update #1). Starlink online = `status === "online"`; LTE
+            // online = `connectionText` not `No service`.
+            if (
+              ingestionFSM &&
+              (v.path === "network.providers.starlink.status" ||
+                v.path === "networking.lte.connectionText")
+            ) {
+              const becameOnline = ingestionFSM.setUplinkStatus({
+                starlink:
+                  deltaState.get("network.providers.starlink.status") ??
+                  app.getSelfPath("network.providers.starlink.status"),
+                lte:
+                  deltaState.get("networking.lte.connectionText") ??
+                  app.getSelfPath("networking.lte.connectionText"),
+              });
+              if (becameOnline) {
+                app.debug("Uplink came online — triggering forecast fetch");
+                runPredictionCycle().catch((error) => {
+                  app.error(
+                    `Uplink-online prediction cycle error: ${error.message}`,
+                  );
+                });
+              }
+            }
+
             // Track if this is a solar power path we care about
             if (solarPowerPaths.has(v.path)) {
               solarPowerDelta.push(v.path);
@@ -2036,6 +2066,7 @@ module.exports = (app) => {
       // Initialize components
       ingestionFSM = new deps.IngestionFSM(app, {
         forecastHours: config.weather?.forecastHours,
+        forecastCacheHours: config.weather?.forecastCacheHours,
         dataDir: app.getDataDirPath(),
       });
       advisoryPublisher = new deps.AdvisoryPublisher(app, plugin.id);

@@ -5,13 +5,21 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
+const fs = require("node:fs/promises");
+const os = require("node:os");
+const path = require("node:path");
 
 const {
   IngestionFSM,
   Tier,
   fetchOpenMeteo,
   OPEN_METEO_MAX_ATTEMPTS,
+  DEFAULT_FORECAST_CACHE_HOURS,
 } = require("../plugin/ingestion.js");
+const {
+  writeWeatherCache,
+  weatherPositionBucket,
+} = require("../plugin/weather-cache.js");
 
 function makeApp() {
   return {
@@ -415,6 +423,268 @@ test.describe("Open-Meteo fetch error handling", () => {
       assert.strictEqual(fsm.currentTier, Tier.OPEN_METEO);
       assert.strictEqual(forecast.length, 2);
       assert.ok(forecast.every((p) => p.windSpeedKnots != null));
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+});
+
+test.describe("Offline forecast restore + staleness + uplink cadence", () => {
+  async function mkDataDir() {
+    return fs.mkdtemp(path.join(os.tmpdir(), "ingest-offline-"));
+  }
+
+  /** A fake SK app that returns canned values for given paths. */
+  function makeAppWith(paths = {}) {
+    return {
+      debug() {},
+      info() {},
+      warn() {},
+      error() {},
+      getSelfPath: (p) => paths[p] ?? null,
+    };
+  }
+
+  function fsmWithCache(app, dataDir, opts = {}) {
+    const fsm = new IngestionFSM(app, { dataDir, ...opts });
+    fsm.position = { latitude: 60.17, longitude: 24.94 };
+    return fsm;
+  }
+
+  function networkDown() {
+    globalThis.fetch = async () => {
+      throw new Error("network down");
+    };
+  }
+
+  /** Seed the on-disk cache for a position with a tier-1 forecast hour. */
+  async function seedCache(dataDir, lat, lon, hours, tier = 1, ageMs = 0) {
+    const bucket = weatherPositionBucket(lat, lon);
+    const date = new Date(Date.now() - ageMs);
+    const dateKey = `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}-${String(date.getUTCDate()).padStart(2, "0")}`;
+    const points = hours.map((h) => ({
+      time: new Date(date.getTime() + h * 3600000),
+      ghi: 600,
+      cloudCover: 0.3,
+      windSpeedKnots: 12,
+      gustSpeedKnots: 18,
+      windDirectionDeg: 90,
+      tier,
+    }));
+    await writeWeatherCache(dataDir, dateKey, bucket, points, tier);
+    return dateKey;
+  }
+
+  test("network down + on-disk cache present → restores the real forecast instead of clear sky", async () => {
+    const dir = await mkDataDir();
+    const fsm = fsmWithCache(makeApp(), dir);
+    // Seed a tier-1 forecast for "now" (hour 0) at the boat's bucket.
+    await seedCache(dir, 60.17, 24.94, [0]);
+    const origFetch = globalThis.fetch;
+    networkDown();
+    try {
+      const forecast = await fsm.fetchForecast();
+      // Restore must win over Clear Sky: tier stays 1, wind is present.
+      assert.strictEqual(fsm.currentTier, Tier.OPEN_METEO);
+      assert.ok(forecast.some((p) => p.windSpeedKnots === 12));
+      assert.ok(forecast.some((p) => p.ghi === 600));
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  test("network down + no cache → falls back to clear sky (today's behavior)", async () => {
+    const dir = await mkDataDir();
+    const fsm = fsmWithCache(makeApp(), dir);
+    const origFetch = globalThis.fetch;
+    networkDown();
+    try {
+      const forecast = await fsm.fetchForecast();
+      assert.strictEqual(fsm.currentTier, Tier.CLEAR_SKY);
+      assert.ok(forecast.some((p) => (p.ghi ?? 0) > 0));
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  test("restore reads from the coarse ~1° bucket, not the fine write bucket", async () => {
+    // Fetch landed at 60.17/24.94; the boat has since moved to 60.42/24.80
+    // (same ~1° restore bucket 60/25, different fine bucket). Restore must
+    // still find it.
+    const dir = await mkDataDir();
+    const fsm = fsmWithCache(makeApp(), dir);
+    fsm.position = { latitude: 60.42, longitude: 24.8 }; // moved ~0.3°
+    await seedCache(dir, 60.17, 24.94, [0]);
+    const origFetch = globalThis.fetch;
+    networkDown();
+    try {
+      const forecast = await fsm.fetchForecast();
+      assert.strictEqual(fsm.currentTier, Tier.OPEN_METEO);
+      assert.ok(forecast.some((p) => p.windSpeedKnots === 12));
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  test("tier-aware staleness: a tier-1 forecast stays usable past 15 min offline", async () => {
+    const dir = await mkDataDir();
+    const fsm = fsmWithCache(makeApp(), dir);
+    const origFetch = globalThis.fetch;
+    let fetchCalls = 0;
+    globalThis.fetch = async () => {
+      fetchCalls++;
+      throw new Error("network down"); // never succeeds
+    };
+    try {
+      // Seed a fresh tier-1 cache and restore once.
+      await seedCache(dir, 60.17, 24.94, [0]);
+      await fsm.fetchForecast();
+      assert.strictEqual(fsm.currentTier, Tier.OPEN_METEO);
+      const afterFirst = fetchCalls;
+      // Wind the in-memory fetch time ~30 min into the past: still inside the
+      // 24h tier-1 window, so getForecast must serve the cache WITHOUT
+      // re-attempting a (failing) network fetch.
+      fsm.lastFetchTime = new Date(Date.now() - 30 * 60000);
+      const served = await fsm.getForecast();
+      assert.strictEqual(
+        fetchCalls,
+        afterFirst,
+        "no fetch attempt within the tier-1 staleness window",
+      );
+      assert.strictEqual(served, fsm.lastForecast);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  test("tier-aware staleness: a tier-4 clear-sky forecast re-fetches after 15 min", async () => {
+    const dir = await mkDataDir();
+    const fsm = fsmWithCache(makeApp(), dir);
+    const origFetch = globalThis.fetch;
+    let fetchCalls = 0;
+    globalThis.fetch = async () => {
+      fetchCalls++;
+      throw new Error("network down");
+    };
+    try {
+      // No cache → clear sky (tier 4).
+      await fsm.fetchForecast();
+      assert.strictEqual(fsm.currentTier, Tier.CLEAR_SKY);
+      // 20 min old clear-sky is outside its 15 min window → getForecast must
+      // attempt a refetch (which fails offline; that's fine, we just assert
+      // the attempt happened).
+      fsm.lastFetchTime = new Date(Date.now() - 20 * 60000);
+      fsm.uplinkOnline = false;
+      fsm.lastFetchAttempt = null;
+      await fsm.getForecast();
+      assert.ok(fetchCalls > 0, "clear-sky past 15 min triggers a refetch");
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  test("uplink offline→online edge triggers an immediate fetch eligibility", async () => {
+    const fsm = makeFSM();
+    assert.strictEqual(fsm.uplinkOnline, false);
+    // First online status (Starlink) flips the edge.
+    const became = fsm.setUplinkStatus({ starlink: "online" });
+    assert.strictEqual(became, true);
+    assert.strictEqual(fsm.uplinkOnline, true);
+    // A subsequent LTE-online update is not an edge.
+    const became2 = fsm.setUplinkStatus({
+      starlink: "online",
+      lte: "Connected",
+    });
+    assert.strictEqual(became2, false);
+    // Going offline then online again is another edge.
+    fsm.setUplinkStatus({ starlink: "offline", lte: "No service" });
+    assert.strictEqual(fsm.uplinkOnline, false);
+    const became3 = fsm.setUplinkStatus({ lte: "4G" });
+    assert.strictEqual(became3, true);
+  });
+
+  test("uplink online caps refetch attempts to ~1h even if the forecast is stale", async () => {
+    const dir = await mkDataDir();
+    const fsm = fsmWithCache(makeApp(), dir);
+    const origFetch = globalThis.fetch;
+    let fetchCalls = 0;
+    globalThis.fetch = async () => {
+      fetchCalls++;
+      throw new Error("network down");
+    };
+    try {
+      await seedCache(dir, 60.17, 24.94, [0]);
+      await fsm.fetchForecast(); // restores tier 1
+      // Mark the forecast ancient so staleness says "refresh eligible"...
+      fsm.lastFetchTime = new Date(Date.now() - 48 * 3600000);
+      fsm.uplinkOnline = true;
+      fsm.lastOnlineFetchAttempt = Date.now() - 30 * 60000; // …but refetched 30 min ago
+      const before = fetchCalls;
+      await fsm.getForecast();
+      assert.strictEqual(
+        fetchCalls,
+        before,
+        "online cadence (1h) suppresses a refetch only 30 min after the last",
+      );
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  test("stale-boundary hybrid: cache older than forecastCacheHours → logbook solar + latest-known wind", async () => {
+    const dir = await mkDataDir();
+    // Live SK wind available for the nowcast.
+    const app = makeAppWith({
+      "environment.wind.speedTrue": 8, // m/s
+      "environment.wind.directionTrue": Math.PI, // 180°
+    });
+    const fsm = fsmWithCache(app, dir);
+    const origFetch = globalThis.fetch;
+    // Open-Meteo down; logbook returns one observation with 4 oktas.
+    const today = new Date().toISOString().split("T")[0];
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u.includes("open-meteo")) throw new Error("network down");
+      if (u.includes("signalk-logbook")) {
+        if (new URL(u).pathname.endsWith("/logs")) {
+          return { ok: true, json: async () => [today] };
+        }
+        return {
+          ok: true,
+          json: async () => [
+            {
+              datetime: new Date(Date.now() - 3600000).toISOString(),
+              observations: { cloudCoverage: 4 },
+            },
+          ],
+        };
+      }
+      throw new Error("network down");
+    };
+    try {
+      // Seed a tier-1 forecast fetched 30 h ago (older than the 24 h window).
+      await seedCache(dir, 60.17, 24.94, [0], 1, 30 * 3600000);
+      const forecast = await fsm.fetchForecast();
+      // Hybrid must NOT claim to be a real forecast tier.
+      assert.strictEqual(fsm.currentTier, Tier.LOGBOOK);
+      // Wind is the latest-known live value (8 m/s → ~15.55 kn), held constant.
+      assert.ok(
+        forecast.every(
+          (p) =>
+            p.windSpeedKnots != null &&
+            Math.abs(p.windSpeedKnots - 8 * 1.94384) < 0.1,
+        ),
+      );
+      assert.ok(forecast.every((p) => p.windDirectionDeg === 180));
+      // Solar is logbook-attenuated (cloud cover 0.5), present in daytime.
+      assert.ok(forecast.every((p) => p.cloudCover === 0.5));
+      assert.ok(forecast.some((p) => (p.ghi ?? 0) > 0));
+      // Points are tagged so downstream can down-weight.
+      assert.ok(
+        forecast.every(
+          (p) => p.source === "logbook" || p.source === "clear-sky",
+        ),
+      );
     } finally {
       globalThis.fetch = origFetch;
     }
