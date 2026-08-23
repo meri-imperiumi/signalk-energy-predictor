@@ -2074,8 +2074,16 @@ class PredictionEngine {
             : new Date(fp.time).getTime();
         return t > max ? t : max;
       }, 0);
+      // Count prediction hours that have a matching forecast point. Hour h
+      // is centered on startTime + h·1h and matches any forecast point
+      // within 30 min, so the last coverable hour is the one nearest
+      // lastFcstTime: round((lastFcstTime - startTime)/1h), not floor. A
+      // plain floor+1 drops the final hour whenever the prediction cycle
+      // runs even a minute after the forecast's first point (e.g. a 24-point
+      // forecast then publishes only hours 0–22, losing hour 23 — and its
+      // WPF-corrected wind/gust — entirely).
       const coveredHours =
-        Math.floor((lastFcstTime - startTime.getTime()) / 3600000) + 1;
+        Math.floor((lastFcstTime - startTime.getTime()) / 3600000 + 0.5) + 1;
       if (coveredHours > 0 && coveredHours < effectiveHours) {
         effectiveHours = coveredHours;
         this.app?.debug?.(

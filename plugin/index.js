@@ -410,6 +410,17 @@ module.exports = (app) => {
       correctedGust10m != null
         ? toDeviceHeight(correctedGust10m, deviceHeightM, z0)
         : null;
+
+    // A gust is, by definition, a wind speed peak above the mean — the
+    // forecasted gust can never be smaller than the forecasted base wind.
+    // The factors can push the corrected gust below the corrected speed
+    // (e.g. a small gust factor with a large speed factor, or just forecast
+    // rounding), so floor the corrected gust at the corrected speed.
+    const flooredGust =
+      correctedGust != null
+        ? Math.max(correctedGust, correctedSpeed)
+        : null;
+
     return {
       applies: true,
       placeKey: key,
@@ -418,7 +429,7 @@ module.exports = (app) => {
       speedFactor,
       gustFactor,
       correctedSpeed,
-      correctedGust,
+      correctedGust: flooredGust,
     };
   }
 
@@ -2306,6 +2317,10 @@ module.exports = (app) => {
     solarMatrices,
     runPredictionCycle,
     recordSample,
+    resolveWindProtectionContext,
+    get windProtection() {
+      return windProtection;
+    },
     get learningCycleCount() {
       return learningCycleCount;
     },
