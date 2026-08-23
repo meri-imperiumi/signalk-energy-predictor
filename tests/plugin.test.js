@@ -528,10 +528,11 @@ test.describe("Signal K API interactions", () => {
     app.dataPath = tempDir;
     await plugin.start(config, () => {});
 
-    const emit = (values) =>
-      app.subscriptionmanager.subscriptions.forEach(({ deltaHandler }) =>
-        deltaHandler({ context: app.selfId, updates: [{ values }] }),
-      );
+    const emit = (values) => {
+      app.subscriptionmanager.subscriptions.forEach(({ deltaHandler }) => {
+        deltaHandler({ context: app.selfId, updates: [{ values }] });
+      });
+    };
 
     // Establish a known nav state via a delta
     emit([{ path: "navigation.state", value: "moored" }]);
