@@ -412,19 +412,24 @@ class LoadProfile {
   /**
    * Checks if a sample should be gated out (not learned).
    *
+   * Gates use explicit overrides when provided (historical replay); otherwise
+   * they read the live Signal K state via getSelfPath (live prediction path).
+   *
    * @param {number} dcLoadW - DC load in watts
    * @param {number} acLoadW - AC load in watts
    * @param {string} binKey - Bin key for the sample
+   * @param {{shorePowerConnected?: boolean|null, engineRunning?: boolean|null}} [overrides] - Historical state overrides
    * @returns {string|null} Gate name if gated, null if should sample
    */
-  shouldGate(dcLoadW, acLoadW, binKey) {
-    // Shore power gate
-    if (this.isShorePowerConnected()) {
+  shouldGate(dcLoadW, acLoadW, binKey, overrides = {}) {
+    const shorePower =
+      overrides.shorePowerConnected ?? this.isShorePowerConnected();
+    if (shorePower) {
       return "shore-power";
     }
 
-    // Engine running gate
-    if (this.isEngineRunning() === true) {
+    const engineRunning = overrides.engineRunning ?? this.isEngineRunning();
+    if (engineRunning === true) {
       return "engine-running";
     }
 
@@ -445,11 +450,12 @@ class LoadProfile {
    * Tracks days sampled per bin for the minSamples gate.
    *
    * @param {string} binKey - Bin key
+   * @param {Date} [when] - Sample timestamp (defaults to now, live path)
    * @returns {void}
    */
-  trackSampleDay(binKey) {
-    const today = new Date().toISOString().split("T")[0];
-    const key = `${binKey}:${today}`;
+  trackSampleDay(binKey, when = new Date()) {
+    const day = new Date(when).toISOString().split("T")[0];
+    const key = `${binKey}:${day}`;
     if (!this.samplesPerBin.has(key)) {
       this.samplesPerBin.set(key, true);
     }
@@ -464,7 +470,7 @@ class LoadProfile {
   getSampleDays(binKey) {
     let count = 0;
     for (const key of this.samplesPerBin.keys()) {
-      if (key.startsWith(binKey + ":")) {
+      if (key.startsWith(`${binKey}:`)) {
         count++;
       }
     }
@@ -472,7 +478,11 @@ class LoadProfile {
   }
 
   /**
-   * Adds a load sample to the appropriate bin.
+   * Adds a load sample to the appropriate bin (live prediction path).
+   *
+   * Reads the current nav state, engine state, and shore-power state from
+   * Signal K via getSelfPath. For historical replay, call ingestSample()
+   * directly with explicit overrides.
    *
    * @param {number} dcLoadW - DC load in watts
    * @param {number} acLoadW - AC load in watts
@@ -495,22 +505,63 @@ class LoadProfile {
       return;
     }
 
-    // Get bin key
-    const stateClass = this.getStateClass();
-    const sunPhase = this.getSunPhase(now, position);
+    this.ingestSample({
+      time: now,
+      dcLoadW,
+      acLoadW,
+      position,
+      stateClass: this.getStateClass(),
+      engineRunning: this.isEngineRunning(),
+      shorePowerConnected: this.isShorePowerConnected(),
+    });
+  }
+
+  /**
+   * Ingests a load sample with explicit classification state.
+   *
+   * Core binning routine shared by the live path (addSample) and historical
+   * replay (replayLoadProfile). Skips the rolling-average tracking, which
+   * only the live path needs.
+   *
+   * @param {object} params
+   * @param {Date} params.time - Sample timestamp
+   * @param {number} params.dcLoadW - DC load in watts
+   * @param {number} params.acLoadW - AC load in watts
+   * @param {{latitude: number, longitude: number}|null} params.position - Position at sample time
+   * @param {string} params.stateClass - State class (underway or at-rest)
+   * @param {boolean|null} [params.engineRunning] - Engine running at sample time
+   * @param {boolean|null} [params.shorePowerConnected] - Shore power at sample time
+   * @returns {string|null} Gate name if the sample was gated, null if ingested
+   */
+  ingestSample({
+    time,
+    dcLoadW,
+    acLoadW,
+    position,
+    stateClass,
+    engineRunning = null,
+    shorePowerConnected = null,
+  }) {
+    if (!this.enabled) {
+      return null;
+    }
+
+    const sunPhase = this.getSunPhase(time, position);
     const binKey = this.getBinKey(stateClass, sunPhase);
 
-    // Check gates
-    const gate = this.shouldGate(dcLoadW, acLoadW, binKey);
+    const gate = this.shouldGate(dcLoadW, acLoadW, binKey, {
+      engineRunning,
+      shorePowerConnected,
+    });
     if (gate) {
       this.app?.debug?.(
         `Load profile gated: ${gate}, state=${stateClass}, phase=${sunPhase}`,
       );
-      return;
+      return gate;
     }
 
     // Track sample day for minSamples gate
-    this.trackSampleDay(binKey);
+    this.trackSampleDay(binKey, time);
 
     // Get or create bin
     let bin = this.bins.get(binKey);
@@ -531,6 +582,7 @@ class LoadProfile {
     this.app?.debug?.(
       `Load profile sample: state=${stateClass}, phase=${sunPhase}, dc=${Math.round(dcLoadW)}W, ac=${Math.round(acLoadW)}W`,
     );
+    return null;
   }
 
   /**
@@ -558,6 +610,30 @@ class LoadProfile {
       dcWh: bin.dcEma,
       acWh: bin.acEma,
     };
+  }
+
+  /**
+   * Lists learned bins (those past the min-days gate).
+   *
+   * @returns {Array<{binKey: string, stateClass: string, sunPhase: string, dcWh: number, acWh: number, days: number}>}
+   */
+  learnedBins() {
+    const out = [];
+    for (const [binKey, bin] of this.bins) {
+      if (bin.dcEma == null) continue;
+      const days = this.getSampleDays(binKey);
+      if (days < this.minDaysPerBin) continue;
+      const [stateClass, sunPhase] = binKey.split(":");
+      out.push({
+        binKey,
+        stateClass,
+        sunPhase,
+        dcWh: bin.dcEma,
+        acWh: bin.acEma,
+        days,
+      });
+    }
+    return out;
   }
 
   /**
@@ -616,6 +692,23 @@ function toNumber(v) {
   if (typeof v === "number") return isNaN(v) ? null : v;
   if (typeof v === "object" && typeof v.value === "number")
     return isNaN(v.value) ? null : v.value;
+  return null;
+}
+
+/**
+ * Normalizes a Signal K navigation.position value into {latitude, longitude}.
+ * Handles both the unwrapped form ({latitude, longitude}, as stored in the
+ * live deltaState) and the wrapped form ({value: {latitude, longitude}}, as
+ * returned by app.getSelfPath when no recent delta is available).
+ * @param {unknown} pos
+ * @returns {{latitude: number, longitude: number}|null}
+ */
+function unwrapPosition(pos) {
+  if (!pos || typeof pos !== "object") return null;
+  const v = pos.value && typeof pos.value === "object" ? pos.value : pos;
+  if (typeof v.latitude === "number" && typeof v.longitude === "number") {
+    return { latitude: v.latitude, longitude: v.longitude };
+  }
   return null;
 }
 
@@ -778,12 +871,10 @@ class PredictionEngine {
       const dc = Math.max(0, dcPowerW ?? 0);
       const ac = Math.max(0, acPowerW ?? 0);
 
-      // Get current position for sun phase classification
-      const pos = this.getSelfPath("navigation.position");
-      const position =
-        pos && pos.latitude != null && pos.longitude != null
-          ? { latitude: pos.latitude, longitude: pos.longitude }
-          : null;
+      // Get current position for sun phase classification. unwrapPosition
+      // handles both the live deltaState form ({latitude, longitude}) and the
+      // app.getSelfPath fallback form ({value: {latitude, longitude}}).
+      const position = unwrapPosition(this.getSelfPath("navigation.position"));
 
       this.loadProfile.addSample(dc, ac, position);
     }
@@ -1684,10 +1775,13 @@ class PredictionEngine {
     let detectedRunningSoC = currentSoC;
     const averageLoad = this.loadProfile.getAverageLoad();
 
-    // Get current position for sun phase classification
-    const pos = this.getSelfPath("navigation.position");
-    const latitude = pos?.latitude ?? 0;
-    const longitude = pos?.longitude ?? 0;
+    // Get current position for sun phase classification. unwrapPosition
+    // tolerates both the unwrapped delta form and the wrapped app.getSelfPath
+    // form so sun-phase classification still works when no position delta has
+    // arrived in the current cycle.
+    const position = unwrapPosition(this.getSelfPath("navigation.position"));
+    const latitude = position?.latitude ?? 0;
+    const longitude = position?.longitude ?? 0;
 
     this.app?.debug?.(
       `runPrediction: SoC=${Math.round(currentSoC * 100)}%, load=${Math.round(averageLoad.dcWh + averageLoad.acWh)}W, pos=${latitude.toFixed(2)},${longitude.toFixed(2)}, sailing=${isSailing}, forecast=${forecast.length}pts`,
@@ -1844,12 +1938,7 @@ class PredictionEngine {
       }
 
       // Get sun-phase aware load for this forecast hour
-      const sunPhase = this.loadProfile.getSunPhase(
-        time,
-        pos && pos.latitude != null && pos.longitude != null
-          ? { latitude: pos.latitude, longitude: pos.longitude }
-          : null,
-      );
+      const sunPhase = this.loadProfile.getSunPhase(time, position);
       const loadProfile = this.loadProfile.getLoad(sunPhase, stateClass);
       let houseLoadW;
       if (loadProfile) {
@@ -2153,4 +2242,5 @@ module.exports = {
   toNumber,
   toKnots,
   MS_TO_KN,
+  unwrapPosition,
 };

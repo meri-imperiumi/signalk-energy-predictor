@@ -406,6 +406,14 @@ module.exports = (app) => {
         status += ` Learning: ${matrixCount} array${matrixCount > 1 ? "s" : ""}, ${totalBins} bins`;
       }
 
+      // Add load-profile learned bins so the flat-fallback vs learned-bin
+      // state is visible (predicted house load is flat until bins pass the
+      // min-days gate)
+      const learnedBins = predictionEngine?.loadProfile?.learnedBins?.() ?? [];
+      if (learnedBins.length > 0) {
+        status += ` Load: ${learnedBins.length} bins`;
+      }
+
       // Add active advisories count
       const activeNotifications =
         advisoryPublisher?.getActiveNotifications?.() ?? new Map();

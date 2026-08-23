@@ -245,6 +245,12 @@ async function runPopulate(args) {
 
   printResults([...result.arrays, ...result.generators]);
   console.log(`\nSamples written to recordings: ${result.samplesWritten}`);
+  if (result.loadProfile) {
+    const lp = result.loadProfile;
+    console.log(
+      `Load profile: ${lp.ingested} ingested, ${lp.gated} gated (${lp.learnedBins} bins learned${lp.seeded ? ", built on saved profile" : ", fresh"})`,
+    );
+  }
   if (args.fresh) {
     console.log("Matrices rebuilt from scratch (fresh)");
   } else {

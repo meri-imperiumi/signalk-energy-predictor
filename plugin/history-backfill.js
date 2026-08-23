@@ -9,7 +9,12 @@
 
 const { SolarMatrix, theoreticalPower } = require("./learning.js");
 const { sunPosition, irradianceFromCloudCover } = require("./solar.js");
-const { predictWindHour, predictHydroHour } = require("./prediction.js");
+const {
+  predictWindHour,
+  predictHydroHour,
+  LoadProfile,
+  StateClass,
+} = require("./prediction.js");
 const matrixPersistence = require("./matrix.js");
 const { parseManufacturerCurve } = require("./schema.js");
 const recorderModule = require("./recorder.js");
@@ -882,7 +887,8 @@ async function populateFromHistory({
     }));
 
   // One /values query for everything: array + generator power, SoC, nav
-  // state, AWA, speed through water, house load
+  // state, AWA, speed through water, house load (DC + AC for the load
+  // profile replay)
   const queryPaths = Array.from(
     new Set([
       ...arrays.map((a) => a.powerPath),
@@ -890,6 +896,7 @@ async function populateFromHistory({
       socPath,
       ...CONTEXT_PATHS,
       "electrical.venus.dcPower",
+      "electrical.venus.acPower",
     ]),
   );
 
@@ -961,6 +968,33 @@ async function populateFromHistory({
     resolution,
   });
 
+  // Replay history through the load profile so the sun-phase EMA bins are
+  // seeded (otherwise the forecast house load stays flat until enough live
+  // samples accumulate). Load the existing profile to build on it, or start
+  // fresh under --fresh. Falls back to the config's loadProfile section.
+  const loadProfile = new LoadProfile({
+    config: config.loadProfile || {},
+    getSelfPath: () => undefined,
+    app: undefined,
+  });
+  let loadProfileSeeded = false;
+  if (!fresh) {
+    try {
+      loadProfileSeeded = await matrixPersistence.loadLoadProfile(
+        dataDir,
+        loadProfile,
+      );
+    } catch (_error) {
+      // No existing profile: start fresh
+    }
+  }
+  const loadProfileStats = replayLoadProfile({
+    loadProfile,
+    historyData,
+    resolution,
+  });
+  await matrixPersistence.saveLoadProfile(dataDir, loadProfile);
+
   // Seed recordings with pre-install actuals (gap-fill merge: live
   // samples win, replayed ticks only fill the holes)
   const samplesWritten = await backfillSamples({
@@ -975,7 +1009,16 @@ async function populateFromHistory({
     to,
   });
 
-  return { arrays: results, generators: generatorResults, samplesWritten };
+  return {
+    arrays: results,
+    generators: generatorResults,
+    samplesWritten,
+    loadProfile: {
+      seeded: loadProfileSeeded,
+      ...loadProfileStats,
+      learnedBins: loadProfile.learnedBins().length,
+    },
+  };
 }
 
 /** Tolerance for considering two samples the same moment */
@@ -1120,6 +1163,108 @@ async function backfillSamples({
   return written;
 }
 
+/**
+ * Maps an inferred nav state string to a LoadProfile state class.
+ *
+ * Mirrors LoadProfile.getStateClass() but for historical replay where the
+ * nav state comes from the history API rather than the live Signal K path.
+ *
+ * @param {string} navState - Inferred nav state (sailing/motoring/anchored/moored/docked)
+ * @returns {string} StateClass.UNDERWAY or StateClass.AT_REST
+ */
+function stateClassFromNavState(navState) {
+  return ["sailing", "motoring", "under way"].includes(navState)
+    ? StateClass.UNDERWAY
+    : StateClass.AT_REST;
+}
+
+/**
+ * Replays history through the load profile, populating the sun-phase EMA
+ * bins in place.
+ *
+ * Unlike addSample() (which reads the live nav state, engine state, and
+ * shore-power state), this classifies each historical tick from the
+ * history record itself: sun phase from the tick timestamp + position,
+ * state class from the inferred nav state, and the engine-running gate
+ * from the propulsion columns. Shore power isn't in the history query, so
+ * it's treated as not connected during replay.
+ *
+ * Ticks with no DC or AC load reading are skipped (nothing to learn).
+ *
+ * @param {object} params
+ * @param {object} params.loadProfile - LoadProfile instance to update (in place)
+ * @param {object} params.historyData - History API /values response
+ * @param {number} [params.resolution] - Sample resolution in seconds
+ * @returns {{dataPoints: number, ingested: number, gated: number}}
+ */
+function replayLoadProfile({
+  loadProfile,
+  historyData,
+  resolution = DEFAULT_RESOLUTION,
+}) {
+  const columns = pathColumns(historyData);
+  const dcColumn = columns.get("electrical.venus.dcPower");
+  const acColumn = columns.get("electrical.venus.acPower");
+  const navStateColumn = columns.get("navigation.state");
+  const positionColumn = columns.get("navigation.position");
+  const stwColumn = columns.get("navigation.speedThroughWater");
+  const propulsionCols = propulsionColumns(historyData);
+
+  let dataPoints = 0;
+  let ingested = 0;
+  let gated = 0;
+  /** Last explicit navigation.state, carried forward across gaps */
+  let lastExplicitNavState = null;
+
+  for (const point of historyData.data || []) {
+    const time = parseUtcTimestamp(point[0]);
+    const dcLoadW = columnNumber(point, dcColumn);
+    const acLoadW = columnNumber(point, acColumn);
+    if (dcLoadW == null && acLoadW == null) {
+      continue;
+    }
+    dataPoints++;
+
+    const navStateResult = inferNavState(
+      point,
+      navStateColumn,
+      stwColumn,
+      propulsionCols,
+      columns,
+      lastExplicitNavState,
+    );
+    if (navStateResult.explicit) {
+      lastExplicitNavState = navStateResult.state;
+    }
+    const stateClass = stateClassFromNavState(navStateResult.state);
+
+    const posValue = columnValue(point, positionColumn);
+    const position =
+      Array.isArray(posValue) && posValue.length >= 2
+        ? { longitude: posValue[0], latitude: posValue[1] }
+        : null;
+
+    const gate = loadProfile.ingestSample({
+      time,
+      dcLoadW: Math.max(0, dcLoadW ?? 0),
+      acLoadW: Math.max(0, acLoadW ?? 0),
+      position,
+      stateClass,
+      engineRunning: engineRunningAt(point, propulsionCols, columns),
+      // Shore power isn't queried from history; treat as absent during replay
+      shorePowerConnected: false,
+    });
+
+    if (gate) {
+      gated++;
+    } else {
+      ingested++;
+    }
+  }
+
+  return { dataPoints, ingested, gated };
+}
+
 module.exports = {
   DEFAULT_RESOLUTION,
   DEFAULT_SOC_PATH,
@@ -1132,6 +1277,7 @@ module.exports = {
   interpolateWeather,
   replayHistory,
   replayGenerators,
+  replayLoadProfile,
   backfillSamples,
   populateFromHistory,
 };

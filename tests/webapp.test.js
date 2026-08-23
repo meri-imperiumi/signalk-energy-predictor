@@ -123,12 +123,31 @@ test("chart shows hydro actual and hydro predicted series", () => {
   assert.match(source, /hydroPred/);
 });
 
+test("chart shows predicted house load from the forecast cycle", () => {
+  const source = readFileSync(
+    path.join(PUBLIC_DIR, "ep-timeline-chart.js"),
+    "utf8",
+  );
+  // Day view: a Pred. house load series is declared next to the yield preds
+  assert.match(source, /id: "predLoad"/);
+  assert.match(source, /Pred\. house load/);
+  // Mapped from the recorded cycle's hourly houseLoadWh forecast
+  assert.match(source, /predLoad: hour\.houseLoadWh \?\? null/);
+});
+
 test("chart clips predicted SoC to now so the line is not drawn in the past", () => {
   const source = readFileSync(
     path.join(PUBLIC_DIR, "ep-timeline-chart.js"),
     "utf8",
   );
+  // Day view: hourly predSoC points are dropped once they fall before now
   assert.match(source, /p\.predSoC != null && p\.t >= Date\.now\(\)/);
+  // Week/month view: a day's predicted SoC is suppressed when the whole day
+  // is in the past, so the line never retroactively fills recorded history
+  assert.match(
+    source,
+    /localDayStart\(b\.day\) \+ 24 \* 3600000 > Date\.now\(\)/,
+  );
 });
 
 test("headline figures show hydro yield", () => {

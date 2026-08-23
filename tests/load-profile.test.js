@@ -10,6 +10,7 @@ const {
   LoadProfile,
   SunPhase,
   StateClass,
+  unwrapPosition,
 } = require("../plugin/prediction.js");
 
 test.describe("LoadProfile", () => {
@@ -351,5 +352,103 @@ test.describe("LoadProfile", () => {
     assert.strictEqual(lp.alpha, 0.05);
     assert.strictEqual(lp.minDaysPerBin, 3);
     assert.strictEqual(lp.outlierFactor, 3);
+  });
+});
+
+test.describe("unwrapPosition", () => {
+  test("unwraps the app.getSelfPath form ({value: {latitude, longitude}})", () => {
+    const pos = unwrapPosition({
+      value: { latitude: -18.86, longitude: -159.8 },
+      meta: {},
+      $source: "gps",
+      timestamp: "2026-08-23T00:00:00Z",
+    });
+    assert.deepStrictEqual(pos, { latitude: -18.86, longitude: -159.8 });
+  });
+
+  test("passes through the live deltaState form ({latitude, longitude})", () => {
+    const pos = unwrapPosition({ latitude: 12.3, longitude: 45.6 });
+    assert.deepStrictEqual(pos, { latitude: 12.3, longitude: 45.6 });
+  });
+
+  test("returns null for missing or malformed input", () => {
+    assert.strictEqual(unwrapPosition(null), null);
+    assert.strictEqual(unwrapPosition(undefined), null);
+    assert.strictEqual(unwrapPosition("not a position"), null);
+    assert.strictEqual(unwrapPosition({}), null);
+    assert.strictEqual(unwrapPosition({ value: {} }), null);
+  });
+});
+
+test.describe("PredictionEngine position unwrapping", () => {
+  // Seeded load-profile bins with distinct per-phase values so the forecast
+  // can be checked for per-phase variation (vs. a flat fallback).
+  function seedBins(loadProfile, { day, night }) {
+    const mk = (dc) => ({ dcEma: dc, acEma: 0 });
+    loadProfile.bins.set("at-rest:day", mk(day));
+    loadProfile.bins.set("at-rest:night", mk(night));
+    loadProfile.bins.set("at-rest:dawn", mk(day));
+    loadProfile.bins.set("at-rest:dusk", mk(day));
+    for (const k of [
+      "at-rest:day",
+      "at-rest:night",
+      "at-rest:dawn",
+      "at-rest:dusk",
+    ]) {
+      for (let i = 0; i < 5; i++) {
+        loadProfile.samplesPerBin.set(`${k}:2024-01-0${i + 1}`, true);
+      }
+    }
+  }
+
+  function makeForecast() {
+    const now = new Date();
+    return Array.from({ length: 24 }, (_, h) => ({
+      time: new Date(now.getTime() + h * 3600000),
+      ghi: 0,
+      cloudCover: 0.5,
+      gustSpeedKnots: 0,
+      windSpeedKnots: 0,
+    }));
+  }
+
+  test("uses wrapped app.getSelfPath position to classify forecast sun phases", () => {
+    const { PredictionEngine } = require("../plugin/prediction.js");
+    // Wrapped form as returned by app.getSelfPath("navigation.position")
+    // when no position delta has arrived in the current cycle.
+    const wrappedPosition = {
+      value: { latitude: -18.86, longitude: -159.8 },
+      meta: {},
+      $source: "gps",
+    };
+    const pathValues = new Map([
+      ["navigation.position", wrappedPosition],
+      ["navigation.state", "moored"],
+      ["electrical.batteries.house.capacity.stateOfCharge", 0.5],
+    ]);
+    const app = {
+      debug() {},
+      error() {},
+      getSelfPath: (p) => pathValues.get(p),
+    };
+    const engine = new PredictionEngine({
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [],
+      mechanicalGenerators: [],
+      getEfficiency: () => 0.7,
+      getSelfPath: (p) => app.getSelfPath(p),
+      app,
+    });
+    seedBins(engine.loadProfile, { day: 90, night: 50 });
+
+    const out = engine.runPrediction(makeForecast());
+    const loads = out.map((p) => p.houseLoadWh);
+    // With a real position, the forecast should see more than one distinct
+    // house-load value across a 24h window (day vs. night bins differ). A flat
+    // fallback would produce a single repeated value.
+    assert.ok(
+      new Set(loads).size > 1,
+      `expected per-phase house load variation, got ${loads.join(",")}`,
+    );
   });
 });

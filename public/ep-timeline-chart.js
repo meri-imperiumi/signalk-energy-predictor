@@ -87,6 +87,14 @@ const DAY_SERIES = [
     axis: "left",
   },
   {
+    id: "predLoad",
+    label: "Pred. house load",
+    color: COLORS.load,
+    predicted: true,
+    kind: "line",
+    axis: "left",
+  },
+  {
     id: "predSoC",
     label: "Pred. SoC %",
     color: COLORS.soc,
@@ -325,6 +333,7 @@ class EpTimelineChart extends HTMLElement {
           predSolar: hour.idealSolarYieldWh || 0,
           predWind: Math.max(0, windCombined - hydroWh),
           predHydro: hydroWh,
+          predLoad: hour.houseLoadWh ?? null,
           predSoC:
             hour.idealSoC != null
               ? Math.round(hour.idealSoC * 1000) / 10
@@ -341,6 +350,7 @@ class EpTimelineChart extends HTMLElement {
           predSolar: hour.idealSolarYieldWh || 0,
           predWind: Math.max(0, windCombined - hydroWh),
           predHydro: hydroWh,
+          predLoad: null,
           predSoC: null,
         });
       }
@@ -366,6 +376,9 @@ class EpTimelineChart extends HTMLElement {
         predSolar: pred.map((p) => ({ t: p.t, v: p.predSolar })),
         predWind: pred.map((p) => ({ t: p.t, v: p.predWind })),
         predHydro: pred.map((p) => ({ t: p.t, v: p.predHydro })),
+        predLoad: pred
+          .filter((p) => p.predLoad != null)
+          .map((p) => ({ t: p.t, v: p.predLoad })),
         predSoC: pred
           .filter((p) => p.predSoC != null && p.t >= Date.now())
           .map((p) => ({ t: p.t, v: p.predSoC })),
@@ -397,7 +410,10 @@ class EpTimelineChart extends HTMLElement {
       row.values.predSolar = p.predSolar;
       row.values.predWind = p.predWind;
       row.values.predHydro = p.predHydro;
-      if (p.predSoC != null) row.values.predSoC = p.predSoC;
+      if (p.predLoad != null) row.values.predLoad = p.predLoad;
+      if (p.predSoC != null && p.t >= Date.now()) {
+        row.values.predSoC = p.predSoC;
+      }
     }
 
     return {
@@ -507,7 +523,10 @@ class EpTimelineChart extends HTMLElement {
         hydroActual: actual.hydroWh,
         hydroPred: predHydro,
         soc: actual.socCount > 0 ? actual.socSum / actual.socCount : null,
-        socPred: pred?.soc != null ? pred.soc * 100 : null,
+        socPred:
+          pred?.soc != null && localDayStart(b.day) + 24 * 3600000 > Date.now()
+            ? pred.soc * 100
+            : null,
         windKn: actual.windCount > 0 ? actual.windSum / actual.windCount : null,
       };
     });

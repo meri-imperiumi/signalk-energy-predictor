@@ -15,12 +15,18 @@ const {
   interpolateWeather,
   replayHistory,
   replayGenerators,
+  replayLoadProfile,
   backfillSamples,
   populateFromHistory,
   historyHeaders,
   queryHistory,
 } = require("../plugin/history-backfill.js");
 const { SolarMatrix } = require("../plugin/learning.js");
+const {
+  LoadProfile,
+  StateClass,
+  SunPhase,
+} = require("../plugin/prediction.js");
 const { getRecordings } = require("../plugin/recorder.js");
 
 /** Latitude/longitude with a high sun at fixture noon (French Polynesia) */
@@ -61,6 +67,7 @@ function makeHistoryData() {
       { path: "navigation.speedThroughWater" },
       { path: "electrical.dcsource.wind.power" },
       { path: "electrical.venus.dcPower" },
+      { path: "electrical.venus.acPower" },
       { path: "navigation.position" },
     ],
     data: [],
@@ -76,14 +83,15 @@ const COL = {
   stw: 5,
   windGen: 6,
   house: 7,
-  position: 8,
+  ac: 8,
+  position: 9,
 };
 
 /**
  * Pushes a history tick with named fields so column order can't be misread.
  * @param {object} historyData
  * @param {number} minutes - Offset from NOON in minutes
- * @param {object} vals - { solar, soc, navState, awa, stw, windGen, house, position }
+ * @param {object} vals - { solar, soc, navState, awa, stw, windGen, house, ac, position }
  */
 function pushTick(historyData, minutes, vals) {
   const row = [new Date(NOON + minutes * 60000).toISOString()];
@@ -94,6 +102,7 @@ function pushTick(historyData, minutes, vals) {
   row[COL.stw] = vals.stw ?? null;
   row[COL.windGen] = vals.windGen ?? null;
   row[COL.house] = vals.house ?? null;
+  row[COL.ac] = vals.ac ?? null;
   row[COL.position] = vals.position ?? [LON, LAT];
   historyData.data.push(row);
 }
@@ -469,6 +478,79 @@ test.describe("replayGenerators", () => {
   });
 });
 
+test.describe("replayLoadProfile", () => {
+  test("replays history into the sun-phase bins so getLoad returns a value", () => {
+    // Noon ticks across 4 distinct UTC days, anchored, with DC + AC load.
+    // The fixture position is local noon, so every tick classifies as DAY.
+    const historyData = makeHistoryData();
+    for (let day = 0; day < 4; day++) {
+      const t = NOON + day * 24 * 3600000;
+      const row = [new Date(t).toISOString()];
+      row[COL.soc] = 0.5;
+      row[COL.navState] = "anchored";
+      row[COL.house] = 60;
+      row[COL.ac] = 40;
+      row[COL.position] = [LON, LAT];
+      historyData.data.push(row);
+    }
+
+    const loadProfile = new LoadProfile({
+      config: { minDaysPerBin: 3 },
+      getSelfPath: () => undefined,
+      app: undefined,
+    });
+    const stats = replayLoadProfile({
+      loadProfile,
+      historyData,
+      resolution: 300,
+    });
+
+    assert.strictEqual(stats.dataPoints, 4);
+    assert.strictEqual(stats.ingested, 4);
+    assert.strictEqual(stats.gated, 0);
+    // The at-rest:day bin is now past the 3-day gate
+    const load = loadProfile.getLoad(SunPhase.DAY, StateClass.AT_REST);
+    assert.ok(load, "getLoad should return a value after replay");
+    assert.ok(load.dcWh > 0);
+    assert.ok(load.acWh > 0);
+    assert.strictEqual(loadProfile.learnedBins().length, 1);
+  });
+
+  test("engine-running ticks are gated out", () => {
+    const historyData = makeHistoryData();
+    // propulsion.main.state = started on every tick
+    historyData.values.push({ path: "propulsion.main.state" });
+    // Re-point columns: add propulsion column after position
+    const propCol = COL.position + 1;
+    for (let day = 0; day < 4; day++) {
+      const t = NOON + day * 24 * 3600000;
+      const row = [new Date(t).toISOString()];
+      row[COL.soc] = 0.5;
+      row[COL.navState] = "anchored";
+      row[COL.house] = 60;
+      row[COL.position] = [LON, LAT];
+      row[propCol] = "started";
+      historyData.data.push(row);
+    }
+
+    const loadProfile = new LoadProfile({
+      config: { minDaysPerBin: 1 },
+      getSelfPath: () => undefined,
+      app: undefined,
+    });
+    const stats = replayLoadProfile({
+      loadProfile,
+      historyData,
+      resolution: 300,
+    });
+
+    // All ticks gated as engine-running, nothing ingested
+    assert.strictEqual(stats.ingested, 0);
+    assert.strictEqual(stats.gated, 4);
+    assert.strictEqual(loadProfile.learnedBins().length, 0);
+  });
+});
+
 test.describe("recordings gap-fill", () => {
   test("replayed ticks skip timestamps near live samples", async () => {
     const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "bf-gap-"));
@@ -556,12 +638,13 @@ test.describe("populateFromHistory", () => {
 
       const historyData = makeHistoryData();
       for (let m = 0; m < 30; m += 5) {
-        // solar 50 W, wind gen 20 W actual
+        // solar 50 W, wind gen 20 W actual, 60 W house load
         pushTick(historyData, m, {
           solar: 50,
           soc: 0.5,
           navState: "anchored",
           windGen: 20,
+          house: 60,
         });
       }
 
@@ -630,6 +713,20 @@ test.describe("populateFromHistory", () => {
       assert.ok(Math.abs(samples[0].windSpeedKnots - 15) < 0.1);
       // Solar power recorded into the sample's arrays map
       assert.strictEqual(samples[0].arrays["test-array"], 50);
+
+      // Load profile replayed and persisted
+      assert.ok(
+        result.loadProfile,
+        "populate should report load-profile stats",
+      );
+      assert.strictEqual(result.loadProfile.seeded, false);
+      assert.ok(result.loadProfile.ingested > 0);
+      const lpFile = path.join(dataDir, "load-profile.json");
+      const persistedLp = JSON.parse(await fs.readFile(lpFile, "utf8"));
+      assert.ok(
+        Object.keys(persistedLp.bins).length > 0,
+        "load-profile.json should contain learned bins",
+      );
     } finally {
       await fs.rm(dataDir, { recursive: true, force: true });
     }
