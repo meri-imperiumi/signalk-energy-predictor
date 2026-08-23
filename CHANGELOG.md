@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- Uplink status for forecast fetch cadence now reads the Signal K
+  `network.internet.state` path (provided by the required
+  `signalk-internet` plugin) instead of the Starlink-specific
+  `network.providers.starlink.status` and LTE `networking.lte.connectionText`
+  paths. `network.internet.state` values `online` and `metered` both count
+  as internet available for fetching.
 - Surplus and engine-run advisory notification messages now render their
   time windows in solar-local time derived from the vessel's longitude, so a
   server clocked in UTC still surfaces crew-local clock times. Emitted

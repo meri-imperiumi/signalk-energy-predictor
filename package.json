@@ -34,7 +34,8 @@
       "./doc/webapp-month.png"
     ],
     "requires": [
-      "@meri-imperiumi/signalk-autostate"
+      "@meri-imperiumi/signalk-autostate",
+      "@meri-imperiumi/signalk-internet"
     ],
     "recommends": [
       "signalk-venus-plugin",

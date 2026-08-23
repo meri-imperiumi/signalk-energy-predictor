@@ -586,21 +586,31 @@ test.describe("Offline forecast restore + staleness + uplink cadence", () => {
   test("uplink offline→online edge triggers an immediate fetch eligibility", async () => {
     const fsm = makeFSM();
     assert.strictEqual(fsm.uplinkOnline, false);
-    // First online status (Starlink) flips the edge.
-    const became = fsm.setUplinkStatus({ starlink: "online" });
+    // First online status (internet) flips the edge.
+    const became = fsm.setUplinkStatus({ internet: "online" });
     assert.strictEqual(became, true);
     assert.strictEqual(fsm.uplinkOnline, true);
-    // A subsequent LTE-online update is not an edge.
-    const became2 = fsm.setUplinkStatus({
-      starlink: "online",
-      lte: "Connected",
-    });
+    // A subsequent online update is not an edge.
+    const became2 = fsm.setUplinkStatus({ internet: "online" });
     assert.strictEqual(became2, false);
     // Going offline then online again is another edge.
-    fsm.setUplinkStatus({ starlink: "offline", lte: "No service" });
+    fsm.setUplinkStatus({ internet: "offline" });
     assert.strictEqual(fsm.uplinkOnline, false);
-    const became3 = fsm.setUplinkStatus({ lte: "4G" });
+    const became3 = fsm.setUplinkStatus({ internet: "metered" });
     assert.strictEqual(became3, true);
+  });
+
+  test("metered internet counts as online for fetch eligibility", () => {
+    const fsm = makeFSM();
+    assert.strictEqual(fsm.uplinkOnline, false);
+    // `metered` means the internet is available (just billed by volume),
+    // so a forecast fetch is still eligible.
+    const became = fsm.setUplinkStatus({ internet: "metered" });
+    assert.strictEqual(became, true);
+    assert.strictEqual(fsm.uplinkOnline, true);
+    // Going back to offline clears it.
+    fsm.setUplinkStatus({ internet: "offline" });
+    assert.strictEqual(fsm.uplinkOnline, false);
   });
 
   test("uplink online caps refetch attempts to ~1h even if the forecast is stale", async () => {

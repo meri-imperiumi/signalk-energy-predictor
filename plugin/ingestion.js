@@ -511,9 +511,8 @@ class IngestionFSM {
     this.dataDir = dataDir || null;
     /**
      * Uplink status driving fetch cadence (work doc #15 update #1). True if
-     * either Starlink (`network.providers.starlink.status === "online"`) or
-     * LTE (`networking.lte.connectionText` not `No service`) is online.
-     * Mirrored from deltas via `setUplinkStatus`.
+     * internet is available (`network.internet.state` is `online` or
+     * `metered`). Mirrored from deltas via `setUplinkStatus`.
      */
     this.uplinkOnline = false;
     /**
@@ -540,24 +539,19 @@ class IngestionFSM {
   /**
    * Mirrors uplink status from deltas (work doc #15 update #1).
    *
-   * Online if either Starlink (`network.providers.starlink.status ===
-   * "online"`) or LTE (`networking.lte.connectionText` not `No service`,
-   * case-insensitive) is online. Returns true if the offline→online edge
-   * happened on this call so the caller can trigger an immediate fetch.
+   * Online if internet is available (`network.internet.state` is `online`
+   * or `metered`). Returns true if the offline→online edge happened on this
+   * call so the caller can trigger an immediate fetch.
    *
    * @param {object} status
-   * @param {unknown} [status.starlink] - `network.providers.starlink.status`
-   * @param {unknown} [status.lte] - `networking.lte.connectionText`
+   * @param {unknown} [status.internet] - `network.internet.state`
    * @returns {boolean} true if this call flipped uplink from offline to online
    */
-  setUplinkStatus({ starlink, lte } = {}) {
-    const starlinkOnline =
-      typeof starlink === "string" && starlink.trim() === "online";
-    const lteOnline =
-      typeof lte === "string" &&
-      lte.trim().length > 0 &&
-      lte.trim().toLowerCase() !== "no service";
-    const online = starlinkOnline || lteOnline;
+  setUplinkStatus({ internet } = {}) {
+    const internetOnline =
+      typeof internet === "string" &&
+      (internet.trim() === "online" || internet.trim() === "metered");
+    const online = internetOnline;
     const becameOnline = online && !this.uplinkOnline;
     this.uplinkOnline = online;
     if (becameOnline) {

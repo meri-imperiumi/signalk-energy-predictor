@@ -150,8 +150,7 @@ const SUBSCRIPTION_PATHS = [
   "electrical.venus.acPower",
   "propulsion.*.state",
   "propulsion.*.revolutions",
-  "network.providers.starlink.status",
-  "networking.lte.connectionText",
+  "network.internet.state",
 ];
 
 /**
@@ -1446,20 +1445,13 @@ module.exports = (app) => {
 
             // Mirror uplink status into the ingestion FSM and trigger a
             // forecast fetch on the offline→online edge (work doc #15
-            // update #1). Starlink online = `status === "online"`; LTE
-            // online = `connectionText` not `No service`.
-            if (
-              ingestionFSM &&
-              (v.path === "network.providers.starlink.status" ||
-                v.path === "networking.lte.connectionText")
-            ) {
+            // update #1). Internet online = `network.internet.state` is
+            // `online` or `metered`.
+            if (ingestionFSM && v.path === "network.internet.state") {
               const becameOnline = ingestionFSM.setUplinkStatus({
-                starlink:
-                  deltaState.get("network.providers.starlink.status") ??
-                  app.getSelfPath("network.providers.starlink.status"),
-                lte:
-                  deltaState.get("networking.lte.connectionText") ??
-                  app.getSelfPath("networking.lte.connectionText"),
+                internet:
+                  deltaState.get("network.internet.state") ??
+                  app.getSelfPath("network.internet.state"),
               });
               if (becameOnline) {
                 app.debug("Uplink came online — triggering forecast fetch");
