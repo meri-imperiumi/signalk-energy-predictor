@@ -827,3 +827,188 @@ test("buildDeployStates: suppresses recommendations matching current detected st
     ],
   );
 });
+
+test("buildDeployStates: a newer cycle overturns an older cycle's future stow (WPF learning / new forecast)", () => {
+  // Cycle A (05:00) forecast a stow for tonight's 22:00 — the raw gust
+  // breached the limit before WPF learning corrected it. Cycle B (11:00),
+  // with WPF now applied, covers the same future hour and has NO flinsail
+  // action there (the corrected gust no longer breaches). The 22:00 stow
+  // from cycle A must be withdrawn — the current recommendation reflects
+  // the latest forecast, not the stale one. Historical recs for hours no
+  // newer cycle covers are preserved.
+  const from = new Date("2026-08-23T00:00:00Z");
+  const to = new Date("2026-08-25T00:00:00Z");
+  const samples = [
+    {
+      timestamp: "2026-08-23T05:00:00.000Z",
+      deployStates: { flinsail: "deployed" },
+    },
+  ];
+  // Cycle A: stow at 22:00 (future), deploy at 02:00 (later still)
+  const cycleA = {
+    timestamp: "2026-08-23T05:00:00.000Z",
+    forecast: [
+      {
+        time: "2026-08-23T05:00:00.000Z",
+        actions: [],
+      },
+      {
+        time: "2026-08-23T22:00:00.000Z",
+        actions: [
+          {
+            id: "flinsail",
+            idealAction: "stow",
+            detectedAction: "stow",
+            reason: "forecast night gusts up to 22kn ≥ limit 20kn",
+            idealState: "stowed",
+          },
+        ],
+      },
+      {
+        time: "2026-08-24T02:00:00.000Z",
+        actions: [
+          {
+            id: "flinsail",
+            idealAction: "deploy",
+            detectedAction: "deploy",
+            reason: "no night gusts",
+            idealState: "deployed",
+          },
+        ],
+      },
+    ],
+  };
+  // Cycle B (newer): covers 11:00 onward through the same future hours but
+  // records NO flinsail actions — WPF cleared the gusts, flinsail stays
+  // deployed all night, no transitions. 48 hourly points from 11:00 Aug 23.
+  const cycleB = {
+    timestamp: "2026-08-23T11:00:00.000Z",
+    forecast: Array.from({ length: 48 }, (_, h) => ({
+      time: new Date(
+        new Date("2026-08-23T11:00:00.000Z").getTime() + h * 3600000,
+      ).toISOString(),
+      actions: [],
+    })),
+  };
+  const res = buildDeployStates(samples, [cycleA, cycleB], from, to);
+  // The 22:00 stow and the 02:00 deploy from cycle A are both future hours
+  // covered (and overturned) by cycle B → withdrawn entirely.
+  assert.deepStrictEqual(
+    res.recommendations.map((r) => ({
+      time: new Date(r.time).toISOString(),
+      id: r.id,
+      action: r.action,
+    })),
+    [],
+    "newer cycle overturning the future stow must withdraw it",
+  );
+});
+
+test("buildDeployStates: historical recs for hours no newer cycle covers are preserved", () => {
+  // Cycle A issued a stow for 22:00. Cycle B is newer but its forecast span
+  // does NOT reach 22:00 (it only covers later hours), so 22:00 is still
+  // authoritative from cycle A — the historical recommendation stands
+  // because nothing newer revises it.
+  const from = new Date("2026-08-23T00:00:00Z");
+  const to = new Date("2026-08-26T00:00:00Z");
+  const samples = [
+    {
+      timestamp: "2026-08-23T05:00:00.000Z",
+      deployStates: { flinsail: "deployed" },
+    },
+  ];
+  const cycleA = {
+    timestamp: "2026-08-23T05:00:00.000Z",
+    forecast: [
+      {
+        time: "2026-08-23T05:00:00.000Z",
+        actions: [],
+      },
+      {
+        time: "2026-08-23T22:00:00.000Z",
+        actions: [
+          {
+            id: "flinsail",
+            idealAction: "stow",
+            detectedAction: "stow",
+            reason: "forecast night gusts up to 22kn",
+            idealState: "stowed",
+          },
+        ],
+      },
+    ],
+  };
+  // Cycle B is newer but only covers 25:00 onward (doesn't span 22:00).
+  const cycleB = {
+    timestamp: "2026-08-24T01:00:00.000Z",
+    forecast: [
+      { time: "2026-08-24T01:00:00.000Z", actions: [] },
+      { time: "2026-08-24T02:00:00.000Z", actions: [] },
+    ],
+  };
+  const res = buildDeployStates(samples, [cycleA, cycleB], from, to);
+  assert.deepStrictEqual(
+    res.recommendations.map((r) => ({
+      time: new Date(r.time).toISOString(),
+      id: r.id,
+      action: r.action,
+    })),
+    [{ time: "2026-08-23T22:00:00.000Z", id: "flinsail", action: "stow" }],
+    "historical rec for an hour no newer cycle covers must be preserved",
+  );
+});
+
+test("buildDeployStates: cycles older than 24h before the latest are ignored for recommendations", () => {
+  // A stow from 3 days ago is stale history — even if no newer cycle covers
+  // that hour, it must not surface in the recommendation timeline. Only
+  // cycles run within the past 24h of the latest cycle contribute recs.
+  const from = new Date("2026-08-20T00:00:00Z");
+  const to = new Date("2026-08-26T00:00:00Z");
+  const samples = [
+    {
+      timestamp: "2026-08-20T05:00:00.000Z",
+      deployStates: { flinsail: "deployed" },
+    },
+    {
+      timestamp: "2026-08-23T11:00:00.000Z",
+      deployStates: { flinsail: "deployed" },
+    },
+  ];
+  // Old cycle (Aug 20, 3 days before the latest): stow at Aug 20 22:00.
+  const oldCycle = {
+    timestamp: "2026-08-20T05:00:00.000Z",
+    forecast: [
+      { time: "2026-08-20T05:00:00.000Z", actions: [] },
+      {
+        time: "2026-08-20T22:00:00.000Z",
+        actions: [
+          {
+            id: "flinsail",
+            idealAction: "stow",
+            detectedAction: "stow",
+            reason: "night gusts 22kn",
+            idealState: "stowed",
+          },
+        ],
+      },
+    ],
+  };
+  // Latest cycle (Aug 23): no actions, flinsail stays deployed.
+  const latestCycle = {
+    timestamp: "2026-08-23T11:00:00.000Z",
+    forecast: [
+      { time: "2026-08-23T11:00:00.000Z", actions: [] },
+      { time: "2026-08-23T12:00:00.000Z", actions: [] },
+    ],
+  };
+  const res = buildDeployStates(samples, [oldCycle, latestCycle], from, to);
+  assert.deepStrictEqual(
+    res.recommendations.map((r) => ({
+      time: new Date(r.time).toISOString(),
+      id: r.id,
+      action: r.action,
+    })),
+    [],
+    "a rec from a cycle older than 24h before the latest must not surface",
+  );
+});

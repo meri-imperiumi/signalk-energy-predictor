@@ -1192,17 +1192,44 @@ function buildDeployStates(samples, cycles, from, to) {
     return arr[lo - 1].state;
   }
 
-  const recsByHour = new Map(); // `${hourTs}|${id}|${action}` -> ev
-  for (const cycle of cycles) {
-    for (const point of cycle.forecast || []) {
-      const t = new Date(point.time).getTime();
-      const hourTs = Math.round(t / 3600000) * 3600000;
-      for (const a of point.actions || []) {
-        if (a.idealAction !== "deploy" && a.idealAction !== "stow") continue;
-        if (a.detectedAction === "stay") continue;
-        const key = `${hourTs}|${a.id}|${a.idealAction}`;
-        if (!recsByHour.has(key)) {
-          recsByHour.set(key, {
+  // Recommendations: from each cycle's per-hour idealAction events, keyed
+  // by the forecast hour (when the action should happen). A new forecast
+  // (or new WPF learning that changes the corrected gusts) can overturn a
+  // prior cycle's recommendation for a future hour — e.g. a stow advised at
+  // 05:00 for tonight's 22:00 must disappear once the 11:00 forecast (with
+  // WPF applied) no longer breaches the gust limit. So the recommendation
+  // for a given (hour, device) is authoritative only from the *newest* cycle
+  // that covers that hour: if the newest covering cycle still issues the
+  // action, keep it; if it covers the hour but has no action for the device
+  // (the device's ideal state is steady — no transition), the prior
+  // recommendation is withdrawn. Hours no cycle covers keep the oldest
+  // surviving action (pure history, nothing newer to revise it).
+  //
+  // Coverage is per wall-clock hour: a cycle covers hour H if any of its
+  // forecast points rounds to H (it has a verdict for that hour) OR its
+  // forecast span [firstPoint, lastPoint] contains H (a newer forecast
+  // that spans the hour but, due to a minute-offset drift, has no point
+  // rounding exactly to H still supersedes the older cycle's rec there).
+  // Sorted oldest→newest so the last matching cycle wins.
+  const cyclesIndexed = cycles
+    .map((cycle) => {
+      const hourSet = new Set(); // wall-clock hours this cycle has a point for
+      const acts = new Map(); // `${hourTs}|${id}` -> ev (last per hour+device)
+      let startMs = Infinity;
+      let endMs = -Infinity;
+      for (const point of cycle.forecast || []) {
+        const t = new Date(point.time).getTime();
+        const hourTs = Math.round(t / 3600000) * 3600000;
+        hourSet.add(hourTs);
+        if (t < startMs) startMs = t;
+        if (t > endMs) endMs = t;
+        for (const a of point.actions || []) {
+          if (a.idealAction !== "deploy" && a.idealAction !== "stow") continue;
+          if (a.detectedAction === "stay") continue;
+          // Last action for this (hour, device) within the cycle wins
+          // (a later point in the same cycle rounding to the same hour
+          // is the more precise verdict).
+          acts.set(`${hourTs}|${a.id}`, {
             time: hourTs,
             id: a.id,
             action: a.idealAction,
@@ -1210,6 +1237,47 @@ function buildDeployStates(samples, cycles, from, to) {
           });
         }
       }
+      return {
+        ts: new Date(cycle.timestamp).getTime(),
+        startMs,
+        endMs,
+        hourSet,
+        acts,
+      };
+    })
+    .sort((a, b) => a.ts - b.ts);
+
+  // Recommendations are only relevant for the recent past — a stow advised
+  // days ago is stale history that doesn't help the crew now. Only cycles
+  // run within the past 24h of the latest cycle contribute recommendations;
+  // older cycles are ignored entirely (their detected states still feed
+  // the detected-transition timeline above, which is genuine history).
+  const latestCycleTs =
+    cyclesIndexed.length > 0 ? cyclesIndexed[cyclesIndexed.length - 1].ts : 0;
+  const recentCycles = cyclesIndexed.filter(
+    (c) => c.ts >= latestCycleTs - MS_PER_DAY,
+  );
+
+  /** Newest cycle covering wall-clock hour H (ms), or null. */
+  const newestCovering = (hourTs) => {
+    for (let i = recentCycles.length - 1; i >= 0; i--) {
+      const c = recentCycles[i];
+      if (c.hourSet.has(hourTs)) return c;
+      if (hourTs >= c.startMs && hourTs <= c.endMs) return c;
+    }
+    return null;
+  };
+
+  const recsByHour = new Map(); // `${hourTs}|${id}` -> ev
+  for (const cycle of recentCycles) {
+    for (const [key, ev] of cycle.acts) {
+      // Only keep this cycle's action if it IS the newest cycle covering
+      // the hour. A newer cycle covering the hour but having no action
+      // for this device withdraws the recommendation (we simply don't
+      // add it).
+      const newest = newestCovering(ev.time);
+      if (newest && newest.ts !== cycle.ts) continue;
+      recsByHour.set(key, ev);
     }
   }
   // Collapse consecutive same-device same-action advisories into the first,
@@ -1222,10 +1290,16 @@ function buildDeployStates(samples, cycles, from, to) {
   // Detected states are "deployed"/"stowed" (past tense); advisory actions
   // are "deploy"/"stow" (imperative). Normalize for comparison.
   const actionToState = { deploy: "deployed", stow: "stowed" };
-  const stateToAction = { deployed: "deploy", stowed: "stow" };
   const recommendations = [];
   const idealState = new Map(); // id -> current ideal state (tracked)
   for (const ev of [...recsByHour.values()].sort((a, b) => a.time - b.time)) {
+    // Only emit recommendations that fall within the queried window. A rec
+    // just before the window (e.g. a stow advised at 20:00 last night, now
+    // outside the "today" day-view) is history for a past hour and must not
+    // leak into the current view as if still actionable. The ideal-state
+    // tracker still walks every rec in order so an in-window transition
+    // is correctly compared against the prior ideal state.
+    const inWindow = ev.time >= fromMs && ev.time <= toMs;
     const target = actionToState[ev.action];
     // Initialize ideal state from detected state the first time we see a
     // device, at the time of this advisory.
@@ -1235,7 +1309,7 @@ function buildDeployStates(samples, cycles, from, to) {
     }
     if (idealState.get(ev.id) === target) continue; // no change
     idealState.set(ev.id, target);
-    recommendations.push(ev);
+    if (inWindow) recommendations.push(ev);
   }
   // Also collapse: if the first emitted advisory for a device matches the
   // detected state at its time, it was already filtered above. Consecutive
