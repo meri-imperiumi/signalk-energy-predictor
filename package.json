@@ -36,7 +36,8 @@
       "@meri-imperiumi/signalk-autostate"
     ],
     "recommends": [
-      "signalk-venus-plugin"
+      "signalk-venus-plugin",
+      "@meri-imperiumi/signalk-logbook"
     ]
   },
   "engines": {
