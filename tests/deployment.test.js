@@ -2632,6 +2632,89 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
     }
   });
 
+  test("FLINsail hysteresis: stays stowed when gusts hover near limit", () => {
+    // Gusts oscillate right around the 20kn limit (21.2, 19.8, 20.0, 13.1).
+    // Without hysteresis the state flaps stow/deploy/stow/deploy every
+    // hour. With a 2kn hysteresis it should stow at the first spike and
+    // stay stowed until gusts drop below 18kn.
+    const app = makeFakeApp();
+    app.setSelfPath("navigation.position", { latitude: 0, longitude: 0 });
+    app.setSelfPath("navigation.state", "moored");
+    const engine = new PredictionEngine({
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [
+        {
+          id: "flinsail",
+          type: "deployable",
+          capacityWp: 300,
+          gustLimitKnots: 20,
+          gustHysteresisKnots: 2,
+          powerPath: "electrical.solar.flinsail.power",
+        },
+      ],
+      mechanicalGenerators: [],
+      getEfficiency: () => 0.7,
+      getSelfPath: (path) => app.getSelfPath(path),
+      app,
+    });
+
+    // Daytime (equator noon) so the night-block logic doesn't apply.
+    // Gusts: 21.2 (h0), 19.8 (h1), 20.0 (h2), 13.1 (h3), then clear 10kn
+    const now = new Date("2026-03-20T12:00:00Z");
+    const gusts = [21.2, 19.8, 20.0, 13.1];
+    const forecast = Array.from({ length: 24 }, (_, h) => ({
+      time: new Date(now.getTime() + h * 3600000),
+      ghi: 500,
+      cloudCover: 0,
+      gustSpeedKnots: h < gusts.length ? gusts[h] : 10,
+      windSpeedKnots: 10,
+      windDirectionDeg: null,
+    }));
+    const realNow = Date.now;
+    Date.now = () => now.getTime();
+    try {
+      engine.runPrediction(forecast);
+      // Check the per-hour ideal states directly (the actions array only
+      // contains state changes, so we use computeDeployableSolarStates)
+      const hourlyStates = engine.computeDeployableSolarStates(
+        engine.lastForecast,
+        0,
+        0,
+        now,
+        24,
+        false,
+      );
+      const stateAt = (h) => hourlyStates[h].get("flinsail").state;
+      // h0: 21.2 >= 20 -> stowed
+      assert.strictEqual(stateAt(0), "stowed", "h0 should stow (21.2 >= 20)");
+      // h1: 19.8, prev stowed, 19.8 >= 18 (deploy threshold) -> stay stowed
+      assert.strictEqual(
+        stateAt(1),
+        "stowed",
+        "h1 should stay stowed (19.8 within hysteresis)",
+      );
+      // h2: 20.0, prev stowed, 20.0 >= 18 -> stay stowed
+      assert.strictEqual(
+        stateAt(2),
+        "stowed",
+        "h2 should stay stowed (20.0 within hysteresis)",
+      );
+      // h3: 13.1 < 18 -> deployed (finally drops below hysteresis)
+      assert.strictEqual(
+        stateAt(3),
+        "deployed",
+        "h3 should deploy (13.1 < 18)",
+      );
+      // The stow at h0 should be the only stow action emitted
+      const stowActions = engine.lastPrediction.filter((p) =>
+        p.actions.some((a) => a.id === "flinsail" && a.idealAction === "stow"),
+      );
+      assert.strictEqual(stowActions.length, 1, "only one stow action");
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
   test("hourly actions: detectedAction null when detected state unknown", () => {
     const app = makeFakeApp();
     app.setSelfPath("navigation.position", {

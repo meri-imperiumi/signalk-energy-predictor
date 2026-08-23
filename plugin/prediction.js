@@ -1318,8 +1318,12 @@ class PredictionEngine {
       const lon = pos?.longitude;
       for (const point of this.lastForecast) {
         const gust = point.gustSpeedKnots ?? 0;
+        // Mirror the hysteresis in computeDeployableSolarStates: a stowed
+        // array only deploys once gusts drop below (limit - hysteresis).
+        const hysteresis = array.gustHysteresisKnots ?? 2;
+        const deployThreshold = gustLimit - hysteresis;
         const wouldStow = gust >= gustLimit;
-        const wouldDeploy = !wouldStow;
+        const wouldDeploy = gust < deployThreshold;
         let changeTime = null;
         if (currentState === "deployed" && wouldStow) {
           changeTime = point.time;
@@ -1467,6 +1471,12 @@ class PredictionEngine {
       const states = new Map();
       for (const array of deployable) {
         const gustLimit = array.gustLimitKnots ?? 20;
+        const hysteresis = array.gustHysteresisKnots ?? 2;
+        // Hysteresis: once stowed, only redeploy when gusts drop below
+        // (limit - hysteresis). This prevents flapping when the forecast
+        // hovers right at the limit (e.g. 19.8 / 20.2 / 19.8 alternating).
+        const prev = prevState.get(array.id) ?? "deployed";
+        const deployThreshold = gustLimit - hysteresis;
         let state;
         let reason;
         if (underway) {
@@ -1477,6 +1487,11 @@ class PredictionEngine {
           if (nightMax >= gustLimit) {
             state = "stowed";
             reason = `forecast night gusts up to ${Math.round(nightMax)}kn ≥ limit ${gustLimit}kn`;
+          } else if (prev === "stowed" && nightMax >= deployThreshold) {
+            // Gusts dropped below the stow limit but not by the full
+            // hysteresis: stay stowed for the rest of the night
+            state = "stowed";
+            reason = `forecast night gusts ${Math.round(nightMax)}kn within hysteresis of limit ${gustLimit}kn`;
           } else {
             // No night gust risk: keep the previous state until sunrise
             state = prevState.get(array.id) ?? "deployed";
@@ -1485,6 +1500,11 @@ class PredictionEngine {
         } else if (info.gust >= gustLimit) {
           state = "stowed";
           reason = `forecast gusts ${Math.round(info.gust)}kn ≥ limit ${gustLimit}kn`;
+        } else if (prev === "stowed" && info.gust >= deployThreshold) {
+          // Daytime: gusts dropped below the stow limit but not by the full
+          // hysteresis: stay stowed to avoid flapping
+          state = "stowed";
+          reason = `forecast gusts ${Math.round(info.gust)}kn within hysteresis of limit ${gustLimit}kn`;
         } else {
           state = "deployed";
           reason = `forecast gusts ${Math.round(info.gust)}kn < limit ${gustLimit}kn`;
@@ -1696,8 +1716,14 @@ class PredictionEngine {
         const currentState =
           currentSolarStates?.[0]?.get(array.id) ??
           (currentGust >= gustLimit
-            ? { state: "stowed", reason: `forecast gusts ${Math.round(currentGust)}kn ≥ limit ${gustLimit}kn` }
-            : { state: "deployed", reason: `forecast gusts ${Math.round(currentGust)}kn < limit ${gustLimit}kn` });
+            ? {
+                state: "stowed",
+                reason: `forecast gusts ${Math.round(currentGust)}kn ≥ limit ${gustLimit}kn`,
+              }
+            : {
+                state: "deployed",
+                reason: `forecast gusts ${Math.round(currentGust)}kn < limit ${gustLimit}kn`,
+              });
 
         if (currentState.state === "stowed") {
           recommendations.push({

@@ -121,6 +121,15 @@ function buildPluginSchema() {
               minimum: 10,
               maximum: 50,
             },
+            gustHysteresisKnots: {
+              type: "number",
+              title: "Gust Hysteresis",
+              description:
+                "Redeploy only after gusts drop this far below the limit (knots)",
+              default: 2,
+              minimum: 0,
+              maximum: 10,
+            },
             hardwareEpochs: {
               type: "array",
               title: "Hardware Epochs",
