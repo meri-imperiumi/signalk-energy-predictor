@@ -217,12 +217,29 @@ test("readWeatherCacheCoarse merges fine-bucket files within a ~1° square and r
     [hp(12, { tier: 1, ghi: 800 })],
     1,
   );
-  // Force the second file to be newer than the first.
-  await new Promise((r) => setTimeout(r, 20));
-  const beforeSecond = Date.now();
+  const firstFile = weatherCachePath(
+    dir,
+    DATE,
+    weatherPositionBucket(60.17, 21.39),
+  );
+  const firstMtime = (await fs.stat(firstFile)).mtimeMs;
+  // Force the second file to be newer than the first. Use a gap large
+  // enough to exceed filesystem mtime resolution on CI runners (ext4 can
+  // round to whole seconds), then record the actual second file's mtime
+  // rather than the wall clock — `readWeatherCacheCoarse` returns the
+  // inode mtime, which the kernel may assign slightly before/after
+  // `Date.now()` at write time, so asserting against the wall clock is
+  // inherently flaky.
+  await new Promise((r) => setTimeout(r, 1100));
   await writeWeatherCache(dir, DATE, { latitude: 60.38, longitude: 21.42 }, [
     hp(13, { tier: 1, ghi: 760 }),
   ]);
+  const secondFile = weatherCachePath(
+    dir,
+    DATE,
+    weatherPositionBucket(60.38, 21.42),
+  );
+  const secondMtime = (await fs.stat(secondFile)).mtimeMs;
 
   const got = await readWeatherCacheCoarse(dir, DATE, {
     latitude: 60,
@@ -233,9 +250,15 @@ test("readWeatherCacheCoarse merges fine-bucket files within a ~1° square and r
   const byHour = new Map(got.hours.map((p) => [p.time.getUTCHours(), p]));
   assert.strictEqual(byHour.get(12).ghi, 800);
   assert.strictEqual(byHour.get(13).ghi, 760);
-  // mtime proxy for the fetch time is the newer file's mtime.
+  // The restore must pick the newest of the merged files' mtimes, and the
+  // second write (after the gap) must have produced a strictly newer file.
+  // `readWeatherCacheCoarse` builds `fetchedAt` via `new Date(mtimeMs)`,
+  // which truncates the sub-millisecond mtime to whole milliseconds, so
+  // compare against the truncated value rather than the raw float.
+  assert.ok(secondMtime > firstMtime, "second fetch wrote a newer file");
   assert.ok(
-    got.fetchedAt instanceof Date && got.fetchedAt.getTime() >= beforeSecond,
+    got.fetchedAt instanceof Date &&
+      got.fetchedAt.getTime() === Math.trunc(secondMtime),
     "fetchedAt is the newest file mtime",
   );
 });
