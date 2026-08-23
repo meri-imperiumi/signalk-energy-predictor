@@ -272,6 +272,84 @@ test.describe("Deployment recommendations: wind generators", () => {
     assert.strictEqual(rec.recommendedState, "stowed");
     assert.match(rec.reason, /too low/);
   });
+
+  test("stows wind generator and predicts no yield when nav state is unknown (deployableAtMoored false)", () => {
+    // Regression: a deployable wind generator that can only deploy at anchor
+    // must not be assumed deployed when navigation.state is missing/empty,
+    // otherwise the webapp shows predicted output while the boat is moored.
+    const engine = makePredictionEngine({
+      generators: [
+        {
+          id: "windgen",
+          type: "wind",
+          deployable: true,
+          deployableAtMoored: false,
+          maxWindKnots: 30,
+          startupSpeedKnots: 5,
+          powerPath: "electrical.windgen.power",
+          manufacturerCurve: "5,10,10,50,15,100,20,150,25,200,30,250",
+        },
+      ],
+      navState: "unknown",
+    });
+    engine.runPrediction(makeForecastWithGusts(15, 12));
+    // Ideal track: stowed -> no yield
+    assert.strictEqual(engine.lastPrediction[0].idealWindYieldWh, 0);
+    const rec = engine
+      .getDeploymentRecommendations()
+      .find((r) => r.id === "windgen");
+    assert.strictEqual(rec.recommendedState, "stowed");
+    assert.match(rec.reason, /unknown/);
+  });
+
+  test("stows wind generator and predicts no yield at moored when deployableAtMoored is false", () => {
+    const engine = makePredictionEngine({
+      generators: [
+        {
+          id: "windgen",
+          type: "wind",
+          deployable: true,
+          deployableAtMoored: false,
+          maxWindKnots: 30,
+          startupSpeedKnots: 5,
+          powerPath: "electrical.windgen.power",
+          manufacturerCurve: "5,10,10,50,15,100,20,150,25,200,30,250",
+        },
+      ],
+      navState: "moored",
+    });
+    engine.runPrediction(makeForecastWithGusts(15, 12));
+    assert.strictEqual(engine.lastPrediction[0].idealWindYieldWh, 0);
+    const rec = engine
+      .getDeploymentRecommendations()
+      .find((r) => r.id === "windgen");
+    assert.strictEqual(rec.recommendedState, "stowed");
+    assert.match(rec.reason, /moored/);
+  });
+
+  test("deploys wind generator at anchor when deployableAtMoored is false", () => {
+    const engine = makePredictionEngine({
+      generators: [
+        {
+          id: "windgen",
+          type: "wind",
+          deployable: true,
+          deployableAtMoored: false,
+          maxWindKnots: 30,
+          startupSpeedKnots: 5,
+          powerPath: "electrical.windgen.power",
+          manufacturerCurve: "5,10,10,50,15,100,20,150,25,200,30,250",
+        },
+      ],
+      navState: "anchored",
+    });
+    engine.runPrediction(makeForecastWithGusts(15, 12));
+    assert.ok(engine.lastPrediction[0].idealWindYieldWh > 0);
+    const rec = engine
+      .getDeploymentRecommendations()
+      .find((r) => r.id === "windgen");
+    assert.strictEqual(rec.recommendedState, "deployed");
+  });
 });
 
 test.describe("Deployment recommendations: hydro generators", () => {
@@ -519,6 +597,44 @@ test.describe("Missed yield calculation", () => {
       rec.missedYieldWh > 0,
       "Should have positive missed yield from hydro",
     );
+  });
+
+  test("hydro yield is reported separately as idealHydroYieldWh", () => {
+    const engine = makePredictionEngine({
+      generators: [
+        {
+          id: "hydrogen",
+          type: "hydro",
+          deployable: true,
+          minSpeedKnots: 3,
+          maxSpeedKnots: 12,
+          powerPath: "electrical.hydro.power",
+          manufacturerCurve: "3,50,5,100,8,150,10,200,12,250",
+        },
+        {
+          id: "windgen",
+          type: "wind",
+          deployable: true,
+          minDeployWind: 5,
+          maxWindKnots: 30,
+          powerPath: "electrical.wind.power",
+          manufacturerCurve: "3,20,6,60,10,100,15,150,20,200",
+        },
+      ],
+      navState: "sailing",
+      speed: 5,
+    });
+    engine.runPrediction(makeForecastWithGusts(8, 8));
+    const first = engine.lastPrediction[0];
+    assert.ok(first.idealHydroYieldWh > 0, "hydro yield should be positive");
+    assert.ok(first.idealWindYieldWh > 0, "combined mechanical yield positive");
+    assert.ok(
+      first.idealWindYieldWh >= first.idealHydroYieldWh,
+      "idealWindYieldWh is the combined wind+hydro total",
+    );
+    // getHourlyForecast serializes the hydro field for the webapp/recorder
+    const hourly = engine.getHourlyForecast();
+    assert.ok(hourly[0].idealHydroYieldWh > 0);
   });
 
   test("notification message includes missed yield when deploy recommended and stowed", () => {

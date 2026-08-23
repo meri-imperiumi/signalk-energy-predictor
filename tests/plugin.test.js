@@ -500,6 +500,62 @@ test.describe("Signal K API interactions", () => {
 
     await plugin.stop();
   });
+
+  test("navigation.state carries forward across empty delta updates", async () => {
+    // navigation.state is a sticky state: a later delta emitting an empty
+    // value (some providers emit "" when the source drops out) must not
+    // clear a previously known state. The prediction engine should keep
+    // reading the last valid state instead of falling back to "unknown".
+    const app = new FakeSignalKApp();
+    const plugin = makePlugin(app);
+
+    app.setSelfPath("navigation.position", {
+      latitude: 60.0,
+      longitude: 18.0,
+    });
+    app.setSelfPath("electrical.batteries.house.capacity.stateOfCharge", 0.6);
+    app.setSelfPath("navigation.state", "moored");
+    app.setSelfPath("environment.wind.angleApparent", 0);
+
+    const config = {
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [
+        { id: "cabin-roof", type: "fixed", capacityWp: 200, enabled: true },
+      ],
+      mechanicalGenerators: [],
+      weather: { openMeteoEnabled: false, useLogbook: false },
+    };
+    app.dataPath = tempDir;
+    await plugin.start(config, () => {});
+
+    const emit = (values) =>
+      app.subscriptionmanager.subscriptions.forEach(({ deltaHandler }) =>
+        deltaHandler({ context: app.selfId, updates: [{ values }] }),
+      );
+
+    // Establish a known nav state via a delta
+    emit([{ path: "navigation.state", value: "moored" }]);
+    assert.strictEqual(
+      plugin.__getInternals().predictionEngine.getNavState(),
+      "moored",
+    );
+
+    // An empty-string update must not overwrite the carried state
+    emit([{ path: "navigation.state", value: "" }]);
+    assert.strictEqual(
+      plugin.__getInternals().predictionEngine.getNavState(),
+      "moored",
+    );
+
+    // A real new state still takes over
+    emit([{ path: "navigation.state", value: "anchored" }]);
+    assert.strictEqual(
+      plugin.__getInternals().predictionEngine.getNavState(),
+      "anchored",
+    );
+
+    await plugin.stop();
+  });
 });
 
 test.describe("Solar learning regression", () => {

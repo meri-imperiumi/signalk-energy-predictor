@@ -96,3 +96,46 @@ test("chart overlays retro-predicted when no recorded cycle covers the window", 
   // Period model: aggregates retro-predicted hourly points to daily totals
   assert.match(source, /retroPredicted\.points/);
 });
+
+test("window selector exposes Today and hash-based navigation", () => {
+  const source = readFileSync(
+    path.join(PUBLIC_DIR, "ep-window-selector.js"),
+    "utf8",
+  );
+  // Today button
+  assert.match(source, /today\(\)/);
+  assert.match(source, /"Today"/);
+  // Hash routing: reads and writes the URL hash, reacts to hashchange
+  assert.match(source, /loadHash/);
+  assert.match(source, /saveHash/);
+  assert.match(source, /hashchange/);
+});
+
+test("chart shows hydro actual and hydro predicted series", () => {
+  const source = readFileSync(
+    path.join(PUBLIC_DIR, "ep-timeline-chart.js"),
+    "utf8",
+  );
+  // Day view predicted hydro line
+  assert.match(source, /predHydro/);
+  // Week/month view hydro actual + predicted bars
+  assert.match(source, /hydroActual/);
+  assert.match(source, /hydroPred/);
+});
+
+test("chart clips predicted SoC to now so the line is not drawn in the past", () => {
+  const source = readFileSync(
+    path.join(PUBLIC_DIR, "ep-timeline-chart.js"),
+    "utf8",
+  );
+  assert.match(source, /p\.predSoC != null && p\.t >= Date\.now\(\)/);
+});
+
+test("headline figures show hydro yield", () => {
+  const source = readFileSync(
+    path.join(PUBLIC_DIR, "ep-headline-figures.js"),
+    "utf8",
+  );
+  assert.match(source, /Hydro yield/);
+  assert.match(source, /yield\?\.hydro\?\.totalWh/);
+});

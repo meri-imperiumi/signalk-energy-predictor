@@ -396,6 +396,51 @@ test.describe("replayGenerators", () => {
     assert.ok(results[0].totalPredictedWh > 0);
   });
 
+  test("navigation.state carries forward across gaps in backfill replay", () => {
+    // First tick is explicitly moored; subsequent ticks have no nav state
+    // and STW=0 (which would otherwise infer "anchored"). Carry-forward
+    // must keep the wind generator stowed (deployableAtMoored:false) for
+    // the whole run instead of flipping to anchored→deployed at the gaps.
+    const historyData = makeHistoryData();
+    pushTick(historyData, 0, {
+      solar: 0,
+      soc: 0.5,
+      navState: "moored",
+      windGen: 0,
+      stw: 0,
+    });
+    for (let m = 5; m < 30; m += 5) {
+      pushTick(historyData, m, {
+        solar: 0,
+        soc: 0.5,
+        navState: null, // gap: should carry "moored" forward
+        windGen: 0,
+        stw: 0,
+      });
+    }
+    const gen = {
+      id: "windgen",
+      type: "wind",
+      deployable: true,
+      deployableAtMoored: false,
+      powerPath: "electrical.dcsource.wind.power",
+      curve: [
+        { speed: 5, watts: 5 },
+        { speed: 10, watts: 15 },
+        { speed: 15, watts: 55 },
+      ],
+    };
+    const results = replayGenerators({
+      generators: [gen],
+      historyData,
+      weather: makeWeather(NOON), // 15 kn — enough to deploy if at anchor
+      resolution: 300,
+    });
+    // Carried moored → stowed for every tick → 0 Wh. Without carry-forward
+    // the gaps would infer anchored and produce >0 Wh.
+    assert.strictEqual(results[0].totalPredictedWh, 0);
+  });
+
   test("hydro generator requires sailing and speed", () => {
     const historyData = makeHistoryData();
     for (let m = 0; m < 30; m += 5) {

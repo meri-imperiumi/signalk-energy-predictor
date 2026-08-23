@@ -391,6 +391,7 @@ test.describe("builders over recorded fixtures", () => {
     // 24 h forecast: 23×10 + 100 solar
     assert.strictEqual(day.solarWh, 330);
     assert.strictEqual(day.windWh, 165);
+    assert.strictEqual(day.hydroWh, 0);
     assert.strictEqual(day.hours, 24);
   });
 

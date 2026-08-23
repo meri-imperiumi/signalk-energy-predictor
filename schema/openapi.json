@@ -196,6 +196,10 @@
             "type": "number",
             "description": "All mechanical generators (wind and hydro)"
           },
+          "idealHydroYieldWh": {
+            "type": "number",
+            "description": "Hydro generator yield only (subset of idealWindYieldWh)"
+          },
           "houseLoadWh": { "type": "number" },
           "idealNetWh": { "type": "number" },
           "idealSoC": { "type": "number" },
@@ -268,6 +272,7 @@
           "date": { "type": "string", "format": "date" },
           "solarWh": { "type": "number" },
           "windWh": { "type": "number" },
+          "hydroWh": { "type": "number" },
           "loadWh": { "type": "number" },
           "netWh": { "type": "number" },
           "hours": {
