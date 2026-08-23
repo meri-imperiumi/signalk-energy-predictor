@@ -162,7 +162,7 @@ function localDayStart(day) {
 class EpTimelineChart extends HTMLElement {
   constructor() {
     super();
-    /** @type {{mode: string, actuals: object|null, predictions: object|null}|null} */
+    /** @type {{mode: string, actuals: object|null, predictions: object|null, retroPredicted: object|null}|null} */
     this._data = null;
     /** @type {Record<string, boolean>} */
     this.enabled = {};
@@ -180,7 +180,7 @@ class EpTimelineChart extends HTMLElement {
 
   /**
    * Assigning data re-renders the chart.
-   * @param {{mode: string, actuals: object|null, predictions: object|null}|null} value
+   * @param {{mode: string, actuals: object|null, predictions: object|null, retroPredicted: object|null}|null} value
    */
   set data(value) {
     this._data = value;
@@ -280,7 +280,7 @@ class EpTimelineChart extends HTMLElement {
    * @returns {{model: object, rows: object[]}}
    */
   buildDayModel() {
-    const { actuals, predictions } = this._data;
+    const { actuals, predictions, retroPredicted } = this._data;
     const points = actuals?.points || [];
     const cycles = predictions?.cycles || [];
     const cycle = cycles.length > 0 ? cycles[cycles.length - 1] : null;
@@ -288,7 +288,9 @@ class EpTimelineChart extends HTMLElement {
     const from = new Date(this._data.actuals?.window?.from || 0).getTime();
     const to = new Date(this._data.actuals?.window?.to || Date.now()).getTime();
 
-    // Pred series: stepped hourly segments from the freshest cycle
+    // Pred series: stepped hourly segments from the freshest cycle.
+    // Falls back to retro-predicted (backfilled model over archive weather)
+    // when no recorded cycle covers the window.
     const pred = [];
     if (cycle) {
       for (const hour of cycle.forecast || []) {
@@ -301,6 +303,16 @@ class EpTimelineChart extends HTMLElement {
             hour.idealSoC != null
               ? Math.round(hour.idealSoC * 1000) / 10
               : null,
+        });
+      }
+    } else {
+      for (const hour of retroPredicted?.points || []) {
+        const t = new Date(hour.time).getTime();
+        pred.push({
+          t,
+          predSolar: hour.idealSolarYieldWh || 0,
+          predWind: hour.idealWindYieldWh || 0,
+          predSoC: null,
         });
       }
     }
@@ -369,7 +381,7 @@ class EpTimelineChart extends HTMLElement {
    * @returns {{model: object, rows: object[]}}
    */
   buildPeriodModel() {
-    const { actuals, predictions } = this._data;
+    const { actuals, predictions, retroPredicted } = this._data;
     const points = actuals?.points || [];
     const days = predictions?.days || [];
 
@@ -411,6 +423,28 @@ class EpTimelineChart extends HTMLElement {
     }
 
     const predByDay = new Map(days.map((d) => [d.date, d]));
+    // Fall back to retro-predicted hourly points aggregated to daily totals
+    // when no recorded prediction days cover the window.
+    if (days.length === 0 && retroPredicted?.points) {
+      const retroDaily = new Map();
+      for (const hour of retroPredicted.points) {
+        const day = localDayKey(new Date(hour.time).getTime());
+        let entry = retroDaily.get(day);
+        if (!entry) {
+          entry = { date: day, solarWh: 0, windWh: 0 };
+          retroDaily.set(day, entry);
+        }
+        entry.solarWh += hour.idealSolarYieldWh || 0;
+        entry.windWh += hour.idealWindYieldWh || 0;
+      }
+      for (const entry of retroDaily.values()) {
+        entry.solarWh = Math.round(entry.solarWh);
+        entry.windWh = Math.round(entry.windWh);
+      }
+      for (const [date, entry] of retroDaily) {
+        predByDay.set(date, entry);
+      }
+    }
     const allDays = Array.from(
       new Set([...daily.keys(), ...days.map((d) => d.date)]),
     ).sort();

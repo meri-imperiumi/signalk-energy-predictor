@@ -107,17 +107,32 @@ class EpApp extends HTMLElement {
     this.errorEl.textContent = "";
     this.chartEl.data = null;
     try {
-      const [summary, actuals, predictions] = await Promise.all([
-        this.fetchApi("/api/summary", spec.from, spec.to).catch(() => null),
-        this.fetchApi("/api/actuals", spec.from, spec.to),
-        this.fetchApi("/api/predictions", spec.from, spec.to),
-      ]);
+      const [summary, actuals, predictions, retroPredicted] = await Promise.all(
+        [
+          this.fetchApi("/api/summary", spec.from, spec.to).catch(() => null),
+          this.fetchApi("/api/actuals", spec.from, spec.to),
+          this.fetchApi("/api/predictions", spec.from, spec.to),
+          this.fetchApi("/api/retro-predicted", spec.from, spec.to).catch(
+            () => null,
+          ),
+        ],
+      );
       this.figuresEl.data = summary;
-      this.chartEl.data = { mode: spec.mode, actuals, predictions };
+      this.chartEl.data = {
+        mode: spec.mode,
+        actuals,
+        predictions,
+        retroPredicted,
+      };
     } catch (error) {
       this.errorEl.textContent = `Failed to load data: ${error.message}`;
       this.figuresEl.data = null;
-      this.chartEl.data = { mode: spec.mode, actuals: null, predictions: null };
+      this.chartEl.data = {
+        mode: spec.mode,
+        actuals: null,
+        predictions: null,
+        retroPredicted: null,
+      };
     }
   }
 }

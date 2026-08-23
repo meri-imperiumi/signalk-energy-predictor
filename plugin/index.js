@@ -1096,6 +1096,13 @@ module.exports = (app) => {
       app.getSelfPath("navigation.position") ||
       null;
 
+    // Get speed through water (for hydro generator prediction)
+    const stwKnots =
+      toKnots(
+        deltaState.get("navigation.speedThroughWater") ||
+          app.getSelfPath("navigation.speedThroughWater"),
+      ) || null;
+
     await recorder.recordSample({
       timestamp: new Date(),
       arrays,
@@ -1105,6 +1112,7 @@ module.exports = (app) => {
       windSpeedKnots,
       navState,
       position,
+      stwKnots,
     });
   }
 

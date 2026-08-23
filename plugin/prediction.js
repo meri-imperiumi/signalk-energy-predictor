@@ -165,12 +165,17 @@ function predictWindHour({
     return 0; // Gusts exceed limit, would be stowed
   }
 
-  // Deployable wind generators are used at anchor/moored, NOT under way
+  // Deployable wind generators are used at anchor, NOT under way.
+  // Some vessels cannot deploy at a mooring (proximity to dock/other
+  // boats) — gated by generator.deployableAtMoored (default true).
   if (generator.deployable) {
     if (navState === "sailing" || navState === "motoring") {
       return 0; // Stowed when under way (hydro or engine are available)
     }
-    // When anchored/moored, assume deployed
+    if (navState === "moored" && generator.deployableAtMoored === false) {
+      return 0; // Stowed at mooring on this vessel
+    }
+    // When anchored (or moored and deployable there), assume deployed
   }
 
   const power = interpolateWindPower(generator.curve, windSpeedKnots);

@@ -198,6 +198,13 @@ function buildPluginSchema() {
                 "Generator can be deployed/retracted (hydrogenerators are typically deployable)",
               default: false,
             },
+            deployableAtMoored: {
+              type: "boolean",
+              title: "Deployable at mooring",
+              description:
+                "Whether this wind generator can be deployed while moored (some vessels cannot due to proximity to dock or other boats). When false, the generator is predicted stowed at moored and only deployed at anchor.",
+              default: true,
+            },
             maxWindKnots: {
               type: "number",
               title: "Max Wind Speed",

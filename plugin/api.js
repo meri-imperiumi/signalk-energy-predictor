@@ -741,6 +741,17 @@ function registerApiRoutes(router, { app, getConfig, dataDir }) {
     ).catch((error) => handleError(error, res)),
   );
 
+  router.get("/api/retro-predicted", (req, res) => {
+    const { from, to } = parseTimeWindow(req.query);
+    const config = getConfig();
+    loadRecords(readRecordings, from, to, "sample")
+      .then((samples) =>
+        buildRetroPredicted(samples, config, dataDir, from, to),
+      )
+      .then((body) => res.json(body))
+      .catch((error) => handleError(error, res));
+  });
+
   router.get("/api/summary", (req, res) =>
     handle(req, res, "sample", (samples, sourceTypes, from, to) =>
       // Summary also needs cycles for accuracy; load them here
@@ -766,6 +777,173 @@ function registerApiRoutes(router, { app, getConfig, dataDir }) {
   }
 }
 
+/**
+ * Builds the /api/retro-predicted response: what the current learned model
+ * would have predicted for each hour in the window, using archive weather
+ * and the vessel's recorded state (nav state, position).
+ *
+ * Unlike /api/predictions (which serves recorded prediction cycles), this
+ * computes yield retroactively from the backfilled matrices + generator
+ * curves, so the webapp can overlay predicted-vs-actual for the past.
+ *
+ * @param {object[]} samples - Recorded samples within the window (for state)
+ * @param {object} config - Plugin configuration
+ * @param {string} dataDir - Plugin data directory (for matrices)
+ * @param {Date} from - Window start
+ * @param {Date} to - Window end
+ * @returns {Promise<object>} Response body
+ */
+async function buildRetroPredicted(samples, config, dataDir, from, to) {
+  const backfill = require("./history-backfill.js");
+  const { SolarMatrix, theoreticalPower } = require("./learning.js");
+  const { sunPosition, irradianceFromCloudCover } = require("./solar.js");
+  const { predictWindHour, predictHydroHour } = require("./prediction.js");
+  const { parseManufacturerCurve } = require("./schema.js");
+  const matrixPersistence = require("./matrix.js");
+
+  const arrays = (config.solarArrays || []).filter(
+    (a) => a.enabled !== false && a.powerPath && a.capacityWp,
+  );
+  const generators = (config.mechanicalGenerators || [])
+    .filter((g) => g.enabled !== false && g.powerPath)
+    .map((g) => ({
+      ...g,
+      curve: Array.isArray(g.curve)
+        ? g.curve
+        : parseManufacturerCurve(g.manufacturerCurve),
+    }));
+
+  // Load backfilled matrices
+  const saved = await matrixPersistence.loadAllMatrices(dataDir);
+  const matrices = new Map();
+  for (const array of arrays) {
+    const found = saved.find((m) => m.arrayId === array.id);
+    matrices.set(array.id, found ? SolarMatrix.fromJSON(found) : null);
+  }
+
+  // Build per-day positions from samples for the weather track
+  const byDate = new Map();
+  for (const s of samples) {
+    const time = new Date(s.timestamp);
+    if (time < from || time > to) continue;
+    const pos = s.position;
+    if (!pos || pos.latitude == null || pos.longitude == null) continue;
+    const date = time.toISOString().split("T")[0];
+    const noonDist = Math.abs((time.getTime() % 86400000) - 12 * 3600000);
+    const existing = byDate.get(date);
+    if (!existing || noonDist < existing.noonDist) {
+      byDate.set(date, { noonDist, position: pos });
+    }
+  }
+  const dailyPositions = [...byDate.entries()]
+    .map(([date, { position }]) => ({
+      date,
+      latitude: position.latitude,
+      longitude: position.longitude,
+    }))
+    .sort((a, b) => (a.date < b.date ? -1 : 1));
+
+  const weather =
+    dailyPositions.length > 0
+      ? await backfill.fetchHistoricalWeatherTrack({ dailyPositions })
+      : [];
+
+  // Per-hour state: take the latest sample at or before each hour
+  const sorted = samples
+    .slice()
+    .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+  const stateAt = (t) => {
+    let lo = 0;
+    let hi = sorted.length - 1;
+    let best = null;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      if (new Date(sorted[mid].timestamp) <= t) {
+        best = sorted[mid];
+        lo = mid + 1;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    return best;
+  };
+
+  const posAt = (t) => {
+    let best = null;
+    let bestDist = Infinity;
+    for (const s of sorted) {
+      const d = Math.abs(new Date(s.timestamp) - t);
+      if (d < bestDist && s.position) {
+        best = s.position;
+        bestDist = d;
+      }
+    }
+    return best;
+  };
+
+  const points = [];
+  const fromMs = from.getTime();
+  const toMs = to.getTime();
+  for (let t = Math.ceil(fromMs / 3600000) * 3600000; t <= toMs; t += 3600000) {
+    const time = new Date(t);
+    const w = backfill.interpolateWeather(weather, time);
+    const state = stateAt(time);
+    const navState = state?.navState ?? "anchored";
+    const pos = posAt(time);
+
+    let idealSolarYieldWh = 0;
+    if (pos) {
+      const sunPos = sunPosition(time, pos.latitude, pos.longitude);
+      let ghi = w.ghi;
+      if (ghi == null && w.cloudCover != null) {
+        ghi = irradianceFromCloudCover(sunPos.altitude, w.cloudCover);
+      }
+      if (ghi != null && ghi > 0) {
+        for (const array of arrays) {
+          const matrix = matrices.get(array.id);
+          if (!matrix) continue;
+          const th = theoreticalPower(array.capacityWp, ghi, sunPos.altitude);
+          if (th <= 0) continue;
+          const eff = matrix.getAnchored(sunPos.azimuth, sunPos.altitude);
+          idealSolarYieldWh += th * eff;
+        }
+      }
+    }
+
+    let idealWindYieldWh = 0;
+    let idealHydroYieldWh = 0;
+    for (const g of generators) {
+      if (g.type === "wind") {
+        idealWindYieldWh += predictWindHour({
+          generator: g,
+          windSpeedKnots: w.windSpeedKnots ?? 0,
+          gustSpeedKnots: w.gustSpeedKnots ?? 0,
+          navState,
+        });
+      } else if (g.type === "hydro") {
+        const stwKn =
+          state && typeof state.stwKnots === "number" ? state.stwKnots : 0;
+        idealHydroYieldWh += predictHydroHour({
+          generator: g,
+          speedThroughWaterKnots: stwKn,
+          isSailing: navState === "sailing",
+        });
+      }
+    }
+
+    points.push({
+      time: time.toISOString(),
+      idealSolarYieldWh: Math.round(idealSolarYieldWh),
+      idealWindYieldWh: Math.round(idealWindYieldWh + idealHydroYieldWh),
+    });
+  }
+
+  return {
+    window: { from: from.toISOString(), to: to.toISOString() },
+    points,
+  };
+}
+
 module.exports = {
   MAX_WINDOW_DAYS,
   ApiError,
@@ -780,6 +958,7 @@ module.exports = {
   buildPredictions,
   buildEnvironment,
   buildSummary,
+  buildRetroPredicted,
   registerApiRoutes,
   cycleHorizonMs,
 };

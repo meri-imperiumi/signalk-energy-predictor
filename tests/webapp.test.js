@@ -83,4 +83,16 @@ test("chart fetches against the plugin API base used by ep-app", () => {
   assert.match(source, /\/api\/summary/);
   assert.match(source, /\/api\/actuals/);
   assert.match(source, /\/api\/predictions/);
+  assert.match(source, /\/api\/retro-predicted/);
+});
+
+test("chart overlays retro-predicted when no recorded cycle covers the window", () => {
+  const source = readFileSync(
+    path.join(PUBLIC_DIR, "ep-timeline-chart.js"),
+    "utf8",
+  );
+  // Day model: falls back to retroPredicted points when no cycle exists
+  assert.match(source, /retroPredicted\?\.points/);
+  // Period model: aggregates retro-predicted hourly points to daily totals
+  assert.match(source, /retroPredicted\.points/);
 });
