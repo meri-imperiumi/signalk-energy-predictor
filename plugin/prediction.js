@@ -2629,31 +2629,63 @@ class PredictionEngine {
     }
 
     // Sum post-full energy that has nowhere to go. The window runs from the
-    // full hour until the last consecutive hour with positive surplus
-    // contribution (so a mid-window lull doesn't truncate prematurely, we
-    // only stop at a sustained end — typically engine-off or sunset).
+    // full hour until the last hour that actually curtails energy.
+    //
+    // Crucially, only energy produced *while the bank is full* is curtailed
+    // surplus — a deficit hour discharges the bank and creates headroom,
+    // so a later surplus hour must first refill that drawdown before any
+    // of it is curtailed. Summing every net-positive hour (the old
+    // approach) double-counts: it counts the refill energy as surplus,
+    // inflating the total and stretching the window across an overnight
+    // drawdown into the next day's solar (which is actually refilling the
+    // bank, not being wasted).
+    //
+    // Track headroom (Wh the bank can absorb before it's full again):
+    //   - starts at 0 (bank is full at fullHour)
+    //   - a net-negative hour discharges → headroom grows
+    //   - a net-positive hour first fills headroom; only the excess beyond
+    //     headroom is curtailed surplus
+    const capacityWh = this.capacityWh || 0;
+    // The full hour is at >= fullThreshold, not necessarily at 1.0, so there
+    // may be real absorption headroom left (1.0 - idealSoC) * capacity. Count
+    // that as headroom so the absorption-tail energy isn't reported as
+    // curtailed surplus (it's going into the bank, not being wasted).
     let surplusWh = 0;
+    let headroomWh = Math.max(
+      0,
+      (1.0 - fullHour.idealSoC) * capacityWh,
+    );
     let lastIndex = fullHourIndex;
+    let lastSurplusIndex = -1;
     for (let i = fullHourIndex; i < this.lastPrediction.length; i++) {
       const p = this.lastPrediction[i];
-      const contribution = Math.max(
-        0,
+      const net =
         p.idealSolarYieldWh +
-          p.idealWindYieldWh +
-          (p.alternatorWh ?? 0) -
-          p.houseLoadWh,
-      );
-      if (contribution > 0) {
-        surplusWh += contribution;
-        lastIndex = i;
+        p.idealWindYieldWh +
+        (p.alternatorWh ?? 0) -
+        p.houseLoadWh;
+      if (net < 0) {
+        // Discharging: the bank can absorb this much more before being
+        // full again. Cap at capacity so a deep drawdown can't imply more
+        // refilling room than the bank physically holds.
+        headroomWh = Math.min(headroomWh - net, capacityWh);
+      } else if (net > 0) {
+        const curtailed = Math.max(0, net - headroomWh);
+        if (curtailed > 0) {
+          surplusWh += curtailed;
+          lastSurplusIndex = i;
+        }
+        // The remainder fills headroom (refills the drawdown).
+        headroomWh = Math.max(0, headroomWh - net);
       }
+      lastIndex = i;
     }
 
     if (surplusWh < minSurplusWh) return null;
-    if (lastIndex === fullHourIndex) return null; // no post-full surplus window
+    if (lastSurplusIndex === -1) return null; // no post-full curtailed surplus
 
     const from = fullHour.time;
-    const to = this.lastPrediction[lastIndex].time;
+    const to = this.lastPrediction[lastSurplusIndex].time;
     const windowHours = (to.getTime() - from.getTime()) / 3600000 + 1; // inclusive of both ends
     const suggestedLoadW =
       windowHours > 0 ? Math.round(surplusWh / windowHours) : 0;
