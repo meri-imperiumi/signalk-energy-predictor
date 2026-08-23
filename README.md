@@ -1,6 +1,10 @@
 # Signal K Energy Predictor
 
-This plugin provides energy predictions for boats powered by renewables. It combines weather forecasts with a solar/wind yield model it learns from your own vessel's actual generation history. This models efficiency with sun position taking weather heading into account. The plugin can utilize insolation forecasts it downloads from the internet, but can also utilize local GRIBs or other Signal K Weather API providers. It will actively inform about potential energy surplus or events like having to take deployable solar panels down because of a forecasted gale. The system supports solar power, wind generators, hydrogenerators and is aware of alternator or genset output.
+This plugin predicts your boat’s energy production and helps you manage it. It combines weather forecasts with models learned from your vessel’s actual generation history to predict output from solar panels, wind generators, and hydrogenerators. The models account for factors such as sun position, vessel heading, rig and sail shading, and wind protection at anchor.
+
+Weather forecasts can come from online insolation services, local GRIB files, or other Signal K Weather API providers. The plugin is designed to work offline-first, degrading gracefully from high-resolution online forecasts to low-bandwidth GRIBs or even manual cloud-cover observations. It also accounts for energy from alternators and gensets when predicting battery state.
+
+In addition to forecasting, the plugin tries to identify and notify user of significant events. It can detect an approaching energy surplus or deficit, predict when the battery will reach float, and alert you when conditions require deployable equipment to be stowed, such as taking down a FLINsail before a gale.
 
 ![Analysis for a sailing day](https://github.com/meri-imperiumi/signalk-energy-predictor/raw/main/doc/webapp-day.png)
 
@@ -8,11 +12,12 @@ This plugin provides energy predictions for boats powered by renewables. It comb
 
 * Learning model for solar panel output that takes rig shading, sails, etc into account
 * Learning model for wind protection in anchorages (for stowing deployables or predicting wind generator output)
-* Backfilling support to import 
+* Backfilling support to import historical data for learning and backtesting purposes
 * Support for deployable renewables (for example FLINsail or a rigging-suspended wind generator)
 * Notifications for actionable items ("take down FLINsail, gusts over 20kn overnight")
 * Energy surplus detection for estimating when battery will be full and panels going to float
 * Energy deficit detection for when the boat might need to run the engine or a genset
+* Data sanitization: pauses the learning model when the engine is running or solar chargers are in float/absorption, preventing skewed efficiency data
 * Automatic forecast download when Starlink goes online
 
 ## Status
