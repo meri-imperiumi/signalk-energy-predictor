@@ -1176,9 +1176,10 @@ class PredictionEngine {
    * azimuth relative to the boat's heading. After sunset, it targets the next
    * sunrise so the crew can set the sail overnight for first light.
    *
-   * For the morning case, if the boat is anchored/moored the predicted heading
-   * at sunrise is estimated from the forecast wind direction (boats point into
-   * the wind). Falls back to current heading if no wind direction forecast
+   * For the morning case, an anchored boat's predicted heading at sunrise
+   * is estimated from the forecast wind direction (the bow swings into the
+   * wind). A moored boat keeps a fixed heading, so its current heading is
+   * used instead. Falls back to current heading if no wind direction forecast
    * is available.
    *
    * @param {object} _array - Solar array config (must be type "deployable")
@@ -1236,8 +1237,15 @@ class PredictionEngine {
     }
     const sunrisePos = sunPosition(sunrise, lat, lon);
 
-    // For anchored/moored boats, predict heading from forecast wind direction
-    let predictedHeading = this.getForecastWindDirectionAt(sunrise);
+    // For anchored boats, the bow swings into the wind, so predict the
+    // heading at sunrise from the forecast wind direction (direction the
+    // wind comes from = where the bow points). Moored boats are tied to a
+    // fixed heading that will not change, so use the current heading instead.
+    const navState = this.getNavState();
+    let predictedHeading;
+    if (navState === "anchored") {
+      predictedHeading = this.getForecastWindDirectionAt(sunrise);
+    }
     if (predictedHeading == null) {
       predictedHeading = this.getHeadingTrue();
     }

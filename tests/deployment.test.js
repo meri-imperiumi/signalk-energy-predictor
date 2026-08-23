@@ -1797,6 +1797,114 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
     }
   });
 
+  test("morning: moored boat uses fixed heading, not forecast wind direction", () => {
+    // At 60N/18E on 2026-01-15 22:00Z it is night, so the pointing
+    // recommendation runs in morning mode targeting the next sunrise
+    // (2026-01-16 07:35Z, azimuth ~134°). The forecast says the wind comes
+    // from due east (90°), which would make an anchored boat point east.
+    // But this boat is moored with a fixed heading of 302.31° (5.28 rad),
+    // so the recommendation must follow the fixed heading, not the wind.
+    const app = makeFakeApp();
+    app.setSelfPath("navigation.position", {
+      latitude: 60,
+      longitude: 18,
+    });
+    app.setSelfPath("navigation.headingTrue", 5.28); // 302.31°
+    app.setSelfPath("navigation.state", "moored");
+
+    const engine = new PredictionEngine({
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [
+        {
+          id: "flinsail",
+          type: "deployable",
+          capacityWp: 300,
+          gustLimitKnots: 20,
+          powerPath: "electrical.solar.flinsail.power",
+        },
+      ],
+      mechanicalGenerators: [],
+      getEfficiency: () => 0.7,
+      getSelfPath: (path) => app.getSelfPath(path),
+      app,
+    });
+
+    const now = new Date("2026-01-15T22:00:00Z");
+    const forecast = Array.from({ length: 48 }, (_, h) => ({
+      time: new Date(now.getTime() + h * 3600000),
+      ghi: 0,
+      cloudCover: 0,
+      gustSpeedKnots: 0,
+      windSpeedKnots: 10,
+      windDirectionDeg: 90, // wind from due east
+    }));
+    const realNow = Date.now;
+    Date.now = () => now.getTime();
+    try {
+      engine.runPrediction(forecast);
+      const recs = engine.getDeploymentRecommendations();
+      const rec = recs.find((r) => r.id === "flinsail");
+      // Moored: fixed heading 302°, sunrise azimuth ~134° → sun to port.
+      assert.strictEqual(rec.recommendedSide, "port");
+      assert.match(rec.reason, /Point port for morning/);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test("morning: anchored boat uses forecast wind direction as heading", () => {
+    // Same setup as above, but anchored. The boat swings into the wind
+    // (from due east, 90°), so at sunrise (azimuth ~134°) the sun is to
+    // starboard of the predicted heading.
+    const app = makeFakeApp();
+    app.setSelfPath("navigation.position", {
+      latitude: 60,
+      longitude: 18,
+    });
+    app.setSelfPath("navigation.headingTrue", 5.28); // ignored when anchored
+    app.setSelfPath("navigation.state", "anchored");
+
+    const engine = new PredictionEngine({
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [
+        {
+          id: "flinsail",
+          type: "deployable",
+          capacityWp: 300,
+          gustLimitKnots: 20,
+          powerPath: "electrical.solar.flinsail.power",
+        },
+      ],
+      mechanicalGenerators: [],
+      getEfficiency: () => 0.7,
+      getSelfPath: (path) => app.getSelfPath(path),
+      app,
+    });
+
+    const now = new Date("2026-01-15T22:00:00Z");
+    const forecast = Array.from({ length: 48 }, (_, h) => ({
+      time: new Date(now.getTime() + h * 3600000),
+      ghi: 0,
+      cloudCover: 0,
+      gustSpeedKnots: 0,
+      windSpeedKnots: 10,
+      windDirectionDeg: 90, // wind from due east
+    }));
+    const realNow = Date.now;
+    Date.now = () => now.getTime();
+    try {
+      engine.runPrediction(forecast);
+      const recs = engine.getDeploymentRecommendations();
+      const rec = recs.find((r) => r.id === "flinsail");
+      // Anchored: predicted heading = wind direction 90°, sunrise azimuth
+      // ~134° → sun to starboard.
+      assert.strictEqual(rec.recommendedSide, "starboard");
+      assert.match(rec.reason, /Point starboard for morning/);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
   test("AdvisoryPublisher publishes recommendedSide and recommendedSideTime", () => {
     const app = makeFakeApp();
     const pub = new AdvisoryPublisher(app, "test-plugin");
