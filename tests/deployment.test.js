@@ -2715,6 +2715,123 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
     }
   });
 
+  test("computeDeployableSolarStates: hours beyond forecast horizon carry forward, not fabricated calm", () => {
+    const app = makeFakeApp();
+    app.setSelfPath("navigation.position", { latitude: 0, longitude: 0 });
+    app.setSelfPath("navigation.state", "moored");
+    const engine = new PredictionEngine({
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [
+        withCurve({
+          id: "flinsail",
+          type: "deployable",
+          powerPath: "electrical.solar.flinsail.power",
+          capacityWp: 400,
+          gustLimitKnots: 20,
+          gustHysteresisKnots: 2,
+          manufacturerCurve: "0,0,20,400",
+        }),
+      ],
+      mechanicalGenerators: [],
+      getEfficiency: () => 0.7,
+      getSelfPath: (path) => app.getSelfPath(path),
+      app,
+    });
+    // Equator noon (daytime). Only the first 3 hours have forecast points;
+    // hours 3+ are beyond the horizon (no matching point).
+    const now = new Date("2026-03-20T12:00:00Z");
+    const forecast = Array.from({ length: 3 }, (_, h) => ({
+      time: new Date(now.getTime() + h * 3600000),
+      ghi: 500,
+      cloudCover: 0,
+      gustSpeedKnots: 25, // >= limit -> stowed at h0..h2
+      windSpeedKnots: 10,
+      windDirectionDeg: null,
+    }));
+    const realNow = Date.now;
+    Date.now = () => now.getTime();
+    try {
+      const hourlyStates = engine.computeDeployableSolarStates(
+        forecast,
+        0,
+        0,
+        now,
+        6,
+        false,
+      );
+      const stateAt = (h) => hourlyStates[h].get("flinsail");
+      // h0: gust 25 >= 20 -> stowed
+      assert.strictEqual(stateAt(0).state, "stowed", "h0 stowed (25 >= 20)");
+      // h3: no forecast -> carry forward stowed, NOT fabricated calm deploy
+      assert.strictEqual(
+        stateAt(3).state,
+        "stowed",
+        "h3 carries forward stowed (no forecast)",
+      );
+      assert.strictEqual(
+        stateAt(3).reason,
+        "no forecast for this hour",
+        "h3 reason is no-forecast",
+      );
+      // No deploy recommendation should mention "0kn" gusts for h3+
+      assert.ok(!stateAt(3).reason.includes("0kn"), "no fabricated 0kn gust");
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test("runPrediction: truncates to forecast horizon, no no-data hours", () => {
+    const app = makeFakeApp();
+    app.setSelfPath("navigation.position", { latitude: 0, longitude: 0 });
+    app.setSelfPath("navigation.state", "moored");
+    // engine defaults to predictionHours=48 (PREDICTION_HOURS). Provide a
+    // forecast that only covers 3 hours — the prediction must truncate to 3,
+    // not emit 48 hours of fabricated 0-knot no-data entries.
+    const engine = new PredictionEngine({
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [
+        withCurve({
+          id: "flinsail",
+          type: "deployable",
+          powerPath: "electrical.solar.flinsail.power",
+          capacityWp: 400,
+          gustLimitKnots: 20,
+          manufacturerCurve: "0,0,20,400",
+        }),
+      ],
+      mechanicalGenerators: [],
+      getEfficiency: () => 0.7,
+      getSelfPath: (path) => app.getSelfPath(path),
+      app,
+    });
+    const now = new Date("2026-03-20T12:00:00Z");
+    const forecast = Array.from({ length: 3 }, (_, h) => ({
+      time: new Date(now.getTime() + h * 3600000),
+      ghi: 500,
+      cloudCover: 0,
+      gustSpeedKnots: 10,
+      windSpeedKnots: 8,
+      windDirectionDeg: null,
+    }));
+    const realNow = Date.now;
+    Date.now = () => now.getTime();
+    try {
+      engine.runPrediction(forecast);
+      assert.strictEqual(
+        engine.lastPrediction.length,
+        3,
+        "prediction truncated to 3h (forecast horizon)",
+      );
+      // No hour 3+ entry should exist (would be no-data noise)
+      assert.ok(
+        !engine.lastPrediction.some((p) => p.hour >= 3),
+        "no no-data hours beyond forecast",
+      );
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
   test("hourly actions: detectedAction null when detected state unknown", () => {
     const app = makeFakeApp();
     app.setSelfPath("navigation.position", {

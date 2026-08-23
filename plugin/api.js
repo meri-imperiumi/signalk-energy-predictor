@@ -1150,6 +1150,44 @@ function buildDeployStates(samples, cycles, from, to) {
   // by the forecast hour (when the action should happen). Collapse across
   // cycles by rounding to the hour and keeping the first, then collapse
   // consecutive same-device same-action advisories into the first.
+  //
+  // Suppress advisories that match the device's current detected state:
+  // recommending "stow" on an already-stowed device (or "deploy" on an
+  // already-deployed one) is noise. The current state is the last known
+  // detected state at/before the advisory time (carried forward across
+  // unknown gaps, same as the detected-transition pass above).
+  const stateTimeline = new Map(); // id -> [{time, state}], sorted
+  for (const s of sorted) {
+    const t = new Date(s.timestamp).getTime();
+    const states = s.deployStates || {};
+    for (const [id, state] of Object.entries(states)) {
+      if (state == null) continue;
+      if (!stateTimeline.has(id)) stateTimeline.set(id, []);
+      const arr = stateTimeline.get(id);
+      if (arr.length === 0 || arr[arr.length - 1].state !== state) {
+        arr.push({ time: t, state });
+      }
+    }
+  }
+  /**
+   * Last known detected state for a device at/before time t (ms).
+   * @returns {string|null|undefined} state, or undefined if unknown
+   */
+  function detectedStateAt(id, tMs) {
+    const arr = stateTimeline.get(id);
+    if (!arr || arr.length === 0) return undefined;
+    // Binary search for the last entry with time <= tMs
+    let lo = 0;
+    let hi = arr.length;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (arr[mid].time <= tMs) lo = mid + 1;
+      else hi = mid;
+    }
+    if (lo === 0) return undefined; // first state is after tMs
+    return arr[lo - 1].state;
+  }
+
   const recsByHour = new Map(); // `${hourTs}|${id}|${action}` -> ev
   for (const cycle of cycles) {
     for (const point of cycle.forecast || []) {
@@ -1170,14 +1208,34 @@ function buildDeployStates(samples, cycles, from, to) {
       }
     }
   }
-  // Collapse consecutive same-device same-action advisories into the first
+  // Collapse consecutive same-device same-action advisories into the first,
+  // and suppress advisories that match the state the device is already in
+  // (or would be in after acting on a prior advisory). The "current ideal
+  // state" per device starts from the last detected state at/before the
+  // advisory time, and is updated by each emitted advisory so a
+  // stow→deploy sequence still shows both (they are real ideal-state
+  // changes), while a steady "already stowed" device gets no "stow" spam.
+  // Detected states are "deployed"/"stowed" (past tense); advisory actions
+  // are "deploy"/"stow" (imperative). Normalize for comparison.
+  const actionToState = { deploy: "deployed", stow: "stowed" };
+  const stateToAction = { deployed: "deploy", stowed: "stow" };
   const recommendations = [];
-  const lastAction = new Map(); // id -> last kept action
+  const idealState = new Map(); // id -> current ideal state (tracked)
   for (const ev of [...recsByHour.values()].sort((a, b) => a.time - b.time)) {
-    if (lastAction.get(ev.id) === ev.action) continue;
-    lastAction.set(ev.id, ev.action);
+    const target = actionToState[ev.action];
+    // Initialize ideal state from detected state the first time we see a
+    // device, at the time of this advisory.
+    if (!idealState.has(ev.id)) {
+      const detected = detectedStateAt(ev.id, ev.time);
+      idealState.set(ev.id, detected || null);
+    }
+    if (idealState.get(ev.id) === target) continue; // no change
+    idealState.set(ev.id, target);
     recommendations.push(ev);
   }
+  // Also collapse: if the first emitted advisory for a device matches the
+  // detected state at its time, it was already filtered above. Consecutive
+  // same-action was handled by the idealState check.
 
   return {
     window: { from: from.toISOString(), to: to.toISOString() },

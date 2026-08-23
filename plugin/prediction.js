@@ -1317,11 +1317,14 @@ class PredictionEngine {
       const lat = pos?.latitude;
       const lon = pos?.longitude;
       for (const point of this.lastForecast) {
-        const gust = point.gustSpeedKnots ?? 0;
+        const gust = point.gustSpeedKnots ?? null;
         // Mirror the hysteresis in computeDeployableSolarStates: a stowed
         // array only deploys once gusts drop below (limit - hysteresis).
         const hysteresis = array.gustHysteresisKnots ?? 2;
         const deployThreshold = gustLimit - hysteresis;
+        // A missing forecast (null gust) is not evidence of calm: skip it
+        // rather than triggering a fabricated deploy/stow.
+        if (gust == null) continue;
         const wouldStow = gust >= gustLimit;
         const wouldDeploy = gust < deployThreshold;
         let changeTime = null;
@@ -1360,16 +1363,22 @@ class PredictionEngine {
       const maxWindKnots = generator.maxWindKnots ?? 30;
       const minDeployWind = generator.startupSpeedKnots ?? 5;
       for (const point of this.lastForecast) {
-        const gust = point.gustSpeedKnots ?? 0;
-        const wind = point.windSpeedKnots ?? 0;
+        const gust = point.gustSpeedKnots ?? null;
+        const wind = point.windSpeedKnots ?? null;
+        // A missing forecast is not evidence of calm: skip it.
+        if (gust == null && wind == null) continue;
         if (currentState === "deployed") {
           // Would stow if gusts exceed limit
-          if (gust >= maxWindKnots) {
+          if (gust != null && gust >= maxWindKnots) {
             return this.toISOString(point.time);
           }
         } else if (currentState === "stowed") {
           // Would deploy if wind ≥ startup and gusts < limit
-          if (wind >= minDeployWind && gust < maxWindKnots) {
+          if (
+            wind != null &&
+            wind >= minDeployWind &&
+            (gust == null || gust < maxWindKnots)
+          ) {
             return this.toISOString(point.time);
           }
         }
@@ -1419,7 +1428,11 @@ class PredictionEngine {
     const deployable = this.solarArrays.filter((a) => a.type === "deployable");
     if (deployable.length === 0) return [];
 
-    // Per-hour sun altitude and matched forecast gust
+    // Per-hour sun altitude and matched forecast gust. A null gust means
+    // no forecast point covers that hour (beyond the horizon or a gap):
+    // it must NOT be treated as calm (0 kn), otherwise the array would
+    // be recommended to deploy on a fabricated windless day. Downstream
+    // logic carries the previous state forward across such hours.
     const hourInfo = [];
     for (let h = 0; h < hours; h++) {
       const time = new Date(startTime.getTime() + h * 3600000);
@@ -1435,28 +1448,34 @@ class PredictionEngine {
       hourInfo.push({
         time,
         isNight: altitude <= 0,
-        gust: fp?.gustSpeedKnots ?? 0,
+        hasForecast: fp != null,
+        gust: fp?.gustSpeedKnots ?? null,
       });
     }
 
-    // Annotate each night hour with its night block's max gust
+    // Annotate each night hour with its night block's max gust. Hours
+    // without a forecast point (null gust) are skipped — a missing forecast
+    // must not count as a calm night (which would wrongly deploy).
     const nightBlockMax = new Array(hours).fill(null);
     let blockStart = -1;
-    let blockMax = 0;
+    let blockMax = null; // null = no forecast seen yet in this block
     const flushBlock = (end) => {
       if (blockStart >= 0) {
         for (let i = blockStart; i < end; i++) nightBlockMax[i] = blockMax;
       }
       blockStart = -1;
-      blockMax = 0;
+      blockMax = null;
     };
     for (let h = 0; h < hours; h++) {
       if (hourInfo[h].isNight) {
         if (blockStart < 0) {
           blockStart = h;
-          blockMax = 0;
+          blockMax = null;
         }
-        blockMax = Math.max(blockMax, hourInfo[h].gust);
+        const g = hourInfo[h].gust;
+        if (g != null) {
+          blockMax = blockMax == null ? g : Math.max(blockMax, g);
+        }
       } else {
         flushBlock(h);
       }
@@ -1482,6 +1501,13 @@ class PredictionEngine {
         if (underway) {
           state = "stowed";
           reason = "vessel under way";
+        } else if (!info.hasForecast) {
+          // No forecast point covers this hour (beyond the horizon or a
+          // gap). Do not fabricate a calm-day deploy: carry the previous
+          // state forward with a neutral reason so no misleading gust
+          // figure is reported.
+          state = prev;
+          reason = "no forecast for this hour";
         } else if (info.isNight) {
           const nightMax = nightBlockMax[h] ?? 0;
           if (nightMax >= gustLimit) {
@@ -1497,6 +1523,11 @@ class PredictionEngine {
             state = prevState.get(array.id) ?? "deployed";
             reason = "no night gusts";
           }
+        } else if (info.gust == null) {
+          // Forecast point exists but carries no gust value: do not
+          // treat as calm. Carry the previous state forward.
+          state = prev;
+          reason = "forecast gust unavailable";
         } else if (info.gust >= gustLimit) {
           state = "stowed";
           reason = `forecast gusts ${Math.round(info.gust)}kn ≥ limit ${gustLimit}kn`;
@@ -1603,15 +1634,24 @@ class PredictionEngine {
               navState === "unknown"
                 ? "vessel nav state unknown"
                 : `cannot deploy while ${navState}`;
-          } else if (gustKnots >= maxWindKnots) {
+          } else if (gustKnots == null && windKnots == null) {
+            // No forecast point covers this hour (beyond the horizon or a
+            // gap). Do not fabricate a calm-day stow/deploy: carry the
+            // previous state forward with a neutral reason.
+            idealState = "deployed"; // carry-forward handled by caller's prevIdealStates
+            reason = "no forecast for this hour";
+          } else if (gustKnots != null && gustKnots >= maxWindKnots) {
             idealState = "stowed";
             reason = `forecast gusts ${Math.round(gustKnots)}kn ≥ limit ${maxWindKnots}kn`;
-          } else if (windKnots >= minDeployWind) {
+          } else if (windKnots != null && windKnots >= minDeployWind) {
             idealState = "deployed";
             reason = `forecast wind ${Math.round(windKnots)}kn ≥ startup ${minDeployWind}kn`;
           } else {
             idealState = "stowed";
-            reason = `forecast wind ${Math.round(windKnots)}kn < startup ${minDeployWind}kn`;
+            reason =
+              windKnots != null
+                ? `forecast wind ${Math.round(windKnots)}kn < startup ${minDeployWind}kn`
+                : "forecast wind unavailable";
           }
         }
       } else if (generator.type === "hydro") {
@@ -1964,12 +2004,16 @@ class PredictionEngine {
       this.app?.debug?.(
         `  forecast[0]: ${forecast[0].time.toISOString()} ghi=${forecast[0].ghi}`,
       );
-      this.app?.debug?.(
-        `  forecast[12]: ${forecast[12].time.toISOString()} ghi=${forecast[12].ghi}`,
-      );
-      this.app?.debug?.(
-        `  forecast[24]: ${forecast[24]?.time.toISOString()} ghi=${forecast[24]?.ghi}`,
-      );
+      if (forecast[12]) {
+        this.app?.debug?.(
+          `  forecast[12]: ${forecast[12].time.toISOString()} ghi=${forecast[12].ghi}`,
+        );
+      }
+      if (forecast[24]) {
+        this.app?.debug?.(
+          `  forecast[24]: ${forecast[24].time.toISOString()} ghi=${forecast[24].ghi}`,
+        );
+      }
     }
 
     const startTime = new Date(Date.now());
@@ -1990,18 +2034,36 @@ class PredictionEngine {
       this.applyWindProtection(fp, latitude, longitude),
     );
 
+    // Cap the prediction to the forecast horizon. Hours beyond the last
+    // forecast point carry no real wind/gust data and only fabricate 0s
+    // plus load estimates — they are noise, not predictions. If the
+    // forecast is empty, fall back to the configured predictionHours so
+    // the SoC projection still runs (load-only forecast).
+    let effectiveHours = this.predictionHours;
+    if (correctedForecast.length > 0) {
+      // Cap to the number of forecast points. Forecast points are hourly;
+      // a prediction hour needs a matching point (within 30 min) to carry
+      // real wind/gust data. Hours beyond the last point are no-data noise.
+      if (correctedForecast.length < effectiveHours) {
+        effectiveHours = correctedForecast.length;
+        this.app?.debug?.(
+          `  capping prediction to ${effectiveHours}h (forecast has ${correctedForecast.length}pts of ${this.predictionHours}h)`,
+        );
+      }
+    }
+
     // Deployable solar states with sunrise/sunset-aware night handling
     const solarStatesPerHour = this.computeDeployableSolarStates(
       correctedForecast,
       latitude,
       longitude,
       startTime,
-      this.predictionHours,
+      effectiveHours,
       underway,
     );
     this.app?.debug?.(`  prediction[0]: ${startTime.toISOString()}`);
 
-    for (let h = 0; h < this.predictionHours; h++) {
+    for (let h = 0; h < effectiveHours; h++) {
       const time = new Date(startTime.getTime() + h * 3600000);
 
       // Find corresponding forecast point (use the WPF-corrected forecast
@@ -2020,8 +2082,13 @@ class PredictionEngine {
 
       const ghi = forecastPoint?.ghi ?? 0;
       const cloudCover = forecastPoint?.cloudCover ?? 0;
-      const windGustKnots = forecastPoint?.gustSpeedKnots ?? 0;
-      const windSpeedKnots = forecastPoint?.windSpeedKnots ?? 0;
+      // Wind/gust default to null (not 0) when no forecast point covers
+      // this hour: a missing forecast must not be treated as calm, otherwise
+      // wind generators would be recommended to stow with "0kn < startup"
+      // and the gust gate would fabricate a calm day. Downstream consumers
+      // (predictWindHour, getHourlyActions) treat null as no-data.
+      const windGustKnots = forecastPoint?.gustSpeedKnots ?? null;
+      const windSpeedKnots = forecastPoint?.windSpeedKnots ?? null;
       const forecastWindSpeedKnots =
         rawPoint?.windSpeedKnots != null
           ? Math.round((rawPoint.windSpeedKnots || 0) * 10) / 10
@@ -2084,7 +2151,7 @@ class PredictionEngine {
         if (h === 12 || h === 22) {
           const extra =
             array.type === "deployable"
-              ? ` gust=${windGustKnots.toFixed(0)}kn limit=${array.gustLimitKnots ?? "n/a"}kn`
+              ? ` gust=${windGustKnots != null ? windGustKnots.toFixed(0) : "n/a"}kn limit=${array.gustLimitKnots ?? "n/a"}kn`
               : "";
           this.app?.debug?.(
             `  h=${h} array=${array.id}: alt=${((sunPos.altitude * 180) / Math.PI).toFixed(1)}° ghi=${ghi.toFixed(0)} eff=${efficiency.toFixed(2)} cap=${array.capacityWp}Wp yield=${arrayYield.toFixed(1)}Wh${extra}`,

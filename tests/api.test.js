@@ -745,3 +745,85 @@ test("buildDeployStates: prior state from before window suppresses first-entry e
     ],
   );
 });
+
+test("buildDeployStates: suppresses recommendations matching current detected state", () => {
+  // superwind is stowed (moored, not deployable). flinsail is deployed.
+  // At night flinsail reads 0 W so its deploy state is absent from recent
+  // samples — the carried-forward state from the last daylight sample
+  // (deployed) must still suppress a redundant "deploy" recommendation.
+  const from = new Date("2026-08-23T00:00:00Z");
+  const to = new Date("2026-08-25T00:00:00Z");
+  const samples = [
+    {
+      // Last daylight sample: flinsail deployed, superwind stowed.
+      timestamp: "2026-08-23T04:25:00.000Z",
+      deployStates: { flinsail: "deployed", superwind: "stowed" },
+    },
+    // Night samples: no flinsail entry (0 W, dark). superwind stays stowed.
+    {
+      timestamp: "2026-08-23T21:00:00.000Z",
+      deployStates: { superwind: "stowed" },
+    },
+    {
+      timestamp: "2026-08-24T00:00:00.000Z",
+      deployStates: { superwind: "stowed" },
+    },
+  ];
+  const cycles = [
+    {
+      timestamp: "2026-08-23T05:00:00.000Z",
+      forecast: [
+        {
+          time: "2026-08-23T05:00:00.000Z",
+          actions: [
+            // superwind already stowed -> suppress.
+            {
+              id: "superwind",
+              idealAction: "stow",
+              reason: "cannot deploy while moored",
+            },
+            // flinsail already deployed -> suppress.
+            { id: "flinsail", idealAction: "deploy", reason: "no night gusts" },
+          ],
+        },
+        {
+          time: "2026-08-23T21:00:00.000Z",
+          actions: [
+            // flinsail should stow (gusts) -> real change, keep.
+            {
+              id: "flinsail",
+              idealAction: "stow",
+              reason: "forecast gusts 21kn >= limit 20kn",
+            },
+          ],
+        },
+        {
+          time: "2026-08-24T00:00:00.000Z",
+          actions: [
+            // flinsail should deploy again (gusts drop) -> real change, keep.
+            {
+              id: "flinsail",
+              idealAction: "deploy",
+              reason: "forecast gusts 12kn < limit 20kn",
+            },
+          ],
+        },
+      ],
+    },
+  ];
+  const res = buildDeployStates(samples, cycles, from, to);
+  // Only the genuine ideal-state changes: stow at 21:00, deploy at 00:00.
+  // The redundant "stow superwind" and "deploy flinsail" at 05:00 are
+  // suppressed because those devices are already in that state.
+  assert.deepStrictEqual(
+    res.recommendations.map((r) => ({
+      time: new Date(r.time).toISOString(),
+      id: r.id,
+      action: r.action,
+    })),
+    [
+      { time: "2026-08-23T21:00:00.000Z", id: "flinsail", action: "stow" },
+      { time: "2026-08-24T00:00:00.000Z", id: "flinsail", action: "deploy" },
+    ],
+  );
+});
