@@ -95,6 +95,23 @@ test("chart overlays retro-predicted when no recorded cycle covers the window", 
   assert.match(source, /retroPredicted\?\.points/);
   // Period model: aggregates retro-predicted hourly points to daily totals
   assert.match(source, /retroPredicted\.points/);
+  // Per-day fallback (not all-or-nothing): the current month has recorded
+  // cycles only from today forward, so its past days must still pull
+  // predicted Wh from retro-predicted. Recorded days stay authoritative.
+  assert.match(source, /if \(!predByDay\.has\(date\)\) \{/);
+});
+
+test("chart draws predicted lines dashed in week/month view", () => {
+  const source = readFileSync(
+    path.join(PUBLIC_DIR, "ep-timeline-chart.js"),
+    "utf8",
+  );
+  // renderLines (used for the period view's soc/socPred/windKn lines) must
+  // honor the predicted flag with a dashed stroke, matching renderDaySeries
+  assert.match(
+    source,
+    /"stroke-dasharray": def\.predicted \? "5 4" : undefined/,
+  );
 });
 
 test("chart stitches retro-predicted into the current day's past and anchors predicted SoC", () => {
@@ -125,6 +142,34 @@ test("window selector exposes Today and hash-based navigation", () => {
   assert.match(source, /loadHash/);
   assert.match(source, /saveHash/);
   assert.match(source, /hashchange/);
+});
+
+test("window selector spans calendar weeks (Mon–Sun) and months (1st–last)", () => {
+  const source = readFileSync(
+    path.join(PUBLIC_DIR, "ep-window-selector.js"),
+    "utf8",
+  );
+  // Week window starts on Monday: anchor shifted back to the week's Monday
+  assert.match(source, /MONDAY = 1/);
+  assert.match(source, /anchor\.getDay\(\) - MONDAY/);
+  // Month window starts on the 1st and ends on the 1st of the next month
+  // (handles variable month length and the Dec→Jan roll)
+  assert.match(
+    source,
+    /new Date\(anchor\.getFullYear\(\), anchor\.getMonth\(\), 1\)/,
+  );
+  assert.match(
+    source,
+    /new Date\(start\.getFullYear\(\), start\.getMonth\(\) \+ 1, 1\)/,
+  );
+  // Month stepping moves by calendar month, not a fixed 30 days
+  assert.match(
+    source,
+    /new Date\(anchor\.getFullYear\(\), anchor\.getMonth\(\) \+ direction, 1\)/,
+  );
+  // The fixed-span modeDays helper is gone (it produced 30-day "months")
+  assert.doesNotMatch(source, /modeDays/);
+  assert.doesNotMatch(source, /30;/);
 });
 
 test("chart shows hydro actual and hydro predicted series", () => {
@@ -160,9 +205,18 @@ test("chart clips predicted SoC to now so the line is not drawn in the past", ()
   assert.match(source, /p\.predSoC != null && p\.t >= Date\.now\(\)/);
   // Week/month view: a day's predicted SoC is suppressed when the whole day
   // is in the past, so the line never retroactively fills recorded history
-  assert.match(
-    source,
-    /localDayStart\(b\.day\) \+ 24 \* 3600000 > Date\.now\(\)/,
+  assert.match(source, /localDayStart\(day\) \+ 24 \* 3600000 > Date\.now\(\)/);
+  // Regression guard: the allDays.map((day) => ...) callback must not
+  // reference the bare `b` variable (it was the cause of "Can't find
+  // variable: b" when opening week/month, since the parameter is `day`).
+  const periodBlock = source.match(
+    /allDays\.map\(\(day\) => \{[\s\S]*?\n {6}\};\n {4}\}\);/,
+  );
+  assert.ok(periodBlock, "expected the allDays.map((day) => ...) block");
+  assert.doesNotMatch(
+    periodBlock[0],
+    /\bb\.day\b/,
+    "period builder must use the `day` parameter, not the undefined `b`",
   );
 });
 

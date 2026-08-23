@@ -5,6 +5,15 @@
  * Windows are anchored to the browser's local midnight so "a day" is the
  * user's actual day; the API receives UTC ISO timestamps as usual.
  *
+ * - Day: a single calendar day.
+ * - Week: Monday to Sunday (the week containing the anchor date).
+ * - Month: the 1st to the last day of the calendar month containing the
+ *   anchor date.
+ *
+ * Stepping (prev/next) and "Today" move by whole calendar units, so a
+ * month steps to the previous/next calendar month and a week steps to
+ * the previous/next Monday-anchored week.
+ *
  * The selected preset persists in localStorage (ep:prefs) so the webapp
  * reopens on the last used window.
  */
@@ -13,19 +22,76 @@ const MODES = /** @type {const} */ (["day", "week", "month"]);
 /** Milliseconds per day */
 const MS_PER_DAY = 24 * 3600000;
 
+/** JS getDay(): 0 = Sunday … 6 = Saturday; Monday is day 1. */
+const MONDAY = 1;
+
 /**
- * Window span in days for each mode.
+ * Local-midnight start of the day, week, or month containing the anchor.
+ *
+ * `anchor` is the user's picked/stepped date at local midnight. The
+ * returned start is also local midnight and is the inclusive lower bound
+ * of the window.
  * @param {string} mode
- * @returns {number}
+ * @param {Date} anchor - local midnight
+ * @returns {Date}
  */
-function modeDays(mode) {
+function windowStart(mode, anchor) {
   if (mode === "week") {
-    return 7;
+    // Shift back to Monday: (day - 1 + 7) % 7 days from Sunday, but JS
+    // weeks start on Sunday so Monday is day 1.
+    const offset = (anchor.getDay() - MONDAY + 7) % 7;
+    return new Date(
+      anchor.getFullYear(),
+      anchor.getMonth(),
+      anchor.getDate() - offset,
+    );
   }
   if (mode === "month") {
-    return 30;
+    return new Date(anchor.getFullYear(), anchor.getMonth(), 1);
   }
-  return 1;
+  return new Date(anchor.getFullYear(), anchor.getMonth(), anchor.getDate());
+}
+
+/**
+ * Exclusive upper bound (local midnight) of the window starting at `start`.
+ * @param {string} mode
+ * @param {Date} start - local-midnight window start
+ * @returns {Date}
+ */
+function windowEnd(mode, start) {
+  if (mode === "week") {
+    return new Date(start.getTime() + 7 * MS_PER_DAY);
+  }
+  if (mode === "month") {
+    // First day of the following month (handles month-length and year roll)
+    return new Date(start.getFullYear(), start.getMonth() + 1, 1);
+  }
+  return new Date(start.getTime() + MS_PER_DAY);
+}
+
+/**
+ * Anchor date one calendar unit away from `anchor` in `direction`.
+ * @param {string} mode
+ * @param {Date} anchor - local midnight
+ * @param {number} direction - +1 forward, -1 back
+ * @returns {Date}
+ */
+function stepAnchor(mode, anchor, direction) {
+  if (mode === "week") {
+    return new Date(
+      anchor.getFullYear(),
+      anchor.getMonth(),
+      anchor.getDate() + 7 * direction,
+    );
+  }
+  if (mode === "month") {
+    return new Date(anchor.getFullYear(), anchor.getMonth() + direction, 1);
+  }
+  return new Date(
+    anchor.getFullYear(),
+    anchor.getMonth(),
+    anchor.getDate() + direction,
+  );
 }
 
 class EpWindowSelector extends HTMLElement {
@@ -108,11 +174,12 @@ class EpWindowSelector extends HTMLElement {
 
   /** @returns {{mode: string, from: string, to: string}} */
   windowSpec() {
-    const days = modeDays(this.mode);
+    const start = windowStart(this.mode, this.from);
+    const end = windowEnd(this.mode, start);
     return {
       mode: this.mode,
-      from: this.from.toISOString(),
-      to: new Date(this.from.getTime() + days * MS_PER_DAY).toISOString(),
+      from: start.toISOString(),
+      to: end.toISOString(),
     };
   }
 
@@ -139,16 +206,12 @@ class EpWindowSelector extends HTMLElement {
   }
 
   /**
-   * Steps the window by whole days, keeping the local-midnight anchor.
+   * Steps the window by one calendar unit (day / week / month), keeping
+   * the local-midnight anchor.
    * @param {number} direction - +1 forward, -1 back
    */
   step(direction) {
-    const days = modeDays(this.mode) * direction;
-    this.from = new Date(
-      this.from.getFullYear(),
-      this.from.getMonth(),
-      this.from.getDate() + days,
-    );
+    this.from = stepAnchor(this.mode, this.from, direction);
     this.render();
     this.emit();
   }
@@ -214,4 +277,4 @@ class EpWindowSelector extends HTMLElement {
 
 customElements.define("ep-window-selector", EpWindowSelector);
 
-export { EpWindowSelector, modeDays };
+export { EpWindowSelector };

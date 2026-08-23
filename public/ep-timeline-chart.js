@@ -523,9 +523,12 @@ class EpTimelineChart extends HTMLElement {
     }
 
     const predByDay = new Map(days.map((d) => [d.date, d]));
-    // Fall back to retro-predicted hourly points aggregated to daily totals
-    // when no recorded prediction days cover the window.
-    if (days.length === 0 && retroPredicted?.points) {
+    // Fill predicted Wh for days the recorded cycles don't cover from
+    // retro-predicted hourly points aggregated to daily totals. Past months
+    // have no recorded cycles so every day falls back here; the current
+    // month has cycles only from today forward, so its past days fall back
+    // here too — otherwise those days would show zero predicted bars.
+    if (retroPredicted?.points) {
       const retroDaily = new Map();
       for (const hour of retroPredicted.points) {
         const day = localDayKey(new Date(hour.time).getTime());
@@ -545,7 +548,11 @@ class EpTimelineChart extends HTMLElement {
         entry.hydroWh = Math.round(entry.hydroWh);
       }
       for (const [date, entry] of retroDaily) {
-        predByDay.set(date, entry);
+        // Don't clobber a recorded prediction day (the freshest cycle's
+        // forecast is authoritative for the days it covers)
+        if (!predByDay.has(date)) {
+          predByDay.set(date, entry);
+        }
       }
     }
     const allDays = Array.from(
@@ -574,7 +581,7 @@ class EpTimelineChart extends HTMLElement {
         hydroPred: predHydro,
         soc: actual.socCount > 0 ? actual.socSum / actual.socCount : null,
         socPred:
-          pred?.soc != null && localDayStart(b.day) + 24 * 3600000 > Date.now()
+          pred?.soc != null && localDayStart(day) + 24 * 3600000 > Date.now()
             ? pred.soc * 100
             : null,
         windKn: actual.windCount > 0 ? actual.windSum / actual.windCount : null,
@@ -923,7 +930,9 @@ class EpTimelineChart extends HTMLElement {
           d: path,
           fill: "none",
           stroke: def.color,
-          "stroke-width": 2,
+          "stroke-width": def.predicted ? 1.5 : 2,
+          "stroke-dasharray": def.predicted ? "5 4" : undefined,
+          opacity: def.predicted ? 0.75 : 1,
         }),
       );
     }
