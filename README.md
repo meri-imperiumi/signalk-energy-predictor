@@ -7,6 +7,7 @@ Weather forecasts can come from online insolation services, local GRIB files, or
 In addition to forecasting, the plugin tries to identify and notify user of significant events. It can detect an approaching energy surplus or deficit, predict when the battery will reach float, and alert you when conditions require deployable equipment to be stowed, such as taking down a FLINsail before a gale.
 
 ![Analysis for a sailing day](https://github.com/meri-imperiumi/signalk-energy-predictor/raw/main/doc/webapp-day.png)
+![Predictions for the next day](https://github.com/meri-imperiumi/signalk-energy-predictor/raw/main/doc/webapp-future.png)
 
 ## Features
 

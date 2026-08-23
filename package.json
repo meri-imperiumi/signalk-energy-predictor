@@ -30,6 +30,7 @@
     "appIcon": "./icon.png",
     "screenshots": [
       "./doc/webapp-day.png",
+      "./doc/webapp-future.png",
       "./doc/webapp-month.png"
     ],
     "requires": [
