@@ -839,8 +839,8 @@ class AdvisoryPublisher {
   }
 
   /**
-   * Checks whether an opportunistic load is already running, so the
-   * surplus advisory doesn't suggest turning on something that's already
+   * Checks whether an opportunistic load is already running, so a richer
+   * suggestion surface (e.g. the webapp) can skip loads that are already
    * consuming power (e.g. Starlink online, watermaker started).
    *
    * Detection is optional: a load without a `statePath` is never
@@ -916,25 +916,6 @@ class AdvisoryPublisher {
       let message = `${formatWh(opportunity.surplusWh)} surplus available ${from}-${to}`;
       if (opportunity.suggestedLoadW > 0) {
         message += ` (~${opportunity.suggestedLoadW}W sustained)`;
-      }
-      // Suggest uses from the configured opportunistic-loads list.
-      // Skip loads already running (e.g. Starlink online, watermaker
-      // started) — there's no point suggesting you turn on what's on.
-      const usable = opportunisticLoads.filter(
-        (l) =>
-          l.watts > 0 &&
-          opportunity.suggestedLoadW > 0 &&
-          !this.isLoadRunning(l),
-      );
-      if (usable.length > 0) {
-        const suggestions = usable
-          .slice(0, 3)
-          .map((l) => {
-            const hours = Math.floor(opportunity.surplusWh / l.watts);
-            return `${l.name} (${l.watts}W) for ~${hours}h`;
-          })
-          .join(", ");
-        message += `: ${suggestions}`;
       }
       let urgency = calculateUrgency({
         advisoryType: "opportunity",

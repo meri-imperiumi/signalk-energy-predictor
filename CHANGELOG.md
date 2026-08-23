@@ -8,6 +8,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- The surplus-energy notification no longer lists per-load consumption
+  suggestions (e.g. "Watermaker (150W) for ~8h"); it now just reports
+  when the surplus window happens and how much energy is available
+  (plus the sustained wattage). The opportunistic-loads configuration and
+  the `AdvisoryPublisher.isLoadRunning` helper are retained for a richer
+  suggestion surface in the webapp.
 - Uplink status for forecast fetch cadence now reads the Signal K
   `network.internet.state` path (provided by the required
   `signalk-internet` plugin) instead of the Starlink-specific

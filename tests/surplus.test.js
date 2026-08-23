@@ -381,7 +381,7 @@ test.describe("publishSurplusAdvisory", () => {
       .filter((v) => v.path.startsWith(pathPrefix));
   }
 
-  test("publishes a warn notification with window, Wh, and suggested load", () => {
+  test("publishes a warn notification with window and Wh amount", () => {
     const app = makeFakeApp();
     const pub = new AdvisoryPublisher(app, "test-plugin");
     // Window starting ~1h out lands at medium urgency (warn) regardless of
@@ -400,7 +400,9 @@ test.describe("publishSurplusAdvisory", () => {
     assert.strictEqual(n.value.state, "warn");
     assert.match(n.value.message, /1\.2kWh surplus available/);
     assert.match(n.value.message, /~240W sustained/);
-    assert.match(n.value.message, /Watermaker \(150W\) for ~8h/);
+    // Consumption suggestions are no longer part of the notification — it
+    // just reports when the surplus happens and how much there is.
+    assert.doesNotMatch(n.value.message, /Watermaker/);
   });
 
   test("marks the end time when the surplus window spans midnight", () => {
@@ -465,9 +467,9 @@ test.describe("publishSurplusAdvisory", () => {
     assert.strictEqual(wh[wh.length - 1].value, 0);
   });
 
-  test("skips opportunistic loads that are already running (string state)", () => {
+  test("no longer mentions opportunistic loads (string state)", () => {
     const app = makeFakeApp();
-    // Starlink is online → already consuming, should be skipped
+    // Starlink is online — irrelevant now, the message never names loads.
     app.setSelfPath("network.providers.starlink.status", "online");
     const pub = new AdvisoryPublisher(app, "test-plugin");
     const from = new Date("2026-06-21T11:00:00Z");
@@ -489,12 +491,13 @@ test.describe("publishSurplusAdvisory", () => {
     );
     assert.ok(n);
     assert.doesNotMatch(n.value.message, /Starlink/);
-    assert.match(n.value.message, /Watermaker/);
+    assert.doesNotMatch(n.value.message, /Watermaker/);
   });
 
-  test("skips opportunistic loads that are already running (boolean digital switching)", () => {
+  test("no longer mentions opportunistic loads (boolean digital switching)", () => {
     const app = makeFakeApp();
-    // Watermaker on a digital-switching boolean that is true → running
+    // Watermaker on a digital-switching boolean that is true — irrelevant
+    // now, the message never names loads.
     app.setSelfPath("electrical.switches.watermaker.state", true);
     const pub = new AdvisoryPublisher(app, "test-plugin");
     const from = new Date("2026-06-21T11:00:00Z");
@@ -516,10 +519,10 @@ test.describe("publishSurplusAdvisory", () => {
     );
     assert.ok(n);
     assert.doesNotMatch(n.value.message, /Watermaker/);
-    assert.match(n.value.message, /Ice maker/);
+    assert.doesNotMatch(n.value.message, /Ice maker/);
   });
 
-  test("does not skip a load whose boolean is false (off)", () => {
+  test("no longer mentions a load whose boolean is false (off)", () => {
     const app = makeFakeApp();
     app.setSelfPath("electrical.switches.watermaker.state", false);
     const pub = new AdvisoryPublisher(app, "test-plugin");
@@ -540,10 +543,10 @@ test.describe("publishSurplusAdvisory", () => {
       v.path.startsWith("notifications.electrical.energy.surplus"),
     );
     assert.ok(n);
-    assert.match(n.value.message, /Watermaker/);
+    assert.doesNotMatch(n.value.message, /Watermaker/);
   });
 
-  test("loads without a statePath are always candidates", () => {
+  test("no longer mentions loads without a statePath", () => {
     const app = makeFakeApp();
     const pub = new AdvisoryPublisher(app, "test-plugin");
     const from = new Date("2026-06-21T11:00:00Z");
@@ -557,6 +560,6 @@ test.describe("publishSurplusAdvisory", () => {
       v.path.startsWith("notifications.electrical.energy.surplus"),
     );
     assert.ok(n);
-    assert.match(n.value.message, /Ice maker/);
+    assert.doesNotMatch(n.value.message, /Ice maker/);
   });
 });
