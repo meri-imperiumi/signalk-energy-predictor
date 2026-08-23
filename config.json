@@ -499,6 +499,81 @@
           "maximum": 10
         }
       }
+    },
+    "surplus": {
+      "type": "object",
+      "title": "Surplus Energy Alerting",
+      "description": "Notify when the battery is forecast full while yield continues, so the charge controller would curtail energy that could run opportunistic loads (watermaker, ice maker). Includes the motoring side-effect case (arriving by motor at midday with hours of sun left)",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "title": "Enable Surplus Alerting",
+          "description": "Publish a surplus-energy opportunity notification and Signal K value when the battery is forecast full with yield to spare",
+          "default": true
+        },
+        "fullThreshold": {
+          "type": "number",
+          "title": "Full Threshold",
+          "description": "SoC at which the bank is considered full (absorption/full), 0-1",
+          "default": 0.95,
+          "minimum": 0.8,
+          "maximum": 1
+        },
+        "minSurplusWh": {
+          "type": "number",
+          "title": "Minimum Surplus (Wh)",
+          "description": "Minimum wasted-potential energy required to trigger an alert. Below this the surplus is too small to act on",
+          "default": 300,
+          "minimum": 0
+        },
+        "maxLeadHours": {
+          "type": "number",
+          "title": "Max Lead Time (hours)",
+          "description": "Only alert for surplus windows starting within this many hours. Beyond that, forecast uncertainty makes the alert noise",
+          "default": 36,
+          "minimum": 24,
+          "maximum": 48
+        },
+        "opportunisticLoads": {
+          "type": "array",
+          "title": "Opportunistic Loads",
+          "description": "Loads that can usefully consume surplus energy. Shown as suggestions in the alert message. Advisory-only — no load switching",
+          "items": {
+            "type": "object",
+            "properties": {
+              "name": {
+                "type": "string",
+                "title": "Name",
+                "description": "e.g. Watermaker, Ice maker, Starlink",
+                "default": "Watermaker"
+              },
+              "watts": {
+                "type": "number",
+                "title": "Typical Power (W)",
+                "description": "Typical draw when running, used to estimate how long the surplus could run it",
+                "default": 150,
+                "minimum": 1
+              },
+              "statePath": {
+                "type": "string",
+                "title": "State Path (optional)",
+                "description": "Signal K path indicating whether this load is already running. A boolean true (digital switching) or a string matching onValues means running; the load is then not suggested as a surplus use since it is already consuming power. Leave blank for loads that aren't instrumented",
+                "default": ""
+              },
+              "onValues": {
+                "type": "string",
+                "title": "On Values (optional)",
+                "description": "Comma-separated values at statePath that mean the load is running, e.g. 'online,started,on'. Defaults to 'started,on,online,running,active'",
+                "default": "started,on,online,running,active"
+              }
+            },
+            "required": [
+              "name",
+              "watts"
+            ]
+          }
+        }
+      }
     }
   },
   "required": [

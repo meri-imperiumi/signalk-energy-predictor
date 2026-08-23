@@ -33,6 +33,7 @@ const AdvisoryType = {
   TIME_TO_FULL: "time_to_full",
   TIME_TO_EMPTY: "time_to_empty",
   DEPLOY_INFO: "deploy_info",
+  SURPLUS_OPPORTUNITY: "surplus",
 };
 
 /**
@@ -551,6 +552,121 @@ class AdvisoryPublisher {
   }
 
   /**
+   * Checks whether an opportunistic load is already running, so the
+   * surplus advisory doesn't suggest turning on something that's already
+   * consuming power (e.g. Starlink online, watermaker started).
+   *
+   * Detection is optional: a load without a `statePath` is never
+   * considered running (we have no signal), so it's always a candidate.
+   * Loads that are instrumented but whose state can't be read or whose
+   * value is null/unknown are also treated as not-running — we only
+   * suppress a suggestion when we have a positive "it's on" reading.
+   *
+   * @param {{statePath?: string, onValues?: string}} load - Load config
+   * @returns {boolean} True if the load is detected as running
+   */
+  isLoadRunning(load) {
+    if (!load.statePath) return false;
+    const raw = this.app.getSelfPath
+      ? this.app.getSelfPath(load.statePath)
+      : null;
+    if (raw == null) return false;
+    // Tolerate both bare values and {value: ...} wrapper objects
+    const v =
+      typeof raw === "object" && raw != null && "value" in raw
+        ? raw.value
+        : raw;
+    if (v == null) return false;
+    // Digital-switching loads expose a boolean: true means running,
+    // false means off. String state paths (e.g. Starlink
+    // "online") go through the onValues check below.
+    if (typeof v === "boolean") return v;
+    const s = String(v).toLowerCase().trim();
+    if (s === "") return false;
+    const onValues =
+      load.onValues != null && load.onValues !== ""
+        ? load.onValues
+        : "started,on,online,running,active";
+    const accepted = onValues
+      .toLowerCase()
+      .split(",")
+      .map((x) => x.trim())
+      .filter((x) => x !== "");
+    return accepted.includes(s);
+  }
+
+  /**
+   * Publishes a surplus-energy opportunity advisory: the battery is
+   * forecast full while yield continues, so the charge controller would
+   * curtail energy that could instead run opportunistic loads (watermaker,
+   * ice maker, …). Includes the classic motoring side-effect case.
+   *
+   * @param {{surplusWh: number, from: Date, to: Date, suggestedLoadW: number}|null} opportunity -
+   *        Surplus window from findSurplusOpportunity, or null to clear
+   * @param {Array<{name: string, watts: number}>} [opportunisticLoads] -
+   *        Configured loads used to suggest uses for the surplus
+   * @returns {void}
+   */
+  publishSurplusAdvisory(opportunity, opportunisticLoads = []) {
+    const type = AdvisoryType.SURPLUS_OPPORTUNITY;
+
+    if (opportunity) {
+      const from = opportunity.from.toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+      });
+      const to = opportunity.to.toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+      });
+      let message = `${formatWh(opportunity.surplusWh)} surplus available ${from}-${to}`;
+      if (opportunity.suggestedLoadW > 0) {
+        message += ` (~${opportunity.suggestedLoadW}W sustained)`;
+      }
+      // Suggest uses from the configured opportunistic-loads list.
+      // Skip loads already running (e.g. Starlink online, watermaker
+      // started) — there's no point suggesting you turn on what's on.
+      const usable = opportunisticLoads.filter(
+        (l) =>
+          l.watts > 0 &&
+          opportunity.suggestedLoadW > 0 &&
+          !this.isLoadRunning(l),
+      );
+      if (usable.length > 0) {
+        const suggestions = usable
+          .slice(0, 3)
+          .map((l) => {
+            const hours = Math.floor(opportunity.surplusWh / l.watts);
+            return `${l.name} (${l.watts}W) for ~${hours}h`;
+          })
+          .join(", ");
+        message += `: ${suggestions}`;
+      }
+      this.publishNotification(type, DeployState.WARN, message);
+      // Also expose the value as a delta so consumers can act without
+      // parsing the notification.
+      this.publishDelta({
+        [`${PREDICTION_BASE}.surplusWh`]: opportunity.surplusWh,
+        [`${PREDICTION_BASE}.surplus.from`]: opportunity.from.toISOString(),
+        [`${PREDICTION_BASE}.surplus.to`]: opportunity.to.toISOString(),
+      });
+    } else {
+      this.publishNotification(
+        type,
+        DeployState.NORMAL,
+        "No surplus opportunity",
+      );
+      this.publishDelta({
+        [`${PREDICTION_BASE}.surplusWh`]: 0,
+        [`${PREDICTION_BASE}.surplus.from`]: null,
+        [`${PREDICTION_BASE}.surplus.to`]: null,
+      });
+    }
+  }
+
+  /**
    * Publishes all advisories based on prediction results.
    *
    * @param {object} params
@@ -569,6 +685,8 @@ class AdvisoryPublisher {
     timeToEmpty,
     stowageOpportunity,
     engineRunTime,
+    surplusOpportunity,
+    opportunisticLoads = [],
     deploymentRecommendations = [],
     currentDeployStates = new Map(),
   }) {
@@ -591,6 +709,10 @@ class AdvisoryPublisher {
 
     // Publish engine run advisory
     this.publishEngineRunAdvisory(engineRunTime);
+
+    // Publish surplus opportunity advisory (battery full while yield
+    // continues — watermaker/ice-maker case; motoring side-effect)
+    this.publishSurplusAdvisory(surplusOpportunity, opportunisticLoads);
 
     this.app.debug(
       `Advisories published: ${this.activeNotifications.size} active notifications`,

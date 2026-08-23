@@ -891,4 +891,100 @@ test.describe("Solar learning regression", () => {
 
     await plugin.stop();
   });
+
+  test("night gate skips the whole learning cycle when the sun is below the horizon", async () => {
+    // At night GHI is 0 and every panel reads 0W, so there is nothing to
+    // learn. The cycle must short-circuit before fetching GHI or iterating
+    // arrays — otherwise it emits a wall of "skipping" debug lines per
+    // solar-power delta all night long. We assert the cycle runs zero times
+    // (learningCycleCount stays 0) and no matrix bin is ever populated.
+    const app = new FakeSignalKApp();
+    const plugin = makePlugin(app);
+    const testDir = await mkdtemp(join(tmpdir(), "night-gate-"));
+
+    // Position at the local-midnight meridian on the equator, so the sun
+    // is well below the horizon regardless of when the test runs (the
+    // inverse of the local-noon trick used by the other learning tests).
+    const now = new Date();
+    const utcHours = now.getUTCHours() + now.getUTCMinutes() / 60;
+    const longitude = (0 - utcHours) * 15;
+    const latitude = 0;
+
+    const powerPath = "electrical.solar.cabin-roof.panelPower";
+    const config = {
+      battery: {
+        capacityAh: 400,
+        systemVoltage: 12,
+        minSafeSoC: 0.2,
+        socPath: "electrical.batteries.house.capacity.stateOfCharge",
+      },
+      solarArrays: [
+        {
+          id: "cabin-roof",
+          type: "fixed",
+          capacityWp: 200,
+          powerPath,
+          enabled: true,
+        },
+      ],
+      mechanicalGenerators: [],
+      learning: {
+        enabled: true,
+        minIntervalSeconds: 1,
+      },
+      weather: {
+        openMeteoEnabled: false,
+        useLogbook: false,
+      },
+    };
+
+    app.dataPath = testDir;
+    await plugin.start(config, () => {});
+
+    // Sanity: the sun really is below the horizon at this position/time.
+    const { sunPosition } = require("../plugin/solar.js");
+    const sunPos = sunPosition(new Date(), latitude, longitude);
+    assert.ok(
+      sunPos.altitude <= 0,
+      `test premise: sun below horizon (got ${sunPos.altitude.toFixed(3)} rad)`,
+    );
+
+    app.subscriptionmanager.subscriptions.forEach(({ deltaHandler }) => {
+      deltaHandler({
+        context: app.selfId,
+        updates: [
+          {
+            values: [
+              { path: "navigation.position", value: { latitude, longitude } },
+              {
+                path: "electrical.batteries.house.capacity.stateOfCharge",
+                value: 0.5,
+              },
+              { path: "navigation.state", value: "anchored" },
+              { path: powerPath, value: 0 },
+            ],
+          },
+        ],
+      });
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    // The night gate returns before the cycle body runs, so the counter
+    // (incremented at the end of processSolarLearning) must still be 0.
+    assert.strictEqual(
+      plugin.__getInternals().learningCycleCount,
+      0,
+      "night gate must skip the learning cycle entirely",
+    );
+    const matrix = plugin.__getInternals().solarMatrices.get("cabin-roof");
+    assert.ok(matrix, "matrix exists for array");
+    assert.strictEqual(
+      matrix.anchored.size,
+      0,
+      "no matrix bin populated at night",
+    );
+
+    await plugin.stop();
+  });
 });

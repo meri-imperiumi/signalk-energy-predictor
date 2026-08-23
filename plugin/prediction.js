@@ -7,7 +7,8 @@
  * @file prediction.js
  */
 
-const { sunPosition, nextSunrise, lastSunset } = require("./solar.js");
+const { sunPosition, nextSunrise, nextSunset, lastSunset } =
+  require("./solar.js");
 const { theoreticalPower } = require("./learning.js");
 const { formatWh } = require("./format.js");
 const SunCalc = require("suncalc");
@@ -1989,6 +1990,12 @@ class PredictionEngine {
     const awa = this.getAWA();
     const isSailing = navState === "sailing";
     const underway = this.isUnderway();
+    // Read engine state once per cycle for the alternator-in-ideal-track
+    // addition (motoring side-effect charging). Null (unknown) is treated
+    // as not running so we don't fabricate alternator input from a missing
+    // signal. isEngineRunning lives on LoadProfile (shared engine-state
+    // helper).
+    const engineRunning = this.loadProfile.isEngineRunning();
 
     // Determine state class for forecast hours
     // We use current state for all forecast hours (same assumption as
@@ -2247,7 +2254,26 @@ class PredictionEngine {
         houseLoadW = averageLoad.dcWh + averageLoad.acWh;
       }
 
-      const idealNetWh = idealSolarYieldWh + mechanicalYieldWh - houseLoadW;
+      // Motoring side-effect: when the engine is running for propulsion
+      // (under way), the alternator charges the bank as a byproduct. The
+      // ideal track must account for this so the SoC projection reflects
+      // reality — arriving somewhere by motor at midday almost guarantees a
+      // full battery with hours of sun left (the surplus-advisory headline
+      // case). At-anchor engine runs are deficit response by definition and
+      // are NOT modeled here (the engine-run advisory owns those).
+      //
+      // Engine state is read once per cycle (current state, same assumption
+      // as the rest of the engine — a route-aware version is future work);
+      // underway is already determined above. Only add alternator input when
+      // both hold, gated behind engineAlternatorWatts so default behavior is
+      // unchanged when unset/zero.
+      const alternatorWh =
+        underway && engineRunning === true
+          ? this.battery?.engineAlternatorWatts || 0
+          : 0;
+
+      const idealNetWh =
+        idealSolarYieldWh + mechanicalYieldWh + alternatorWh - houseLoadW;
       const socChange = idealNetWh / this.capacityWh;
       runningSoC = Math.max(0, Math.min(1, runningSoC + socChange));
 
@@ -2290,6 +2316,7 @@ class PredictionEngine {
         idealSolarYieldWh: Math.round(idealSolarYieldWh),
         idealWindYieldWh: Math.round(mechanicalYieldWh),
         idealHydroYieldWh: Math.round(hydroYieldWh),
+        alternatorWh: Math.round(alternatorWh),
         houseLoadWh: Math.round(houseLoadW),
         idealNetWh: Math.round(idealNetWh),
         idealSoC: Math.round(runningSoC * 1000) / 1000,
@@ -2509,6 +2536,124 @@ class PredictionEngine {
   }
 
   /**
+   * Finds a surplus-energy opportunity: a window where the battery is
+   * forecast full while renewable/alternator yield continues with nowhere
+   * for the energy to go (the charge controller would curtail it). This is
+   * the "run the watermaker, make ice" case — and the classic motoring
+   * side-effect case (arriving by motor at midday, bank full, hours of sun
+   * left).
+   *
+   * Detection over the ideal SoC track (lastPrediction):
+   *   1. Find the first hour H where idealSoC >= fullThreshold.
+   *   2. H must not be within ~1h of sunset (no point alerting at dusk).
+   *   3. From H onward, sum the energy that has nowhere to go per hour:
+   *      max(0, solar + wind + alternator - houseLoad). This is energy the
+   *      charge controller would curtail once the bank is full.
+   *   4. The window runs from H until the last hour with positive surplus
+   *      contribution (typically when the engine stops or the sun sets).
+   *   5. Only alert if the window starts within maxLeadHours (beyond that,
+   *      forecast uncertainty makes the alert noise).
+   *   6. Only alert if total surplusWh >= minSurplusWh.
+   *
+   * At-anchor engine runs are deficit response by definition and never
+   * produce a surplus here (we wouldn't run the engine at anchor if surplus
+   * were coming). The motoring case is handled because the alternator input
+   * is part of the ideal track (see runPrediction), so the bank is forecast
+   * full midday and the post-full alternator hours contribute to surplusWh.
+   *
+   * @param {object} opts
+   * @param {number} [opts.fullThreshold=0.95] - SoC at which the bank is
+   *        considered full (absorption/full), [0,1]
+   * @param {number} [opts.minSurplusWh=300] - Minimum wasted energy to alert
+   * @param {number} [opts.maxLeadHours=36] - Max hours from now for the
+   *        window to start; windows further out are ignored until they
+   *        enter the horizon
+   * @returns {{surplusWh: number, from: Date, to: Date, suggestedLoadW: number}|null}
+   */
+  findSurplusOpportunity({
+    fullThreshold = 0.95,
+    minSurplusWh = 300,
+    maxLeadHours = 36,
+  } = {}) {
+    if (this.lastPrediction.length === 0) return null;
+
+    const position = unwrapPosition(this.getSelfPath("navigation.position"));
+    const latitude = position?.latitude ?? 0;
+    const longitude = position?.longitude ?? 0;
+
+    const now = new Date();
+    const maxStart = new Date(now.getTime() + maxLeadHours * 3600000);
+
+    // Find the first hour where the bank is forecast full.
+    const fullHourIndex = this.lastPrediction.findIndex(
+      (p) => p.idealSoC >= fullThreshold,
+    );
+    if (fullHourIndex === -1) return null;
+
+    const fullHour = this.lastPrediction[fullHourIndex];
+    // Window must start within the configured lead-time horizon.
+    if (fullHour.time.getTime() > maxStart.getTime()) return null;
+
+    // Day/night gating by activity model:
+    //  - Under way: someone is always on watch, so alert at any hour
+    //    (covers motoring charging the bank full at night, with sun left
+    //    the next day, or wind surplus while sailing).
+    //  - At rest (anchored/moored/unknown): only alert for windows that
+    //    start in daytime. A full bank at night (typically wind surplus)
+    //    has no one awake to act on it, so we suppress rather than wake
+    //    the crew. The window's own surplus is also near-zero then since
+    //    there's no solar, but wind surplus at a full bank can be real at
+    //    night — by policy we don't alert for it after dark.
+    const underway = this.isUnderway();
+    if (!underway) {
+      const sunAlt = sunPosition(fullHour.time, latitude, longitude).altitude;
+      if (sunAlt <= 0) return null; // sun below horizon → nighttime
+    }
+
+    // H must not be within ~1h of sunset: a full bank at dusk has little
+    // daylight left to waste, so there's nothing to act on. (Under way this
+    // also bounds the alert to windows with meaningful remaining yield.)
+    const sunset = nextSunset(fullHour.time, latitude, longitude);
+    if (sunset) {
+      const hoursToSunset =
+        (sunset.getTime() - fullHour.time.getTime()) / 3600000;
+      if (hoursToSunset <= 1) return null;
+    }
+
+    // Sum post-full energy that has nowhere to go. The window runs from the
+    // full hour until the last consecutive hour with positive surplus
+    // contribution (so a mid-window lull doesn't truncate prematurely, we
+    // only stop at a sustained end — typically engine-off or sunset).
+    let surplusWh = 0;
+    let lastIndex = fullHourIndex;
+    for (let i = fullHourIndex; i < this.lastPrediction.length; i++) {
+      const p = this.lastPrediction[i];
+      const contribution = Math.max(
+        0,
+        p.idealSolarYieldWh +
+          p.idealWindYieldWh +
+          (p.alternatorWh ?? 0) -
+          p.houseLoadWh,
+      );
+      if (contribution > 0) {
+        surplusWh += contribution;
+        lastIndex = i;
+      }
+    }
+
+    if (surplusWh < minSurplusWh) return null;
+    if (lastIndex === fullHourIndex) return null; // no post-full surplus window
+
+    const from = fullHour.time;
+    const to = this.lastPrediction[lastIndex].time;
+    const windowHours = (to.getTime() - from.getTime()) / 3600000 + 1; // inclusive of both ends
+    const suggestedLoadW =
+      windowHours > 0 ? Math.round(surplusWh / windowHours) : 0;
+
+    return { surplusWh: Math.round(surplusWh), from, to, suggestedLoadW };
+  }
+
+  /**
    * Gets hourly forecast data for Signal K delta.
    *
    * @returns {Array<{time: string, idealSolarYieldWh: number, idealWindYieldWh: number, idealHydroYieldWh: number, houseLoadWh: number, idealNetWh: number, idealSoC: number, detectedYieldWh: number, detectedNetWh: number, detectedSoC: number, actions: Array}>}
@@ -2519,6 +2664,7 @@ class PredictionEngine {
       idealSolarYieldWh: Math.round(p.idealSolarYieldWh),
       idealWindYieldWh: Math.round(p.idealWindYieldWh),
       idealHydroYieldWh: Math.round(p.idealHydroYieldWh ?? 0),
+      alternatorWh: Math.round(p.alternatorWh ?? 0),
       houseLoadWh: Math.round(p.houseLoadWh),
       idealNetWh: Math.round(p.idealNetWh),
       idealSoC: Math.round(p.idealSoC * 1000) / 1000,

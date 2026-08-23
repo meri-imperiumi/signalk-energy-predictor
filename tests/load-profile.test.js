@@ -513,67 +513,109 @@ test.describe("PredictionEngine.updateLoadProfile gross consumption", () => {
     }
   }
 
+  // The load profile bins by sun phase, which getSunPhase derives from the
+  // sample timestamp. addSample() uses `new Date()` (the real current time),
+  // and the tests seed `at-rest:day`. At Marquesas (lon -159.8, ~UTC-10) the
+  // real current UTC time may be nighttime there, routing the sample to
+  // `at-rest:night` and making the assertion against `at-rest:day` flaky.
+  //
+  // Freeze both Date.now and the Date no-arg constructor to a known daytime
+  // instant at that position (local solar noon ~22:00 UTC) so the sample
+  // bins as day. Overriding Date.now alone is not enough because `new Date()`
+  // uses the Date% primordial, not the Date.now function — so we also swap
+  // the global Date for the test scope.
+  const DAYTIME_NOW = new Date("2024-01-15T22:00:00Z").getTime();
+  function withDaytimeNow(fn) {
+    const RealDate = Date;
+    // Must be a real function (not an arrow) so `new Date()` works in
+    // production code under test: arrow functions have no [[Construct]].
+    function FakeDate(...args) {
+      if (args.length === 0) return new RealDate(DAYTIME_NOW);
+      return new RealDate(...args);
+    }
+    FakeDate.now = () => DAYTIME_NOW;
+    FakeDate.parse = RealDate.parse;
+    FakeDate.UTC = RealDate.UTC;
+    FakeDate.prototype = RealDate.prototype;
+    Object.setPrototypeOf(FakeDate, RealDate);
+    const realNow = Date.now;
+    globalThis.Date = FakeDate;
+    Date.now = () => DAYTIME_NOW;
+    try {
+      return fn();
+    } finally {
+      globalThis.Date = RealDate;
+      Date.now = realNow;
+    }
+  }
+
   test("adds wind charging back to a negative dcPower reading", () => {
     // Nighttime: no solar, shunt shows -50W (battery charging from wind),
     // wind produces 60W. Gross consumption = -50 + 60 = 10W. With a healthy
     // established bin (100W), the low-outlier gate rejects this 10W sample as
     // anomalous, protecting the bin from a single low reading.
-    const pathValues = new Map([
-      ["electrical.venus.dcPower", -50],
-      ["electrical.venus.acPower", 0],
-      ["electrical.chargers.wind.power", 60],
-      ["electrical.chargers.hydrogenerator.power", 0],
-      ["navigation.state", "moored"],
-      ["navigation.position", { latitude: -18.86, longitude: -159.8 }],
-    ]);
-    const engine = makeEngine(pathValues);
-    seedAtRestDay(engine.loadProfile, 100);
-    engine.updateLoadProfile();
-    const after = engine.loadProfile.bins.get("at-rest:day").dcEma;
-    // 10W is 3x below the 100W EMA, so the low-outlier gate rejects it and the
-    // bin is protected (EMA unchanged).
-    assert.strictEqual(
-      after,
-      100,
-      `EMA should be protected by low gate, got ${after}`,
-    );
+    withDaytimeNow(() => {
+      const pathValues = new Map([
+        ["electrical.venus.dcPower", -50],
+        ["electrical.venus.acPower", 0],
+        ["electrical.chargers.wind.power", 60],
+        ["electrical.chargers.hydrogenerator.power", 0],
+        ["navigation.state", "moored"],
+        ["navigation.position", { latitude: -18.86, longitude: -159.8 }],
+      ]);
+      const engine = makeEngine(pathValues);
+      seedAtRestDay(engine.loadProfile, 100);
+      engine.updateLoadProfile();
+      const after = engine.loadProfile.bins.get("at-rest:day").dcEma;
+      // 10W is 3x below the 100W EMA, so the low-outlier gate rejects it and the
+      // bin is protected (EMA unchanged).
+      assert.strictEqual(
+        after,
+        100,
+        `EMA should be protected by low gate, got ${after}`,
+      );
+    });
   });
 
   test("does not add solar back (already counted in dcPower)", () => {
     // dcPower = shunt + solar = 30 + 100 = 130W already. Solar must NOT be
     // added again. With no wind/hydro, gross == dcPower.
-    const pathValues = new Map([
-      ["electrical.venus.dcPower", 130],
-      ["electrical.venus.acPower", 0],
-      ["electrical.chargers.wind.power", 0],
-      ["electrical.chargers.hydrogenerator.power", 0],
-      ["navigation.state", "moored"],
-      ["navigation.position", { latitude: -18.86, longitude: -159.8 }],
-    ]);
-    const engine = makeEngine(pathValues);
-    seedAtRestDay(engine.loadProfile, 100);
-    engine.updateLoadProfile();
-    const after = engine.loadProfile.bins.get("at-rest:day").dcEma;
-    // Ingested 130W; EMA moves from 100 toward 130 (alpha-smoothed), so it
-    // should increase, not stay flat or overshoot.
-    assert.ok(after > 100, `EMA should rise toward 130W, got ${after}`);
-    assert.ok(after <= 130, `EMA ${after} should not exceed 130`);
+    withDaytimeNow(() => {
+      const pathValues = new Map([
+        ["electrical.venus.dcPower", 130],
+        ["electrical.venus.acPower", 0],
+        ["electrical.chargers.wind.power", 0],
+        ["electrical.chargers.hydrogenerator.power", 0],
+        ["navigation.state", "moored"],
+        ["navigation.position", { latitude: -18.86, longitude: -159.8 }],
+      ]);
+      const engine = makeEngine(pathValues);
+      seedAtRestDay(engine.loadProfile, 100);
+      engine.updateLoadProfile();
+      const after = engine.loadProfile.bins.get("at-rest:day").dcEma;
+      // Ingested 130W; EMA moves from 100 toward 130 (alpha-smoothed), so it
+      // should increase, not stay flat or overshoot.
+      assert.ok(after > 100, `EMA should rise toward 130W, got ${after}`);
+      assert.ok(after <= 130, `EMA ${after} should not exceed 130`);
+    });
   });
 
   test("clamps negative gross to zero (pure charging, no consumption)", () => {
     // dcPower -50, wind 10 -> gross -40, clamped to 0.
-    const pathValues = new Map([
-      ["electrical.venus.dcPower", -50],
-      ["electrical.venus.acPower", 0],
-      ["electrical.chargers.wind.power", 10],
-      ["electrical.chargers.hydrogenerator.power", 0],
-      ["navigation.state", "moored"],
-      ["navigation.position", { latitude: -18.86, longitude: -159.8 }],
-    ]);
-    const engine = makeEngine(pathValues);
-    seedAtRestDay(engine.loadProfile, 100);
-    engine.updateLoadProfile();
-    const after = engine.loadProfile.bins.get("at-rest:day").dcEma;
-    assert.ok(after >= 0, `EMA should stay non-negative, got ${after}`);
+    withDaytimeNow(() => {
+      const pathValues = new Map([
+        ["electrical.venus.dcPower", -50],
+        ["electrical.venus.acPower", 0],
+        ["electrical.chargers.wind.power", 10],
+        ["electrical.chargers.hydrogenerator.power", 0],
+        ["navigation.state", "moored"],
+        ["navigation.position", { latitude: -18.86, longitude: -159.8 }],
+      ]);
+      const engine = makeEngine(pathValues);
+      seedAtRestDay(engine.loadProfile, 100);
+      engine.updateLoadProfile();
+      const after = engine.loadProfile.bins.get("at-rest:day").dcEma;
+      assert.ok(after >= 0, `EMA should stay non-negative, got ${after}`);
+    });
   });
 });

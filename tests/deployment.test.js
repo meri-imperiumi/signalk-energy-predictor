@@ -957,6 +957,100 @@ test.describe("AdvisoryPublisher deployment states", () => {
   });
 });
 
+test.describe("AdvisoryPublisher.sendMeta", () => {
+  function makePublisher() {
+    const app = makeFakeApp();
+    app.selfId = "self";
+    return { app, pub: new AdvisoryPublisher(app, "test-plugin") };
+  }
+
+  test("publishes a single meta delta via handleMessage", () => {
+    const { app, pub } = makePublisher();
+    pub.sendMeta([]);
+    const metaCalls = app.handleMessageCalls.filter(
+      (c) => c.msg.updates?.[0]?.meta,
+    );
+    assert.strictEqual(metaCalls.length, 1);
+    const ctx = metaCalls[0].msg.context;
+    assert.strictEqual(ctx, "vessels.self");
+    assert.strictEqual(metaCalls[0].source, "test-plugin");
+  });
+
+  test("includes units for timeToFull, timeToEmpty and wind protection", () => {
+    const { app, pub } = makePublisher();
+    pub.sendMeta([]);
+    const metaCall = app.handleMessageCalls.find(
+      (c) => c.msg.updates?.[0]?.meta,
+    );
+    const byPath = {};
+    for (const m of metaCall.msg.updates[0].meta) byPath[m.path] = m.value;
+
+    assert.strictEqual(
+      byPath["electrical.energy.prediction.timeToFull"].units,
+      "timestamp",
+    );
+    assert.strictEqual(
+      byPath["electrical.energy.prediction.timeToEmpty"].units,
+      "timestamp",
+    );
+    assert.strictEqual(
+      byPath["electrical.energy.prediction.windProtection.sector"].units,
+      "deg",
+    );
+    assert.strictEqual(
+      byPath["electrical.energy.prediction.windProtection.speedFactor"].units,
+      "ratio",
+    );
+    assert.strictEqual(
+      byPath["electrical.energy.prediction.windProtection.forecastSpeedKnots"]
+        .units,
+      "knots",
+    );
+  });
+
+  test("emits per-device deployment meta, with side only for solar-deployable", () => {
+    const { app, pub } = makePublisher();
+    pub.sendMeta([
+      { id: "flinsail", type: "solar-deployable" },
+      { id: "windgen", type: "mechanical" },
+    ]);
+    const metaCall = app.handleMessageCalls.find(
+      (c) => c.msg.updates?.[0]?.meta,
+    );
+    const paths = metaCall.msg.updates[0].meta.map((m) => m.path);
+
+    // Common leaves for both devices
+    assert.ok(
+      paths.includes(
+        "electrical.energy.prediction.deployment.flinsail.recommendedState",
+      ),
+    );
+    assert.ok(
+      paths.includes(
+        "electrical.energy.prediction.deployment.windgen.missedYieldWh",
+      ),
+    );
+    const flinsailMissed = metaCall.msg.updates[0].meta.find(
+      (m) =>
+        m.path ===
+        "electrical.energy.prediction.deployment.flinsail.missedYieldWh",
+    );
+    assert.strictEqual(flinsailMissed.value.units, "Wh");
+
+    // Side only for the solar-deployable device
+    assert.ok(
+      paths.includes(
+        "electrical.energy.prediction.deployment.flinsail.recommendedSide",
+      ),
+    );
+    assert.ok(
+      !paths.includes(
+        "electrical.energy.prediction.deployment.windgen.recommendedSide",
+      ),
+    );
+  });
+});
+
 test.describe("Detected state inference from navigation state", () => {
   test("hydro detected as stowed when moored (even without deployStatePath)", async () => {
     // This test uses the full plugin to test the index.js inference logic
@@ -1052,7 +1146,7 @@ test.describe("Detected state inference from navigation state", () => {
     // Check published deltas for detectedState
     const deployDeltas = app.handleMessageCalls
       .filter((c) => c.m.updates)
-      .flatMap((c) => c.m.updates[0].values)
+      .flatMap((c) => c.m.updates.flatMap((u) => u.values || []))
       .filter(
         (v) =>
           v.path ===
@@ -1157,7 +1251,7 @@ test.describe("Detected state inference from navigation state", () => {
 
     const deployDeltas = app.handleMessageCalls
       .filter((c) => c.m.updates)
-      .flatMap((c) => c.m.updates[0].values)
+      .flatMap((c) => c.m.updates.flatMap((u) => u.values || []))
       .filter(
         (v) =>
           v.path ===
@@ -1264,7 +1358,7 @@ test.describe("Detected state inference from navigation state", () => {
 
     const deployDeltas = app.handleMessageCalls
       .filter((c) => c.m.updates)
-      .flatMap((c) => c.m.updates[0].values)
+      .flatMap((c) => c.m.updates.flatMap((u) => u.values || []))
       .filter(
         (v) =>
           v.path ===
@@ -1386,7 +1480,7 @@ test.describe("Detected state inference from navigation state", () => {
 
     const deployDeltas = app.handleMessageCalls
       .filter((c) => c.m.updates)
-      .flatMap((c) => c.m.updates[0].values)
+      .flatMap((c) => c.m.updates.flatMap((u) => u.values || []))
       .filter(
         (v) =>
           v.path ===
@@ -1490,7 +1584,7 @@ test.describe("Detected state inference from navigation state", () => {
 
     const deployDeltas = app.handleMessageCalls
       .filter((c) => c.m.updates)
-      .flatMap((c) => c.m.updates[0].values)
+      .flatMap((c) => c.m.updates.flatMap((u) => u.values || []))
       .filter(
         (v) =>
           v.path ===
@@ -1598,7 +1692,7 @@ test.describe("Detected state inference from navigation state", () => {
 
     const deployDeltas = app.handleMessageCalls
       .filter((c) => c.m.updates)
-      .flatMap((c) => c.m.updates[0].values)
+      .flatMap((c) => c.m.updates.flatMap((u) => u.values || []))
       .filter(
         (v) =>
           v.path ===

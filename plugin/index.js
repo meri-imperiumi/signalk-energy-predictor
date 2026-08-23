@@ -1015,6 +1015,20 @@ module.exports = (app) => {
         pluginConfig.battery?.engineAlternatorWatts || 100,
       );
 
+      // Find a surplus-energy opportunity (battery forecast full while
+      // yield continues — watermaker/ice-maker case; motoring side-effect).
+      // Day/night gated: under way alerts any hour (watchkeeper on duty),
+      // at rest only during daytime.
+      const surplusConfig = pluginConfig.surplus || {};
+      const surplusOpportunity =
+        surplusConfig.enabled === false
+          ? null
+          : predictionEngine.findSurplusOpportunity({
+              fullThreshold: surplusConfig.fullThreshold,
+              minSurplusWh: surplusConfig.minSurplusWh,
+              maxLeadHours: surplusConfig.maxLeadHours,
+            });
+
       // Get unified deployment recommendations for all deployable systems
       const deploymentRecommendations =
         predictionEngine.getDeploymentRecommendations();
@@ -1027,6 +1041,8 @@ module.exports = (app) => {
         timeToEmpty,
         stowageOpportunity,
         engineRunTime,
+        surplusOpportunity,
+        opportunisticLoads: surplusConfig.opportunisticLoads || [],
         deploymentRecommendations,
         currentDeployStates,
       });
@@ -1372,6 +1388,35 @@ module.exports = (app) => {
     try {
       app.debug("Learning cycle starting...");
 
+      // Resolve position once: needed both for the night gate below and
+      // for the per-array sun position in the loop. Resolving it here (vs.
+      // per-array inside the loop) avoids 5x duplicate work and lets us
+      // short-circuit the whole cycle at night before fetching GHI or
+      // iterating arrays. At night the sun is below the horizon, GHI is 0,
+      // and every panel reads 0W — there is nothing to learn, so running
+      // the cycle just emits a wall of "skipping" debug lines per delta.
+      const pos = unwrapPosition(
+        deltaState.get("navigation.position") ||
+          app.getSelfPath("navigation.position"),
+      );
+      if (!pos || pos.latitude == null || pos.longitude == null) {
+        app.debug("No GPS position, skipping learning cycle");
+        return;
+      }
+
+      // Night gate: skip the whole cycle when the sun is at or below the
+      // horizon. theoreticalPower() already returns 0 then and the
+      // per-array `actualPowerW <= 0` guard would skip every array anyway,
+      // but computing that requires fetching GHI and iterating all arrays —
+      // pure noise on a cycle that fires on every solar-power delta.
+      const sunPos = sunPosition(new Date(), pos.latitude, pos.longitude);
+      if (wpfIsNight(sunPos.altitude)) {
+        app.debug(
+          `Sun below horizon (${((sunPos.altitude * 180) / Math.PI).toFixed(1)}°), skipping learning cycle`,
+        );
+        return;
+      }
+
       // Get current GHI (will use cached forecast if available)
       const currentGHI = await ingestionFSM.getCurrentGHI();
       app.debug(
@@ -1434,18 +1479,6 @@ module.exports = (app) => {
 
         app.debug(`Array ${array.id}: learning with ${actualPowerW}W output`);
 
-        // Get sun position (prefer delta state, fall back to app.getSelfPath)
-        const pos = unwrapPosition(
-          deltaState.get("navigation.position") ||
-            app.getSelfPath("navigation.position"),
-        );
-        if (!pos || pos.latitude == null || pos.longitude == null) {
-          app.debug(`Array ${array.id}: no GPS position, skipping learning`);
-          continue;
-        }
-
-        const { sunPosition } = await import("./solar.js");
-        const sunPos = sunPosition(new Date(), pos.latitude, pos.longitude);
         const deg = (rad) => ((rad * 180) / Math.PI).toFixed(1);
         app.debug(
           `Array ${array.id}: sun at ${deg(sunPos.azimuth)}° azimuth, ${deg(sunPos.altitude)}° altitude`,
