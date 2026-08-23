@@ -75,13 +75,15 @@ test.describe("Ingestion fallback chain", () => {
   test("logbook cloud observations generate a forecast with attenuated GHI", async () => {
     const fsm = makeFSM();
     const origFetch = globalThis.fetch;
+    // Use today's date so the day is always within the 48h lookback window
+    const today = new Date().toISOString().split("T")[0];
     // Open-Meteo down, logbook has one entry with 4 oktas (0.5) cloud cover
     globalThis.fetch = async (url) => {
       const u = String(url);
       if (u.includes("open-meteo")) throw new Error("network down");
       if (u.includes("signalk-logbook")) {
         if (new URL(u).pathname.endsWith("/logs")) {
-          return { ok: true, json: async () => ["2026-08-21"] };
+          return { ok: true, json: async () => [today] };
         }
         return {
           ok: true,
@@ -167,12 +169,13 @@ test.describe("Ingestion fallback chain", () => {
   test("logbook without observations falls through to Clear Sky", async () => {
     const fsm = makeFSM();
     const origFetch = globalThis.fetch;
+    const today = new Date().toISOString().split("T")[0];
     globalThis.fetch = async (url) => {
       const u = String(url);
       if (u.includes("open-meteo")) throw new Error("network down");
       if (u.includes("signalk-logbook")) {
         if (new URL(u).pathname.endsWith("/logs")) {
-          return { ok: true, json: async () => ["2026-08-21"] };
+          return { ok: true, json: async () => [today] };
         }
         return { ok: true, json: async () => [] }; // day with no entries
       }
