@@ -444,8 +444,8 @@ module.exports = (app) => {
    * and publishWindProtection (which also needs the place/sector/factors for
    * the Signal K paths).
    *
-   * @param {number} forecastSpeedKnots - Forecast wind speed in knots
-   * @param {number|null} forecastGustKnots - Forecast gust in knots
+   * @param {number} forecastSpeedMs - Forecast wind speed in m/s
+   * @param {number|null} forecastGustMs - Forecast gust in m/s
    * @param {number} windDirectionDeg - Forecast wind direction in degrees
    *   (where the wind comes FROM)
    * @param {number} sunElevationRad - Sun elevation in radians (day/night)
@@ -455,8 +455,8 @@ module.exports = (app) => {
    *          {applies: false}}
    */
   function resolveWindProtectionContext(
-    forecastSpeedKnots,
-    forecastGustKnots,
+    forecastSpeedMs,
+    forecastGustMs,
     windDirectionDeg,
     sunElevationRad,
   ) {
@@ -469,8 +469,8 @@ module.exports = (app) => {
       gustFactor: DEFAULT_FACTOR,
       speedSource: SOURCE_NONE,
       gustSource: SOURCE_NONE,
-      correctedSpeed: forecastSpeedKnots,
-      correctedGust: forecastGustKnots,
+      correctedSpeed: forecastSpeedMs,
+      correctedGust: forecastGustMs,
     };
     if (!windProtection) return disabled;
 
@@ -531,8 +531,8 @@ module.exports = (app) => {
         gustFactor,
         speedSource,
         gustSource,
-        correctedSpeed: forecastSpeedKnots,
-        correctedGust: forecastGustKnots,
+        correctedSpeed: forecastSpeedMs,
+        correctedGust: forecastGustMs,
       };
     }
 
@@ -542,9 +542,9 @@ module.exports = (app) => {
     const speedScale =
       speedSource === SOURCE_NONE ? DEFAULT_FACTOR : speedFactor;
     const gustScale = gustSource === SOURCE_NONE ? DEFAULT_FACTOR : gustFactor;
-    const correctedSpeed10m = forecastSpeedKnots * speedScale;
+    const correctedSpeed10m = forecastSpeedMs * speedScale;
     const correctedGust10m =
-      forecastGustKnots != null ? forecastGustKnots * gustScale : null;
+      forecastGustMs != null ? forecastGustMs * gustScale : null;
 
     const correctedSpeed = toDeviceHeight(correctedSpeed10m, deviceHeightM, z0);
     const correctedGust =
@@ -582,23 +582,23 @@ module.exports = (app) => {
    * place/sector — in all those cases the prediction engine applies no
    * correction (factor 1.0).
    *
-   * @param {number} forecastSpeedKnots - Forecast wind speed in knots
-   * @param {number|null} forecastGustKnots - Forecast gust in knots
+   * @param {number} forecastSpeedMs - Forecast wind speed in m/s
+   * @param {number|null} forecastGustMs - Forecast gust in m/s
    * @param {number} windDirectionDeg - Forecast wind direction in degrees
    *   (where the wind comes FROM)
    * @param {number} sunElevationRad - Sun elevation in radians (day/night)
    * @returns {{speed: number, gust: number}|null} corrected wind/gusts at
-   *   device height, in knots; null means "no correction"
+   *   the device height, in m/s; null means "no correction"
    */
   function getWindProtection(
-    forecastSpeedKnots,
-    forecastGustKnots,
+    forecastSpeedMs,
+    forecastGustMs,
     windDirectionDeg,
     sunElevationRad,
   ) {
     const ctx = resolveWindProtectionContext(
-      forecastSpeedKnots,
-      forecastGustKnots,
+      forecastSpeedMs,
+      forecastGustMs,
       windDirectionDeg,
       sunElevationRad,
     );
@@ -641,19 +641,20 @@ module.exports = (app) => {
       [`${base}.gustFactor`]: null,
       [`${base}.speedFactorSource`]: null,
       [`${base}.gustFactorSource`]: null,
-      [`${base}.forecastSpeedKnots`]: null,
-      [`${base}.forecastGustKnots`]: null,
-      [`${base}.correctedSpeedKnots`]: null,
-      [`${base}.correctedGustKnots`]: null,
+      [`${base}.forecastSpeed`]: null,
+      [`${base}.forecastGust`]: null,
+      [`${base}.correctedSpeed`]: null,
+      [`${base}.correctedGust`]: null,
       [`${base}.position`]: pos || null,
     };
 
-    if (windProtection && current && pos) {
+    if (current && pos) {
       const { sunPosition } = require("./solar.js");
       const sunPos = sunPosition(now, pos.latitude, pos.longitude);
+      // The engine's corrected forecast is in m/s; publish m/s deltas.
       const ctx = resolveWindProtectionContext(
-        current.windSpeedKnots ?? 0,
-        current.gustSpeedKnots ?? null,
+        current.windSpeedMs ?? 0,
+        current.gustSpeedMs ?? null,
         current.windDirectionDeg ?? 0,
         sunPos.altitude,
       );
@@ -665,14 +666,13 @@ module.exports = (app) => {
         updates[`${base}.gustFactor`] = ctx.gustFactor;
         updates[`${base}.speedFactorSource`] = ctx.speedSource;
         updates[`${base}.gustFactorSource`] = ctx.gustSource;
-        updates[`${base}.forecastSpeedKnots`] = current.windSpeedKnots ?? null;
-        updates[`${base}.forecastGustKnots`] = current.gustSpeedKnots ?? null;
-        updates[`${base}.correctedSpeedKnots`] = ctx.applies
-          ? ctx.correctedSpeed
-          : null;
-        updates[`${base}.correctedGustKnots`] = ctx.applies
-          ? ctx.correctedGust
-          : null;
+        updates[`${base}.forecastSpeed`] = current.windSpeedMs ?? null;
+        updates[`${base}.forecastGust`] = current.gustSpeedMs ?? null;
+        // The corrected values are meaningful even without a learned
+        // factor (identity passthrough at sea): the consumer sees the
+        // forecast itself plus "no correction applied".
+        updates[`${base}.correctedSpeed`] = ctx.correctedSpeed;
+        updates[`${base}.correctedGust`] = ctx.correctedGust;
       }
     }
 
@@ -2028,8 +2028,13 @@ module.exports = (app) => {
     );
     if (!current) return;
 
-    const forecastSpeed = current.windSpeedKnots;
-    const forecastGust = current.gustSpeedKnots;
+    // The ingestion forecast is in m/s (engine canonical unit); the
+    // learning pipeline works in knots (recorder on-disk format,
+    // minForecastWindKnots threshold), so convert at this boundary.
+    const forecastSpeed =
+      current.windSpeedMs != null ? toKnots(current.windSpeedMs) : null;
+    const forecastGust =
+      current.gustSpeedMs != null ? toKnots(current.gustSpeedMs) : null;
     const windDirectionDeg = current.windDirectionDeg;
     if (forecastSpeed == null) return;
 

@@ -17,6 +17,7 @@ const { EventEmitter } = require("node:events");
 
 const makePlugin = require("../plugin/index.js");
 const { placeKey, sectorFromDeg } = require("../plugin/wind-protection.js");
+const { msFromKnots } = require("../plugin/prediction.js");
 
 class FakeStreamBundle {
   constructor() {
@@ -195,8 +196,8 @@ test.describe("WPF fallback publish: factorSource paths", () => {
     engine.lastForecast = [
       {
         time: now,
-        windSpeedKnots: 10,
-        gustSpeedKnots: null,
+        windSpeedMs: msFromKnots(10),
+        gustSpeedMs: null,
         windDirectionDeg: 90, // sector 2 (E), unlearned → adjacent fallback
         ghi: 0,
         cloudCover: 0,
@@ -236,6 +237,67 @@ test.describe("WPF fallback publish: factorSource paths", () => {
       "gustFactorSource path published",
     );
     assert.strictEqual(published[`${base}.gustFactorSource`], "none");
+
+    await plugin.stop();
+  });
+});
+
+test.describe("WPF identity passthrough: no learned data at all", () => {
+  test("corrected wind deltas publish the raw forecast when nothing is learned", async () => {
+    const app = new FakeSignalKApp();
+    const lat = 60.1;
+    const lon = 21.8;
+    app.setSelfPath("navigation.position", { latitude: lat, longitude: lon });
+    app.setSelfPath("navigation.state", "anchored");
+
+    // Start with WPF enabled but NOTHING learned (fresh store).
+    const plugin = makePlugin(app);
+    app.dataPath = await mkdtemp(join(tempDir, "t-"));
+    await plugin.start(baseConfig(), () => {});
+
+    // Seed the engine's corrected-forecast store with a current point in
+    // m/s (the engine's canonical unit).
+    const now = new Date();
+    const engine = plugin.__getInternals().predictionEngine;
+    engine.lastForecast = [
+      {
+        time: now,
+        windSpeedMs: msFromKnots(10),
+        gustSpeedMs: msFromKnots(18),
+        windDirectionDeg: 90,
+        ghi: 0,
+        cloudCover: 0,
+      },
+    ];
+
+    const pub = plugin.__getInternals().advisoryPublisher;
+    let published = null;
+    const orig = pub.publishDelta.bind(pub);
+    pub.publishDelta = (u) => {
+      published = u;
+      orig(u);
+    };
+
+    plugin.__getInternals().publishWindProtection();
+
+    const base = "electrical.energy.prediction.windProtection";
+    assert.ok(published, "a windProtection delta was published");
+    assert.strictEqual(published[`${base}.enabled`], true);
+    assert.strictEqual(published[`${base}.speedFactorSource`], "none");
+    assert.strictEqual(published[`${base}.gustFactorSource`], "none");
+    // Identity passthrough: the corrected paths carry the raw forecast
+    // (m/s) so at-sea consumers still see wind on these paths.
+    assert.ok(
+      Math.abs(published[`${base}.forecastSpeed`] - msFromKnots(10)) < 1e-9,
+    );
+    assert.ok(
+      Math.abs(published[`${base}.correctedSpeed`] - msFromKnots(10)) < 1e-9,
+      `correctedSpeed should equal the raw forecast in m/s, got ${published[`${base}.correctedSpeed`]}`,
+    );
+    assert.ok(
+      Math.abs(published[`${base}.correctedGust`] - msFromKnots(18)) < 1e-9,
+      `correctedGust should equal the raw forecast in m/s, got ${published[`${base}.correctedGust`]}`,
+    );
 
     await plugin.stop();
   });
@@ -303,8 +365,8 @@ test.describe("WPF fallback end-to-end: hourly forecast reflects the fallback", 
       time: new Date(now.getTime() + h * 3600000),
       ghi: 0, // night-equivalent; we only care about wind here
       cloudCover: 0,
-      windSpeedKnots: 10,
-      gustSpeedKnots: null,
+      windSpeedMs: msFromKnots(10),
+      gustSpeedMs: null,
       windDirectionDeg: 90, // sector 2 (E), unlearned → adjacent fallback from sector 3
     }));
     engine.runPrediction(forecast);

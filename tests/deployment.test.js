@@ -6,7 +6,11 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { PredictionEngine, LoadProfile } = require("../plugin/prediction.js");
+const {
+  PredictionEngine,
+  LoadProfile,
+  msFromKnots,
+} = require("../plugin/prediction.js");
 const { nextSunrise, lastSunset, sunPosition } = require("../plugin/solar.js");
 const { AdvisoryPublisher } = require("../plugin/advisory.js");
 const { parseManufacturerCurve } = require("../plugin/schema.js");
@@ -63,12 +67,15 @@ function makePredictionEngine({
 // A forecast with gust/wind fields that populate lastPrediction
 function makeForecastWithGusts(gustKnots, windKnots) {
   const now = new Date();
+  // Test authors pass knot magnitudes; the engine works in m/s.
+  const gustMs = msFromKnots(gustKnots);
+  const windMs = msFromKnots(windKnots);
   return Array.from({ length: 24 }, (_, h) => ({
     time: new Date(now.getTime() + h * 3600000),
     ghi: 500,
     cloudCover: 0.3,
-    gustSpeedKnots: gustKnots,
-    windSpeedKnots: windKnots,
+    gustSpeedMs: gustMs,
+    windSpeedMs: windMs,
   }));
 }
 
@@ -1048,9 +1055,8 @@ test.describe("AdvisoryPublisher.sendMeta", () => {
       "ratio",
     );
     assert.strictEqual(
-      byPath["electrical.energy.prediction.windProtection.forecastSpeedKnots"]
-        .units,
-      "knots",
+      byPath["electrical.energy.prediction.windProtection.forecastSpeed"].units,
+      "m/s",
     );
     // Surplus-energy paths emitted by publishSurplusAdvisory
     assert.strictEqual(
@@ -1863,8 +1869,8 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       time: new Date(`2026-03-20T${h.toString().padStart(2, "0")}:00:00Z`),
       ghi: 500,
       cloudCover: 0,
-      gustSpeedKnots: 0,
-      windSpeedKnots: 0,
+      gustSpeedMs: msFromKnots(0),
+      windSpeedMs: msFromKnots(0),
       windDirectionDeg: null,
     }));
     // Patch Date.now to return our test time
@@ -1914,8 +1920,8 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       time: new Date(`2026-03-20T${h.toString().padStart(2, "0")}:00:00Z`),
       ghi: 500,
       cloudCover: 0,
-      gustSpeedKnots: 0,
-      windSpeedKnots: 0,
+      gustSpeedMs: msFromKnots(0),
+      windSpeedMs: msFromKnots(0),
       windDirectionDeg: null,
     }));
     const realNow = Date.now;
@@ -1990,8 +1996,8 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       time: new Date(`2026-03-20T${h.toString().padStart(2, "0")}:00:00Z`),
       ghi: 500,
       cloudCover: 0,
-      gustSpeedKnots: 0,
-      windSpeedKnots: 0,
+      gustSpeedMs: msFromKnots(0),
+      windSpeedMs: msFromKnots(0),
       windDirectionDeg: null,
     }));
     const realNow = Date.now;
@@ -2045,8 +2051,8 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       time: new Date(now.getTime() + h * 3600000),
       ghi: 0,
       cloudCover: 0,
-      gustSpeedKnots: 0,
-      windSpeedKnots: 10,
+      gustSpeedMs: msFromKnots(0),
+      windSpeedMs: msFromKnots(10),
       windDirectionDeg: 90, // wind from due east
     }));
     const realNow = Date.now;
@@ -2097,8 +2103,8 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       time: new Date(now.getTime() + h * 3600000),
       ghi: 0,
       cloudCover: 0,
-      gustSpeedKnots: 0,
-      windSpeedKnots: 10,
+      gustSpeedMs: msFromKnots(0),
+      windSpeedMs: msFromKnots(10),
       windDirectionDeg: 90, // wind from due east
     }));
     const realNow = Date.now;
@@ -2153,8 +2159,8 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       time: new Date(now.getTime() + h * 3600000),
       ghi: 0,
       cloudCover: 0,
-      gustSpeedKnots: 0,
-      windSpeedKnots: 10,
+      gustSpeedMs: msFromKnots(0),
+      windSpeedMs: msFromKnots(10),
       windDirectionDeg: 90,
     }));
     const realNow = Date.now;
@@ -2169,9 +2175,7 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       const sunrise = nextSunrise(now, 60, 18);
       assert.ok(sunrise, "sunrise resolves");
       const offsetMin = Math.round((18 / 15) * 60);
-      const solarHHMM = new Date(
-        sunrise.getTime() + offsetMin * 60 * 1000,
-      );
+      const solarHHMM = new Date(sunrise.getTime() + offsetMin * 60 * 1000);
       const solar = `${String(solarHHMM.getUTCHours()).padStart(2, "0")}:${String(
         solarHHMM.getUTCMinutes(),
       ).padStart(2, "0")}`;
@@ -2316,8 +2320,8 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       time: new Date(now.getTime() + h * 3600000),
       ghi: 500,
       cloudCover: 0,
-      gustSpeedKnots: h < 5 ? 25 : 10,
-      windSpeedKnots: 10,
+      gustSpeedMs: h < 5 ? msFromKnots(25) : msFromKnots(10),
+      windSpeedMs: msFromKnots(10),
       windDirectionDeg: null,
     }));
     const realNow = Date.now;
@@ -2373,8 +2377,8 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       time: new Date(now.getTime() + h * 3600000),
       ghi: 500,
       cloudCover: 0,
-      gustSpeedKnots: 10,
-      windSpeedKnots: 10,
+      gustSpeedMs: msFromKnots(10),
+      windSpeedMs: msFromKnots(10),
       windDirectionDeg: null,
     }));
     const realNow = Date.now;
@@ -2424,8 +2428,8 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       time: new Date(now.getTime() + h * 3600000),
       ghi: 500,
       cloudCover: 0,
-      gustSpeedKnots: h >= 18 ? 25 : 10,
-      windSpeedKnots: 10,
+      gustSpeedMs: h >= 18 ? msFromKnots(25) : msFromKnots(10),
+      windSpeedMs: msFromKnots(10),
       windDirectionDeg: null,
     }));
     const realNow = Date.now;
@@ -2500,8 +2504,8 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       time: new Date(now.getTime() + h * 3600000),
       ghi: 500,
       cloudCover: 0,
-      gustSpeedKnots: h < 3 ? 35 : 15,
-      windSpeedKnots: 8,
+      gustSpeedMs: h < 3 ? msFromKnots(35) : msFromKnots(15),
+      windSpeedMs: msFromKnots(8),
       windDirectionDeg: null,
     }));
     const realNow = Date.now;
@@ -2554,8 +2558,8 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       time: new Date(now.getTime() + h * 3600000),
       ghi: 500,
       cloudCover: 0,
-      gustSpeedKnots: 0,
-      windSpeedKnots: 0,
+      gustSpeedMs: msFromKnots(0),
+      windSpeedMs: msFromKnots(0),
       windDirectionDeg: null,
     }));
     const realNow = Date.now;
@@ -2605,8 +2609,8 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       time: new Date(now.getTime() + h * 3600000),
       ghi: 0,
       cloudCover: 0,
-      gustSpeedKnots: 15,
-      windSpeedKnots: 10,
+      gustSpeedMs: msFromKnots(15),
+      windSpeedMs: msFromKnots(10),
       windDirectionDeg: null,
     }));
     const realNow = Date.now;
@@ -2674,8 +2678,8 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       time: new Date(now.getTime() + h * 3600000),
       ghi: 0,
       cloudCover: 0,
-      gustSpeedKnots: 15,
-      windSpeedKnots: 10,
+      gustSpeedMs: msFromKnots(15),
+      windSpeedMs: msFromKnots(10),
       windDirectionDeg: null,
     }));
     const realNow = Date.now;
@@ -2730,8 +2734,8 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       time: new Date(now.getTime() + h * 3600000),
       ghi: 500,
       cloudCover: 0,
-      gustSpeedKnots: 25,
-      windSpeedKnots: 18,
+      gustSpeedMs: msFromKnots(25),
+      windSpeedMs: msFromKnots(18),
       windDirectionDeg: null,
     }));
     const realNow = Date.now;
@@ -2793,8 +2797,8 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       time: new Date(now.getTime() + h * 3600000),
       ghi: 0,
       cloudCover: 0,
-      gustSpeedKnots: 35,
-      windSpeedKnots: 20,
+      gustSpeedMs: msFromKnots(35),
+      windSpeedMs: msFromKnots(20),
       windDirectionDeg: null,
     }));
     const realNow = Date.now;
@@ -2851,8 +2855,8 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       time: new Date(now.getTime() + h * 3600000),
       ghi: 0,
       cloudCover: 0,
-      gustSpeedKnots: 35,
-      windSpeedKnots: 35,
+      gustSpeedMs: msFromKnots(35),
+      windSpeedMs: msFromKnots(35),
       windDirectionDeg: null,
     }));
     const realNow = Date.now;
@@ -2908,8 +2912,8 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       time: new Date(now.getTime() + h * 3600000),
       ghi: 0,
       cloudCover: 0,
-      gustSpeedKnots: 15,
-      windSpeedKnots: 10,
+      gustSpeedMs: msFromKnots(15),
+      windSpeedMs: msFromKnots(10),
       windDirectionDeg: null,
     }));
     const realNow = Date.now;
@@ -2962,8 +2966,8 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       time: new Date(now.getTime()),
       ghi: 0,
       cloudCover: 0,
-      gustSpeedKnots: 35,
-      windSpeedKnots: 10,
+      gustSpeedMs: msFromKnots(35),
+      windSpeedMs: msFromKnots(10),
       windDirectionDeg: null,
     }));
     const realNow = Date.now;
@@ -3012,8 +3016,8 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       time: new Date(now.getTime()),
       ghi: 500,
       cloudCover: 0,
-      gustSpeedKnots: 25,
-      windSpeedKnots: 10,
+      gustSpeedMs: msFromKnots(25),
+      windSpeedMs: msFromKnots(10),
       windDirectionDeg: null,
     }));
     const realNow = Date.now;
@@ -3066,8 +3070,8 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       time: new Date(now.getTime() + h * 3600000),
       ghi: 500,
       cloudCover: 0,
-      gustSpeedKnots: h < gusts.length ? gusts[h] : 10,
-      windSpeedKnots: 10,
+      gustSpeedMs: h < gusts.length ? msFromKnots(gusts[h]) : msFromKnots(10),
+      windSpeedMs: msFromKnots(10),
       windDirectionDeg: null,
     }));
     const realNow = Date.now;
@@ -3144,8 +3148,8 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       time: new Date(now.getTime() + h * 3600000),
       ghi: 500,
       cloudCover: 0,
-      gustSpeedKnots: 25, // >= limit -> stowed at h0..h2
-      windSpeedKnots: 10,
+      gustSpeedMs: msFromKnots(25), // >= limit -> stowed at h0..h2
+      windSpeedMs: msFromKnots(10),
       windDirectionDeg: null,
     }));
     const realNow = Date.now;
@@ -3209,8 +3213,8 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       time: new Date(now.getTime() + h * 3600000),
       ghi: 500,
       cloudCover: 0,
-      gustSpeedKnots: 10,
-      windSpeedKnots: 8,
+      gustSpeedMs: msFromKnots(10),
+      windSpeedMs: msFromKnots(8),
       windDirectionDeg: null,
     }));
     const realNow = Date.now;
@@ -3264,8 +3268,8 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       time: new Date(now.getTime()),
       ghi: 0,
       cloudCover: 0,
-      gustSpeedKnots: 15,
-      windSpeedKnots: 10,
+      gustSpeedMs: msFromKnots(15),
+      windSpeedMs: msFromKnots(10),
       windDirectionDeg: null,
     }));
     const realNow = Date.now;
@@ -3316,8 +3320,8 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       time: new Date(now.getTime() + h * 3600000),
       ghi: 0,
       cloudCover: 0,
-      gustSpeedKnots: h < 3 ? 35 : 15,
-      windSpeedKnots: 10,
+      gustSpeedMs: h < 3 ? msFromKnots(35) : msFromKnots(15),
+      windSpeedMs: msFromKnots(10),
       windDirectionDeg: null,
     }));
     const realNow = Date.now;
@@ -3390,8 +3394,8 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       time: new Date(now.getTime() + h * 3600000),
       ghi: 500,
       cloudCover: 0,
-      gustSpeedKnots: h === 14 ? 25 : 10,
-      windSpeedKnots: 10,
+      gustSpeedMs: h === 14 ? msFromKnots(25) : msFromKnots(10),
+      windSpeedMs: msFromKnots(10),
       windDirectionDeg: null,
     }));
     const realNow = Date.now;
@@ -3471,8 +3475,8 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       time: new Date(now.getTime() + h * 3600000),
       ghi: 0,
       cloudCover: 0,
-      gustSpeedKnots: 10,
-      windSpeedKnots: 10,
+      gustSpeedMs: msFromKnots(10),
+      windSpeedMs: msFromKnots(10),
       windDirectionDeg: null,
     }));
     const realNow = Date.now;
@@ -3544,8 +3548,8 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       time: new Date(now.getTime() + h * 3600000),
       ghi: 0,
       cloudCover: 0,
-      gustSpeedKnots: 25,
-      windSpeedKnots: 10,
+      gustSpeedMs: msFromKnots(25),
+      windSpeedMs: msFromKnots(10),
       windDirectionDeg: null,
     }));
     const realNow = Date.now;
@@ -3601,8 +3605,8 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       time: new Date(now.getTime() + h * 3600000),
       ghi: 500,
       cloudCover: 0,
-      gustSpeedKnots: h === 5 ? 25 : 10,
-      windSpeedKnots: 10,
+      gustSpeedMs: h === 5 ? msFromKnots(25) : msFromKnots(10),
+      windSpeedMs: msFromKnots(10),
       windDirectionDeg: null,
     }));
     const realNow = Date.now;
@@ -3658,8 +3662,8 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       time: new Date(now.getTime() + h * 3600000),
       ghi: 0,
       cloudCover: 0,
-      gustSpeedKnots: h < 3 ? 35 : 15,
-      windSpeedKnots: 10,
+      gustSpeedMs: h < 3 ? msFromKnots(35) : msFromKnots(15),
+      windSpeedMs: msFromKnots(10),
       windDirectionDeg: null,
     }));
     const realNow = Date.now;

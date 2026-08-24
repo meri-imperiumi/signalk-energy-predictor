@@ -159,16 +159,16 @@ test.describe("Ingestion fallback chain", () => {
       assert.strictEqual(forecast.length, 2);
 
       const [first, calm] = forecast;
-      assert.ok(Math.abs(first.windSpeedKnots - 10 * 1.94384) < 0.01);
-      assert.ok(Math.abs(first.gustSpeedKnots - 15 * 1.94384) < 0.01);
+      assert.ok(Math.abs(first.windSpeedMs - 10) < 0.01);
+      assert.ok(Math.abs(first.gustSpeedMs - 15) < 0.01);
       assert.ok(Math.abs(first.windDirectionDeg - 180) < 0.01);
       assert.strictEqual(first.cloudCover, 0.5);
       // Cloud cover must yield a synthesized GHI
       assert.ok(first.ghi != null);
 
       // Calm wind: 0 m/s is a valid reading, not missing data
-      assert.strictEqual(calm.windSpeedKnots, 0);
-      assert.strictEqual(calm.gustSpeedKnots, null);
+      assert.strictEqual(calm.windSpeedMs, 0);
+      assert.strictEqual(calm.gustSpeedMs, null);
     } finally {
       globalThis.fetch = origFetch;
     }
@@ -233,9 +233,9 @@ test.describe("Open-Meteo fetch error handling", () => {
         const points = await fetchOpenMeteo(60.17, 24.94, { retryDelayMs: 1 });
         assert.strictEqual(calls, 2);
         assert.strictEqual(points.length, 2);
-        // km/h -> knots conversion preserved
-        assert.ok(Math.abs(points[0].windSpeedKnots - 18 * 0.539957) < 0.01);
-        assert.ok(Math.abs(points[0].gustSpeedKnots - 27 * 0.539957) < 0.01);
+        // km/h -> m/s conversion preserved
+        assert.ok(Math.abs(points[0].windSpeedMs - 18 / 3.6) < 0.01);
+        assert.ok(Math.abs(points[0].gustSpeedMs - 27 / 3.6) < 0.01);
         // Naive UTC timestamps parsed as UTC
         assert.strictEqual(
           points[0].time.toISOString(),
@@ -369,7 +369,7 @@ test.describe("Open-Meteo fetch error handling", () => {
         assert.strictEqual(points.length, 2);
         assert.strictEqual(points[0].ghi, 100);
         assert.strictEqual(points[1].ghi, 0); // isolated null maps to zero
-        assert.strictEqual(points[1].windSpeedKnots, null);
+        assert.strictEqual(points[1].windSpeedMs, null);
       },
     );
   });
@@ -422,7 +422,7 @@ test.describe("Open-Meteo fetch error handling", () => {
       const forecast = await fsm.fetchForecast();
       assert.strictEqual(fsm.currentTier, Tier.OPEN_METEO);
       assert.strictEqual(forecast.length, 2);
-      assert.ok(forecast.every((p) => p.windSpeedKnots != null));
+      assert.ok(forecast.every((p) => p.windSpeedMs != null));
     } finally {
       globalThis.fetch = origFetch;
     }
@@ -466,8 +466,8 @@ test.describe("Offline forecast restore + staleness + uplink cadence", () => {
       time: new Date(date.getTime() + h * 3600000),
       ghi: 600,
       cloudCover: 0.3,
-      windSpeedKnots: 12,
-      gustSpeedKnots: 18,
+      windSpeedMs: 12,
+      gustSpeedMs: 18,
       windDirectionDeg: 90,
       tier,
     }));
@@ -486,7 +486,7 @@ test.describe("Offline forecast restore + staleness + uplink cadence", () => {
       const forecast = await fsm.fetchForecast();
       // Restore must win over Clear Sky: tier stays 1, wind is present.
       assert.strictEqual(fsm.currentTier, Tier.OPEN_METEO);
-      assert.ok(forecast.some((p) => p.windSpeedKnots === 12));
+      assert.ok(forecast.some((p) => p.windSpeedMs === 12));
       assert.ok(forecast.some((p) => p.ghi === 600));
     } finally {
       globalThis.fetch = origFetch;
@@ -520,7 +520,7 @@ test.describe("Offline forecast restore + staleness + uplink cadence", () => {
     try {
       const forecast = await fsm.fetchForecast();
       assert.strictEqual(fsm.currentTier, Tier.OPEN_METEO);
-      assert.ok(forecast.some((p) => p.windSpeedKnots === 12));
+      assert.ok(forecast.some((p) => p.windSpeedMs === 12));
     } finally {
       globalThis.fetch = origFetch;
     }
@@ -677,12 +677,10 @@ test.describe("Offline forecast restore + staleness + uplink cadence", () => {
       const forecast = await fsm.fetchForecast();
       // Hybrid must NOT claim to be a real forecast tier.
       assert.strictEqual(fsm.currentTier, Tier.LOGBOOK);
-      // Wind is the latest-known live value (8 m/s → ~15.55 kn), held constant.
+      // Wind is the latest-known live value (8 m/s), held constant.
       assert.ok(
         forecast.every(
-          (p) =>
-            p.windSpeedKnots != null &&
-            Math.abs(p.windSpeedKnots - 8 * 1.94384) < 0.1,
+          (p) => p.windSpeedMs != null && Math.abs(p.windSpeedMs - 8) < 0.1,
         ),
       );
       assert.ok(forecast.every((p) => p.windDirectionDeg === 180));

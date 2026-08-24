@@ -124,18 +124,18 @@ function formatWindowTime(when, start, offsetMinutes = null) {
 /**
  * Computes the severity ratio (`currentValue / limit`) for a deployment
  * recommendation. For gust-driven recommendations (FLINsail, wind gen) it is
- * `currentGustKnots / limitKnots`; for hydro (speed-driven) it is
- * `currentSpeedKnots / limitKnots`. Returns null when neither a current
+ * `currentGustMs / limitMs`; for hydro (speed-driven) it is
+ * `currentSpeedMs / limitMs`. Returns null when neither a current
  * reading nor a limit is present (no intensity evidence).
  *
  * @param {object} rec - Deployment recommendation
  * @returns {number|null}
  */
 function severityRatioFor(rec) {
-  const limit = rec.limitKnots;
+  const limit = rec.limitMs;
   if (limit == null || limit <= 0) return null;
   const current =
-    rec.currentGustKnots != null ? rec.currentGustKnots : rec.currentSpeedKnots;
+    rec.currentGustMs != null ? rec.currentGustMs : rec.currentSpeedMs;
   if (current == null) return null;
   return current / limit;
 }
@@ -286,7 +286,7 @@ class AdvisoryPublisher {
         value: {
           displayName: "Forecast source",
           description:
-            "Which weather-forecast source the current prediction is built on (e.g. \"Open-Meteo\", \"Signal K Weather API\", \"Signal K Logbook\", \"Clear Sky Baseline\"), or null when no forecast is available",
+            'Which weather-forecast source the current prediction is built on (e.g. "Open-Meteo", "Signal K Weather API", "Signal K Logbook", "Clear Sky Baseline"), or null when no forecast is available',
         },
       },
       {
@@ -348,39 +348,39 @@ class AdvisoryPublisher {
         },
       },
       {
-        path: `${PREDICTION_BASE}.windProtection.forecastSpeedKnots`,
+        path: `${PREDICTION_BASE}.windProtection.forecastSpeed`,
         value: {
           displayName: "Forecast wind speed",
           description:
             "Raw forecast wind speed at the current position before wind protection correction",
-          units: "knots",
+          units: "m/s",
         },
       },
       {
-        path: `${PREDICTION_BASE}.windProtection.forecastGustKnots`,
+        path: `${PREDICTION_BASE}.windProtection.forecastGust`,
         value: {
           displayName: "Forecast wind gust",
           description:
             "Raw forecast wind gust at the current position before wind protection correction",
-          units: "knots",
+          units: "m/s",
         },
       },
       {
-        path: `${PREDICTION_BASE}.windProtection.correctedSpeedKnots`,
+        path: `${PREDICTION_BASE}.windProtection.correctedSpeed`,
         value: {
           displayName: "Corrected wind speed",
           description:
             "Forecast wind speed after applying the learned wind protection factor",
-          units: "knots",
+          units: "m/s",
         },
       },
       {
-        path: `${PREDICTION_BASE}.windProtection.correctedGustKnots`,
+        path: `${PREDICTION_BASE}.windProtection.correctedGust`,
         value: {
           displayName: "Corrected wind gust",
           description:
             "Forecast wind gust after applying the learned wind protection factor",
-          units: "knots",
+          units: "m/s",
         },
       },
       {

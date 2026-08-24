@@ -17,7 +17,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { PredictionEngine } = require("../plugin/prediction.js");
+const { PredictionEngine, msFromKnots } = require("../plugin/prediction.js");
 const { sunPosition } = require("../plugin/solar.js");
 
 function makeFakeApp() {
@@ -56,12 +56,13 @@ function noonLongitude() {
 /** Builds a 24h forecast where gust varies per hour. */
 function forecastWithHourlyGusts(gustByHour) {
   const now = new Date();
+  // Test authors pass knot magnitudes; the engine works in m/s.
   return Array.from({ length: 24 }, (_, h) => ({
     time: new Date(now.getTime() + h * 3600000),
     ghi: 500,
     cloudCover: 0.3,
-    gustSpeedKnots: gustByHour(h),
-    windSpeedKnots: 10,
+    gustSpeedMs: msFromKnots(gustByHour(h)),
+    windSpeedMs: msFromKnots(10),
   }));
 }
 

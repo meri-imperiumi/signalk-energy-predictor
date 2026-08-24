@@ -928,20 +928,33 @@ async function buildRetroPredicted(samples, config, dataDir, from, to, app) {
   const backfill = require("./history-backfill.js");
   const { SolarMatrix, theoreticalPower } = require("./learning.js");
   const { sunPosition, irradianceFromCloudCover } = require("./solar.js");
-  const { predictWindHour, predictHydroHour } = require("./prediction.js");
+  const {
+    predictWindHour,
+    predictHydroHour,
+    msFromKnots,
+  } = require("./prediction.js");
   const { parseManufacturerCurve } = require("./schema.js");
   const matrixPersistence = require("./matrix.js");
 
   const arrays = (config.solarArrays || []).filter(
     (a) => a.enabled !== false && a.powerPath && a.capacityWp,
   );
+  // Manufacturer curves are knot-calibrated in the schema; convert the
+  // speed axis to m/s for predictWindHour (matches PredictionEngine's
+  // constructor normalization).
   const generators = (config.mechanicalGenerators || [])
     .filter((g) => g.enabled !== false && g.powerPath)
     .map((g) => ({
       ...g,
       curve: Array.isArray(g.curve)
-        ? g.curve
-        : parseManufacturerCurve(g.manufacturerCurve),
+        ? g.curve.map((pt) => ({
+            speed: msFromKnots(pt.speed),
+            watts: pt.watts,
+          }))
+        : parseManufacturerCurve(g.manufacturerCurve).map((pt) => ({
+            speed: msFromKnots(pt.speed),
+            watts: pt.watts,
+          })),
     }));
 
   // Load backfilled matrices
@@ -1090,8 +1103,8 @@ async function buildRetroPredicted(samples, config, dataDir, from, to, app) {
       if (g.type === "wind") {
         idealWindYieldWh += predictWindHour({
           generator: g,
-          windSpeedKnots: w.windSpeedKnots ?? 0,
-          gustSpeedKnots: w.gustSpeedKnots ?? 0,
+          windSpeedMs: msFromKnots(w.windSpeedKnots ?? 0),
+          gustSpeedMs: msFromKnots(w.gustSpeedKnots ?? 0),
           navState,
         });
       } else if (g.type === "hydro") {
@@ -1102,7 +1115,7 @@ async function buildRetroPredicted(samples, config, dataDir, from, to, app) {
             : 0;
         idealHydroYieldWh += predictHydroHour({
           generator: g,
-          speedThroughWaterKnots: stwKn,
+          speedThroughWaterMs: msFromKnots(stwKn),
           isSailing: navState === "sailing",
         });
       }

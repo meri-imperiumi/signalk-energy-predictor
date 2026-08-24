@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- Wind speeds are now carried in m/s (Signal K's standard unit) in the
+  prediction engine's internals and in the wind-protection Signal K
+  deltas. Knots survive only at the boundaries where humans or existing
+  on-disk formats expect them: the plugin config schema (thresholds stay
+  `*Knots` keys, converted at the config-read boundary; manufacturer
+  power-curve speed axes are converted likewise), the recorder's on-disk
+  sample/observation format, the HTTP API and webapp wind figures, and
+  user-facing reason/notification strings. In detail:
+  - Forecast ingestion (Open-Meteo, Signal K Weather API, logbook hybrid,
+    weather cache) produces `windSpeedMs`/`gustSpeedMs`; the weather cache
+    reads legacy `*Knots` entries with conversion.
+  - `PredictionEngine` stores/reads m/s throughout (`windSpeedMs`,
+    `gustSpeedMs`, `limitMs`, `currentGustMs`, …); deployment-recommendation
+    objects carry `currentGustMs`/`currentSpeedMs`/`limitMs`.
+  - The wind-protection delta paths dropped their unit suffix and now
+    carry m/s with `units: "m/s"` metadata:
+    `…windProtection.forecastSpeed`, `…forecastGust`, `…correctedSpeed`,
+    `…correctedGust` (previously `…SpeedKnots`/`…GustKnots`).
+  - `…windProtection.correctedSpeed`/`correctedGust` are now published
+    even when no wind-protection factor applies (unlearned place, at sea):
+    they carry the uncorrected forecast (identity passthrough) so consumers
+    always see wind on these paths.
+  - `getHourlyForecast()` (recorder/`forecast.hourly` blob/HTTP API)
+    continues to render `windSpeedKnots`/`gustSpeedKnots` at its output
+    boundary; the engine-internal fields feeding it are m/s.
+  - The hourly prediction no longer rounds stored wind values to one
+    decimal; rounding happens at display boundaries (knots rendering in
+    `getHourlyForecast`) only.
+
 ### Added
 - Two new Signal K deltas expose the weather-forecast status the
   current prediction is built on, so the crew can see at a glance whether

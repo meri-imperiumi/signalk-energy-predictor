@@ -15,6 +15,7 @@ const {
   predictHydroHour,
   LoadProfile,
   StateClass,
+  msFromKnots,
 } = require("./prediction.js");
 const matrixPersistence = require("./matrix.js");
 const { parseManufacturerCurve } = require("./schema.js");
@@ -943,8 +944,22 @@ function replayGenerators({
   const propulsionCols = propulsionColumns(historyData);
   const intervalHours = resolution / 3600;
 
+  // Manufacturer/test curves are knot-calibrated (schema convention);
+  // convert the speed axis to m/s so predictWindHour's m/s wind values
+  // land on the right interval (matches PredictionEngine's constructor
+  // normalization).
+  const normalizedGenerators = generators.map((g) => ({
+    ...g,
+    curve: Array.isArray(g.curve)
+      ? g.curve.map((pt) => ({
+          speed: msFromKnots(pt.speed),
+          watts: pt.watts,
+        }))
+      : g.curve,
+  }));
+
   const results = [];
-  for (const generator of generators) {
+  for (const generator of normalizedGenerators) {
     const powerColumn = columns.get(generator.powerPath);
     if (powerColumn == null) {
       continue; // No history for this generator
@@ -982,18 +997,25 @@ function replayGenerators({
       if (generator.type === "wind") {
         predictedW = predictWindHour({
           generator,
-          windSpeedKnots: weatherPoint.windSpeedKnots ?? 0,
-          gustSpeedKnots: weatherPoint.gustSpeedKnots ?? 0,
+          windSpeedMs:
+            weatherPoint.windSpeedKnots != null
+              ? msFromKnots(weatherPoint.windSpeedKnots)
+              : 0,
+          gustSpeedMs:
+            weatherPoint.gustSpeedKnots != null
+              ? msFromKnots(weatherPoint.gustSpeedKnots)
+              : 0,
           navState,
         });
       } else if (generator.type === "hydro") {
-        const stwKn =
+        // Signal K's speedThroughWater is m/s; use it directly.
+        const stwMs =
           columnNumber(point, stwColumn) != null
-            ? columnNumber(point, stwColumn) * 1.94384
+            ? columnNumber(point, stwColumn)
             : 0;
         predictedW = predictHydroHour({
           generator,
-          speedThroughWaterKnots: stwKn,
+          speedThroughWaterMs: stwMs,
           isSailing: navState === "sailing",
         });
       }
@@ -1087,6 +1109,16 @@ async function populateFromHistory({
       curve: Array.isArray(g.curve)
         ? g.curve
         : parseManufacturerCurve(g.manufacturerCurve),
+    }))
+    // Manufacturer curves are knot-calibrated in the schema; convert the
+    // speed axis to m/s so predictWindHour's m/s wind values land on the
+    // right interval (matches PredictionEngine's constructor normalization).
+    .map((g) => ({
+      ...g,
+      curve: g.curve.map((pt) => ({
+        speed: msFromKnots(pt.speed),
+        watts: pt.watts,
+      })),
     }));
 
   // One /values query for everything: array + generator power, SoC, nav

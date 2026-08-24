@@ -31,8 +31,8 @@
  * @property {Date} time
  * @property {number|null} ghi
  * @property {number|null} cloudCover
- * @property {number|null} windSpeedKnots
- * @property {number|null} gustSpeedKnots
+ * @property {number|null} windSpeedMs
+ * @property {number|null} gustSpeedMs
  * @property {number|null} windDirectionDeg
  * @property {number|null} [tier] - 1=Open-Meteo, 2=SK Weather, 3=Logbook,
  *           4=Clear Sky. Lower is better quality. Absent on legacy reads.
@@ -138,8 +138,8 @@ function serializeHours(hours) {
     time: h.time instanceof Date ? h.time.toISOString() : h.time,
     ghi: h.ghi ?? null,
     cloudCover: h.cloudCover ?? null,
-    windSpeedKnots: h.windSpeedKnots ?? null,
-    gustSpeedKnots: h.gustSpeedKnots ?? null,
+    windSpeedMs: h.windSpeedMs ?? null,
+    gustSpeedMs: h.gustSpeedMs ?? null,
     windDirectionDeg: h.windDirectionDeg ?? null,
     tier: h.tier ?? null,
   }));
@@ -157,8 +157,15 @@ function deserializeHours(raw) {
     time: new Date(h.time),
     ghi: h.ghi ?? null,
     cloudCover: h.cloudCover ?? null,
-    windSpeedKnots: h.windSpeedKnots ?? null,
-    gustSpeedKnots: h.gustSpeedKnots ?? null,
+    // Read the canonical m/s fields. Legacy caches (pre-m/s) stored wind
+    // in knots under `*Knots` keys; convert those to m/s so old on-disk
+    // caches stay readable without a re-fetch.
+    windSpeedMs:
+      h.windSpeedMs ??
+      (h.windSpeedKnots != null ? h.windSpeedKnots / 1.94384 : null),
+    gustSpeedMs:
+      h.gustSpeedMs ??
+      (h.gustSpeedKnots != null ? h.gustSpeedKnots / 1.94384 : null),
     windDirectionDeg: h.windDirectionDeg ?? null,
     tier: h.tier ?? null,
   }));
@@ -168,8 +175,8 @@ function deserializeHours(raw) {
 const MERGE_FIELDS = [
   "ghi",
   "cloudCover",
-  "windSpeedKnots",
-  "gustSpeedKnots",
+  "windSpeedMs",
+  "gustSpeedMs",
   "windDirectionDeg",
 ];
 

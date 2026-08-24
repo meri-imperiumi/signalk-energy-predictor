@@ -18,9 +18,6 @@ const {
 } = require("./solar.js");
 const weatherCache = require("./weather-cache.js");
 
-/** m/s → knots, matching prediction.js's MS_TO_KN. */
-const MS_TO_KN = 1.94384;
-
 /**
  * Unwraps a Signal K path value to a number, handling both the bare number
  * (as stored in live delta state) and the wrapped `{value: number}` form
@@ -37,13 +34,16 @@ function toNumber(v) {
 }
 
 /**
- * Converts a Signal K wind speed (m/s) to knots, or null if missing.
+ * Normalizes a Signal K wind speed (m/s) to the engine's canonical m/s,
+ * or null if missing. Signal K already carries wind in m/s, so this is a
+ * tolerant passthrough that handles both bare numbers and the wrapped
+ * `{value: number}` form from `app.getSelfPath`.
  * @param {unknown} v
  * @returns {number|null}
  */
-function toKnots(v) {
+function toMs(v) {
   const ms = toNumber(v);
-  return ms == null ? null : ms * MS_TO_KN;
+  return ms == null ? null : ms;
 }
 
 /**
@@ -126,7 +126,7 @@ const Tier = {
 
 /**
  * Weather forecast data point.
- * @typedef {{time: Date, ghi: number, cloudCover: number|null, gustSpeedKnots: number|null, windSpeedKnots: number|null, windDirectionDeg: number|null}} ForecastPoint
+ * @typedef {{time: Date, ghi: number, cloudCover: number|null, gustSpeedMs: number|null, windSpeedMs: number|null, windDirectionDeg: number|null}} ForecastPoint
  */
 
 /**
@@ -186,13 +186,13 @@ function parseOpenMeteoResponse(data) {
       time: date,
       ghi: hourly.shortwave_radiation[i] ?? 0,
       cloudCover: null,
-      gustSpeedKnots:
+      gustSpeedMs:
         hourly.wind_gusts_10m?.[i] != null
-          ? hourly.wind_gusts_10m[i] * 0.539957 // km/h to knots
+          ? hourly.wind_gusts_10m[i] / 3.6 // km/h to m/s
           : null,
-      windSpeedKnots:
+      windSpeedMs:
         hourly.wind_speed_10m?.[i] != null
-          ? hourly.wind_speed_10m[i] * 0.539957 // km/h to knots
+          ? hourly.wind_speed_10m[i] / 3.6 // km/h to m/s
           : null,
       windDirectionDeg: hourly.wind_direction_10m?.[i] ?? null,
     };
@@ -340,14 +340,9 @@ async function fetchSignalKWeather(app, latitude, longitude) {
         time: new Date(point.date),
         ghi: null,
         cloudCover: point.outside?.cloudCover ?? null,
-        gustSpeedKnots:
-          point.wind?.gust != null
-            ? point.wind.gust * 1.94384 // m/s to knots
-            : null,
-        windSpeedKnots:
-          point.wind?.speedTrue != null
-            ? point.wind.speedTrue * 1.94384 // m/s to knots
-            : null,
+        gustSpeedMs: point.wind?.gust != null ? point.wind.gust : null,
+        windSpeedMs:
+          point.wind?.speedTrue != null ? point.wind.speedTrue : null,
         windDirectionDeg:
           point.wind?.directionTrue != null
             ? (point.wind.directionTrue * 180) / Math.PI // radians to degrees
@@ -448,8 +443,8 @@ function generateClearSkyForecast(startTime, hours, latitude, longitude) {
       time,
       ghi: maxIrradiance(altitude),
       cloudCover: 0,
-      gustSpeedKnots: null,
-      windSpeedKnots: null,
+      gustSpeedMs: null,
+      windSpeedMs: null,
       windDirectionDeg: null,
     });
   }
@@ -666,8 +661,8 @@ class IngestionFSM {
             time,
             ghi: irradianceFromCloudCover(altitude, latestCloudCover),
             cloudCover: latestCloudCover,
-            gustSpeedKnots: null,
-            windSpeedKnots: null,
+            gustSpeedMs: null,
+            windSpeedMs: null,
             windDirectionDeg: null,
           });
         }
@@ -748,8 +743,8 @@ class IngestionFSM {
         time: d,
         ghi: p.ghi ?? null,
         cloudCover: p.cloudCover ?? null,
-        windSpeedKnots: p.windSpeedKnots ?? null,
-        gustSpeedKnots: p.gustSpeedKnots ?? null,
+        windSpeedMs: p.windSpeedMs ?? null,
+        gustSpeedMs: p.gustSpeedMs ?? null,
         windDirectionDeg: p.windDirectionDeg ?? null,
       });
     }
@@ -976,8 +971,8 @@ class IngestionFSM {
 
     // Latest-known wind from live SK state (held constant across horizon).
     const latestWind = {
-      speedKnots: toKnots(this.app.getSelfPath("environment.wind.speedTrue")),
-      gustKnots: toKnots(this.app.getSelfPath("environment.wind.gust")),
+      speedMs: toMs(this.app.getSelfPath("environment.wind.speedTrue")),
+      gustMs: toMs(this.app.getSelfPath("environment.wind.gust")),
       directionDeg: windDirectionDeg(
         this.app.getSelfPath("environment.wind.directionTrue"),
       ),
@@ -1021,8 +1016,8 @@ class IngestionFSM {
         time,
         ghi,
         cloudCover,
-        windSpeedKnots: latestWind.speedKnots,
-        gustSpeedKnots: latestWind.gustKnots,
+        windSpeedMs: latestWind.speedMs,
+        gustSpeedMs: latestWind.gustMs,
         windDirectionDeg: latestWind.directionDeg,
         source,
       });
@@ -1032,7 +1027,7 @@ class IngestionFSM {
     this.lastFetchTime = new Date(nowMs);
     this.lastForecast = points;
     this.app.debug(
-      `Stale hybrid: ${points.length} points (solar: ${cloudCover != null ? "logbook oktas" : "clear sky"}, wind: latest-known ${latestWind.speedKnots ?? "?"}kn)`,
+      `Stale hybrid: ${points.length} points (solar: ${cloudCover != null ? "logbook oktas" : "clear sky"}, wind: latest-known ${latestWind.speedMs ?? "?"}m/s)`,
     );
     return this.lastForecast;
   }
@@ -1143,7 +1138,7 @@ class IngestionFSM {
       return {
         ghi: current.ghi,
         cloudCover: current.cloudCover,
-        gustSpeedKnots: current.gustSpeedKnots,
+        gustSpeedMs: current.gustSpeedMs,
         tier: this.currentTier,
       };
     }
@@ -1153,7 +1148,7 @@ class IngestionFSM {
     return {
       ghi: maxIrradiance(altitude),
       cloudCover: 0,
-      gustSpeedKnots: null,
+      gustSpeedMs: null,
       tier: Tier.CLEAR_SKY,
     };
   }

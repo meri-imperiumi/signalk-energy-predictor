@@ -14,7 +14,7 @@
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const { PredictionEngine } = require("../plugin/prediction.js");
+const { PredictionEngine, msFromKnots } = require("../plugin/prediction.js");
 const { parseManufacturerCurve } = require("../plugin/schema.js");
 
 function withCurve(gen) {
@@ -45,12 +45,16 @@ function makeFakeApp() {
  */
 function makeForecast(gustKnots, windKnots, dirDeg = 180) {
   const now = new Date();
+  // Test authors pass knot magnitudes; the engine works in m/s, so
+  // convert at this fixture boundary.
+  const gustMs = msFromKnots(gustKnots);
+  const windMs = msFromKnots(windKnots);
   return Array.from({ length: 24 }, (_, h) => ({
     time: new Date(now.getTime() + h * 3600000),
     ghi: 500,
     cloudCover: 0.3,
-    gustSpeedKnots: gustKnots,
-    windSpeedKnots: windKnots,
+    gustSpeedMs: gustMs,
+    windSpeedMs: windMs,
     windDirectionDeg: dirDeg,
   }));
 }
@@ -143,8 +147,9 @@ test.describe("WPF application: FLINsail gust gate", () => {
     });
 
     engine.runPrediction(makeForecast(25, 15));
-    // Under way → stowed regardless of gust, but the recorded gust is raw
-    assert.strictEqual(engine.getMaxForecastGust(), 25);
+    // Under way → stowed regardless of gust, but the recorded gust is raw.
+    // Engine stores m/s; 25 kn ≈ 12.86 m/s.
+    assert.ok(Math.abs(engine.getMaxForecastGust() - msFromKnots(25)) < 1e-9);
   });
 });
 
@@ -278,7 +283,7 @@ test.describe("WPF application: no wind direction", () => {
         .recommendedState,
       "deployed",
     );
-    assert.strictEqual(engine.getMaxForecastGust(), 10);
+    assert.ok(Math.abs(engine.getMaxForecastGust() - msFromKnots(10)) < 1e-9);
     assert.strictEqual(called, false);
   });
 });

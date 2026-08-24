@@ -37,8 +37,8 @@ function hp(hour, over = {}) {
     time: new Date(`2026-08-20T${String(hour).padStart(2, "0")}:00:00Z`),
     ghi: 500,
     cloudCover: 0.3,
-    windSpeedKnots: 10,
-    gustSpeedKnots: 15,
+    windSpeedMs: 10,
+    gustSpeedMs: 15,
     windDirectionDeg: 90,
     tier: 1,
     ...over,
@@ -85,6 +85,38 @@ test("write then read round-trips with Date objects and tier preserved", async (
   assert.strictEqual(got[0].time.toISOString(), NOON_ISO);
   assert.strictEqual(got[0].ghi, 800);
   assert.strictEqual(got[0].tier, 1);
+});
+
+test("readWeatherCache converts legacy *Knots wind fields to m/s", async () => {
+  // Pre-m/s caches stored wind in knots under `windSpeedKnots`/
+  // `gustSpeedKnots`. New reads must convert those to m/s so old on-disk
+  // caches stay readable without a re-fetch.
+  const dir = await mkTmpDir();
+  const bucket = { latitude: 60.17, longitude: 21.39 };
+  const filePath = weatherCachePath(dir, DATE, bucket);
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  // 10 kn ≈ 5.144 m/s, 15 kn ≈ 7.716 m/s
+  await fs.writeFile(
+    filePath,
+    JSON.stringify([
+      {
+        time: NOON_ISO,
+        ghi: 500,
+        cloudCover: 0.3,
+        windSpeedKnots: 10,
+        gustSpeedKnots: 15,
+        windDirectionDeg: 90,
+        tier: 1,
+      },
+    ]),
+  );
+  const got = await readWeatherCache(dir, DATE, bucket);
+  assert.ok(got);
+  assert.strictEqual(got.length, 1);
+  assert.ok(Math.abs(got[0].windSpeedMs - 10 / 1.94384) < 1e-9);
+  assert.ok(Math.abs(got[0].gustSpeedMs - 15 / 1.94384) < 1e-9);
+  // New field name is what callers see; the legacy key must not leak through.
+  assert.strictEqual("windSpeedKnots" in got[0], false);
 });
 
 test("better tier wins per hour on overwrite (Clear Sky must not clobber Open-Meteo)", async () => {
