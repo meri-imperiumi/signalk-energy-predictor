@@ -67,6 +67,13 @@ const DEBOUNCE_MS = 5 * 60 * 1000; // 5 minutes
  * human-facing notification text only; all timestamps emitted as deltas stay
  * in UTC (ISO 8601).
  *
+ * There is currently no "ship's time" / on-board local-clock source exposed
+ * by Signal K, so longitude-derived solar-local is used as a stand-in. If
+ * Signal K later exposes a vessel timezone or an explicit ship's-time offset,
+ * callers should source the offset from there instead of this function — the
+ * dedup keying and the `formatLocalHHMM` rendering are offset-agnostic and
+ * only the offset value would change.
+ *
  * Returns `null` when the longitude is unknown so callers can fall back to the
  * server's own timezone rendering.
  *

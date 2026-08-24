@@ -12,6 +12,16 @@
  * When it is null (position unknown) the browser's own timezone is used
  * as a fallback so the UI still works.
  *
+ * Why solar-local and not a civil zone: the crew lives by the sun, and a
+ * vessel's civil zone offset (if one is even set) can lag the sun by up to
+ * an hour and changes on a schedule the predictor doesn't control. There
+ * is currently no "ship's time" / on-board local-clock source exposed by
+ * Signal K, so longitude-derived solar-local is used as a stand-in. If
+ * Signal K later exposes a vessel timezone or an explicit ship's-time
+ * offset, this module and `/api/vessel` should switch to it without
+ * changing any formatter signatures — the offset is the only thing that
+ * needs to be sourced differently.
+ *
  * All formatters take an epoch-ms instant and return a string in the
  * solar-local frame. They shift the instant by the offset and format
  * with UTC getters — avoiding any dependency on the host's Intl

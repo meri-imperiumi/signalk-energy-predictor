@@ -792,6 +792,13 @@ function registerApiRoutes(
   // under yesterday or tomorrow depending on the browser timezone. Returns
   // null when the position is unknown so the client falls back to the
   // browser timezone.
+  //
+  // Why solar-local and not a civil zone: there is currently no "ship's
+  // time" / on-board local-clock source exposed by Signal K, so longitude-
+  // derived solar-local is a stand-in. If Signal K later exposes a vessel
+  // timezone or an explicit ship's-time offset, this endpoint should return
+  // that instead — the webapp consumes only `solarOffsetMinutes`, so no
+  // client change is needed beyond sourcing the value differently.
   router.get("/api/vessel", (_req, res) => {
     const pos = app.getSelfPath?.("navigation.position");
     const longitude =
