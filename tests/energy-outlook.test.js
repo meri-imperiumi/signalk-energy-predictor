@@ -125,6 +125,12 @@ test.describe("PredictionEngine.getEnergyOutlook", () => {
     const outlook = engine.getEnergyOutlook();
     assert.strictEqual(outlook.status, "deficit");
     assert.ok(outlook.endSoC < outlook.currentSoC - 0.05);
+    // Net balance is negative and matches the SoC drop × capacity.
+    assert.ok(outlook.net24hWh < 0, `net24hWh=${outlook.net24hWh}`);
+    assert.strictEqual(
+      outlook.net24hWh,
+      Math.round((outlook.endSoC - outlook.currentSoC) * 4800),
+    );
   });
 
   test("reports stable when SoC ends within 5 points of now", () => {
@@ -135,6 +141,11 @@ test.describe("PredictionEngine.getEnergyOutlook", () => {
     const outlook = engine.getEnergyOutlook();
     assert.strictEqual(outlook.status, "stable");
     assert.ok(Math.abs(outlook.endSoC - outlook.currentSoC) <= 0.05);
+    // Stable → net balance near zero (within rounding of the small draw).
+    assert.ok(
+      Math.abs(outlook.net24hWh) <= 240,
+      `net24hWh=${outlook.net24hWh}`,
+    );
   });
 
   test("reports rising when production outpaces consumption", () => {
@@ -148,6 +159,13 @@ test.describe("PredictionEngine.getEnergyOutlook", () => {
     assert.strictEqual(outlook.status, "rising");
     assert.ok(outlook.endSoC > outlook.currentSoC + 0.05);
     assert.strictEqual(outlook.surplusWh, 0);
+    // Rising without hitting the 100% clamp still reads as a positive
+    // net balance — the whole point of the new path.
+    assert.ok(outlook.net24hWh > 0, `net24hWh=${outlook.net24hWh}`);
+    assert.strictEqual(
+      outlook.net24hWh,
+      Math.round((outlook.endSoC - outlook.currentSoC) * 4800),
+    );
   });
 
   test("reports surplus when the 100% clamp curtails production", () => {
@@ -158,6 +176,10 @@ test.describe("PredictionEngine.getEnergyOutlook", () => {
     assert.strictEqual(outlook.status, "surplus");
     assert.ok(outlook.surplusWh > 0, `surplus ${outlook.surplusWh} Wh`);
     assert.strictEqual(outlook.hours, 24);
+    // Bank starts full and the clamp holds it at 100%, so the stored
+    // energy doesn't change — net balance is ~0 even though curtailment
+    // surplus is positive (reported separately at surplusWh).
+    assert.strictEqual(outlook.net24hWh, 0);
   });
 
   test("critical outranks surplus", () => {
@@ -178,9 +200,9 @@ function makePublisher() {
 }
 
 test.describe("AdvisoryPublisher outlook/yield/gust deltas", () => {
-  test("publishEnergyOutlook publishes the status string", () => {
+  test("publishEnergyOutlook publishes the status string and net24hWh", () => {
     const { app, pub } = makePublisher();
-    pub.publishEnergyOutlook({ status: "critical" });
+    pub.publishEnergyOutlook({ status: "critical", net24hWh: -1200 });
     const call = app.handleMessageCalls.at(-1);
     const values = call.msg.updates[0].values;
     assert.strictEqual(
@@ -188,9 +210,13 @@ test.describe("AdvisoryPublisher outlook/yield/gust deltas", () => {
         .value,
       "critical",
     );
+    assert.strictEqual(
+      values.find((v) => v.path === "electrical.energy.prediction.net").value,
+      -1200,
+    );
   });
 
-  test("publishEnergyOutlook degrades to null without a prediction", () => {
+  test("publishEnergyOutlook degrades to null/0 without a prediction", () => {
     const { app, pub } = makePublisher();
     pub.publishEnergyOutlook(null);
     const call = app.handleMessageCalls.at(-1);
@@ -200,6 +226,10 @@ test.describe("AdvisoryPublisher outlook/yield/gust deltas", () => {
         .value,
       null,
     );
+    assert.strictEqual(
+      values.find((v) => v.path === "electrical.energy.prediction.net").value,
+      0,
+    );
   });
 
   test("publishForecastYield publishes rounded Wh totals", () => {
@@ -208,14 +238,13 @@ test.describe("AdvisoryPublisher outlook/yield/gust deltas", () => {
     const values = app.handleMessageCalls.at(-1).msg.updates[0].values;
     assert.strictEqual(
       values.find(
-        (v) => v.path === "electrical.energy.prediction.forecast.solar24h",
+        (v) => v.path === "electrical.energy.prediction.forecast.solar",
       ).value,
       1235,
     );
     assert.strictEqual(
       values.find(
-        (v) =>
-          v.path === "electrical.energy.prediction.forecast.consumption24h",
+        (v) => v.path === "electrical.energy.prediction.forecast.consumption",
       ).value,
       987,
     );
@@ -271,12 +300,17 @@ test.describe("AdvisoryPublisher outlook/yield/gust deltas", () => {
       "timestamp",
     );
     assert.strictEqual(
-      byPath["electrical.energy.prediction.forecast.solar24h"].units,
+      byPath["electrical.energy.prediction.forecast.solar"].units,
       "Wh",
     );
     assert.strictEqual(
-      byPath["electrical.energy.prediction.forecast.consumption24h"].units,
+      byPath["electrical.energy.prediction.forecast.consumption"].units,
       "Wh",
+    );
+    assert.strictEqual(byPath["electrical.energy.prediction.net"].units, "Wh");
+    assert.strictEqual(
+      byPath["electrical.energy.prediction.net"].displayName,
+      "Net energy balance 24h",
     );
     assert.strictEqual(byPath["environment.wind.gust"].units, "m/s");
   });

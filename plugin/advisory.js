@@ -261,7 +261,7 @@ class AdvisoryPublisher {
         },
       },
       {
-        path: `${PREDICTION_BASE}.surplusWh`,
+        path: `${PREDICTION_BASE}.surplus`,
         value: {
           displayName: "Surplus energy",
           description:
@@ -322,7 +322,16 @@ class AdvisoryPublisher {
         },
       },
       {
-        path: `${PREDICTION_BASE}.forecast.solar24h`,
+        path: `${PREDICTION_BASE}.net`,
+        value: {
+          displayName: "Net energy balance 24h",
+          description:
+            "Estimated net energy balance over the next 24 hours on the ideal track (Wh): positive when the battery is projected to rise (a surplus, even when it never reaches the 100% curtailment threshold), negative when it is projected to fall (a deficit). This is the bank trajectory; curtailment surplus is reported separately at electrical.energy.prediction.surplus. 0 when no prediction is available.",
+          units: "Wh",
+        },
+      },
+      {
+        path: `${PREDICTION_BASE}.forecast.solar`,
         value: {
           displayName: "Estimated solar production 24h",
           description:
@@ -331,7 +340,7 @@ class AdvisoryPublisher {
         },
       },
       {
-        path: `${PREDICTION_BASE}.forecast.consumption24h`,
+        path: `${PREDICTION_BASE}.forecast.consumption`,
         value: {
           displayName: "Estimated power consumption 24h",
           description:
@@ -470,7 +479,7 @@ class AdvisoryPublisher {
           },
         },
         {
-          path: `${base}.missedYieldWh`,
+          path: `${base}.missedYield`,
           value: {
             displayName: `Missed yield (${device.id})`,
             description: `Energy yield missed by not deploying ${device.id} over the recommendation horizon`,
@@ -669,7 +678,7 @@ class AdvisoryPublisher {
       updates[`${PREDICTION_BASE}.deployment.${rec.id}.detectedState`] =
         currentStates.get(rec.id) ?? null;
       updates[`${PREDICTION_BASE}.deployment.${rec.id}.reason`] = rec.reason;
-      updates[`${PREDICTION_BASE}.deployment.${rec.id}.missedYieldWh`] =
+      updates[`${PREDICTION_BASE}.deployment.${rec.id}.missedYield`] =
         rec.missedYieldWh ?? 0;
       updates[`${PREDICTION_BASE}.deployment.${rec.id}.recommendedStateTime`] =
         rec.recommendedStateTime ?? null;
@@ -835,15 +844,21 @@ class AdvisoryPublisher {
 
   /**
    * Publishes the overall energy outlook status for the next 24 hours —
-   * a single glanceable value for instrument panels.
+   * a single glanceable value for instrument panels. Also publishes the
+   * net 24h energy balance (Wh): positive when the bank is projected to
+   * rise (a surplus, even without reaching the curtailment threshold),
+   * negative when projected to fall (a deficit).
    *
-   * @param {{status: string}|null} outlook - Energy outlook from
-   *        PredictionEngine.getEnergyOutlook(), or null when no prediction
+   * @param {{status: string, net24hWh?: number}|null} outlook - Energy
+   *        outlook from PredictionEngine.getEnergyOutlook(), or null
+   *        when no prediction
    * @returns {void}
    */
   publishEnergyOutlook(outlook) {
     this.publishDelta({
       [`${PREDICTION_BASE}.status`]: outlook?.status ?? null,
+      [`${PREDICTION_BASE}.net`]:
+        outlook && Number.isFinite(outlook.net24hWh) ? outlook.net24hWh : 0,
     });
   }
 
@@ -859,10 +874,10 @@ class AdvisoryPublisher {
    */
   publishForecastYield(solarWh24h, consumptionWh24h) {
     this.publishDelta({
-      [`${PREDICTION_BASE}.forecast.solar24h`]: Number.isFinite(solarWh24h)
+      [`${PREDICTION_BASE}.forecast.solar`]: Number.isFinite(solarWh24h)
         ? Math.round(solarWh24h)
         : null,
-      [`${PREDICTION_BASE}.forecast.consumption24h`]: Number.isFinite(
+      [`${PREDICTION_BASE}.forecast.consumption`]: Number.isFinite(
         consumptionWh24h,
       )
         ? Math.round(consumptionWh24h)
@@ -1162,7 +1177,7 @@ class AdvisoryPublisher {
       // Also expose the value as a delta so consumers can act without
       // parsing the notification.
       this.publishDelta({
-        [`${PREDICTION_BASE}.surplusWh`]: opportunity.surplusWh,
+        [`${PREDICTION_BASE}.surplus`]: opportunity.surplusWh,
         [`${PREDICTION_BASE}.surplus.from`]: opportunity.from.toISOString(),
         [`${PREDICTION_BASE}.surplus.to`]: opportunity.to.toISOString(),
       });
@@ -1173,7 +1188,7 @@ class AdvisoryPublisher {
         "No surplus opportunity",
       );
       this.publishDelta({
-        [`${PREDICTION_BASE}.surplusWh`]: 0,
+        [`${PREDICTION_BASE}.surplus`]: 0,
         [`${PREDICTION_BASE}.surplus.from`]: null,
         [`${PREDICTION_BASE}.surplus.to`]: null,
       });

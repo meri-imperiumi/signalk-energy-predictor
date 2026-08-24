@@ -378,7 +378,7 @@ test.describe("publishSurplusAdvisory", () => {
     return app.handleMessageCalls
       .filter((c) => c.msg.updates)
       .flatMap((c) => c.msg.updates[0].values)
-      .filter((v) => v.path.startsWith(pathPrefix));
+      .filter((v) => v.path === pathPrefix);
   }
 
   test("publishes a warn notification with window and Wh amount", () => {
@@ -435,7 +435,7 @@ test.describe("publishSurplusAdvisory", () => {
     );
   });
 
-  test("publishes the surplusWh / from / to deltas", () => {
+  test("publishes the surplus / from / to deltas", () => {
     const app = makeFakeApp();
     const pub = new AdvisoryPublisher(app, "test-plugin");
     const from = new Date("2026-06-21T11:00:00Z");
@@ -444,7 +444,7 @@ test.describe("publishSurplusAdvisory", () => {
       { surplusWh: 800, from, to, suggestedLoadW: 160 },
       [],
     );
-    const wh = getDeltas(app, "electrical.energy.prediction.surplusWh");
+    const wh = getDeltas(app, "electrical.energy.prediction.surplus");
     assert.ok(wh.length > 0);
     assert.strictEqual(wh[wh.length - 1].value, 800);
     const fromD = getDeltas(app, "electrical.energy.prediction.surplus.from");
@@ -462,7 +462,7 @@ test.describe("publishSurplusAdvisory", () => {
     );
     assert.ok(n, "a normal-state clearing notification should be published");
     assert.strictEqual(n.value.state, "normal");
-    const wh = getDeltas(app, "electrical.energy.prediction.surplusWh");
+    const wh = getDeltas(app, "electrical.energy.prediction.surplus");
     assert.ok(wh.length > 0);
     assert.strictEqual(wh[wh.length - 1].value, 0);
   });

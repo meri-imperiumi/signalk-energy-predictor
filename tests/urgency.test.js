@@ -838,7 +838,7 @@ test("publishSurplusAdvisory: held notification still publishes surplus Wh/windo
   );
   const wh = app.handleMessageCalls
     .flatMap((c) => (c.msg.updates || []).flatMap((u) => u.values || []))
-    .find((v) => v.path === "electrical.energy.prediction.surplusWh");
-  assert.ok(wh, "surplusWh delta published even when notification held");
+    .find((v) => v.path === "electrical.energy.prediction.surplus");
+  assert.ok(wh, "surplus delta published even when notification held");
   assert.strictEqual(wh.value, 1600);
 });

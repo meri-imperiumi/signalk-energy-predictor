@@ -3270,7 +3270,8 @@ class PredictionEngine {
    *
    * @returns {{status: "surplus"|"rising"|"stable"|"deficit"|"critical",
    *           currentSoC: number, endSoC: number, minSoC: number,
-   *           criticalSoC: number, surplusWh: number, hours: number}|null}
+   *           criticalSoC: number, surplusWh: number, net24hWh: number,
+   *           hours: number}|null}
    *          null when no prediction has been run
    */
   getEnergyOutlook() {
@@ -3294,6 +3295,14 @@ class PredictionEngine {
 
     const endSoC = track[track.length - 1].idealSoC;
     const minSoC = Math.min(currentSoC, ...track.map((p) => p.idealSoC));
+    // Net energy balance over the window on the ideal track: the change
+    // in stored energy, positive when the bank is projected to rise
+    // (a surplus even when it never reaches the 100% curtailment clamp)
+    // and negative when it is projected to fall (a deficit). This is the
+    // physical bank trajectory; the curtailment-only `surplusWh` above is
+    // the energy the 100% clamp throws away once the bank is already
+    // full — the two are distinct and do not double-count.
+    const net24hWh = Math.round((endSoC - currentSoC) * this.capacityWh);
 
     let status;
     if (minSoC < this.criticalSoC) {
@@ -3316,6 +3325,7 @@ class PredictionEngine {
       minSoC,
       criticalSoC: this.criticalSoC,
       surplusWh: Math.round(surplusWh),
+      net24hWh,
       hours,
     };
   }

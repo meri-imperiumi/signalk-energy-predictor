@@ -874,7 +874,7 @@ test.describe("Missed yield calculation", () => {
       paths[v.path] = v.value;
     }
     assert.strictEqual(
-      paths["electrical.energy.prediction.deployment.flinsail.missedYieldWh"],
+      paths["electrical.energy.prediction.deployment.flinsail.missedYield"],
       1200,
     );
   });
@@ -1112,7 +1112,7 @@ test.describe("AdvisoryPublisher.sendMeta", () => {
     );
     // Surplus-energy paths emitted by publishSurplusAdvisory
     assert.strictEqual(
-      byPath["electrical.energy.prediction.surplusWh"].units,
+      byPath["electrical.energy.prediction.surplus"].units,
       "Wh",
     );
     assert.strictEqual(
@@ -1144,13 +1144,13 @@ test.describe("AdvisoryPublisher.sendMeta", () => {
     );
     assert.ok(
       paths.includes(
-        "electrical.energy.prediction.deployment.windgen.missedYieldWh",
+        "electrical.energy.prediction.deployment.windgen.missedYield",
       ),
     );
     const flinsailMissed = metaCall.msg.updates[0].meta.find(
       (m) =>
         m.path ===
-        "electrical.energy.prediction.deployment.flinsail.missedYieldWh",
+        "electrical.energy.prediction.deployment.flinsail.missedYield",
     );
     assert.strictEqual(flinsailMissed.value.units, "Wh");
 

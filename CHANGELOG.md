@@ -49,11 +49,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   from the ideal track over the next 24 h by
   `PredictionEngine.getEnergyOutlook()`, published every cycle with
   metadata.
+- `electrical.energy.prediction.net` (`Wh`) — estimated net energy
+  balance over the next 24 h on the ideal track: positive when the
+  battery is projected to rise (a surplus, even when it never reaches
+  the 100% curtailment threshold), negative when projected to fall (a
+  deficit). This is the bank trajectory; curtailment surplus is
+  reported separately at `electrical.energy.prediction.surplus`. `0`
+  when no prediction is available. Also exposed on
+  `getEnergyOutlook()`'s return as `net24hWh`.
 - `electrical.energy.prediction.weather.validTo` (`timestamp`) — when the
   current forecast coverage ends (end of the last covered hour), alongside
   the existing source/valid-hours paths.
-- `electrical.energy.prediction.forecast.solar24h` (`Wh`) and
-  `…forecast.consumption24h` (`Wh`) — estimated 24 h solar production
+- `electrical.energy.prediction.forecast.solar` (`Wh`) and
+  `…forecast.consumption` (`Wh`) — estimated 24 h solar production
   (ideal track) and house consumption from the current prediction.
 - `environment.wind.gust` (`m/s`) — derived gust (max of recent wind
   speed samples, the same recipe WPF learning uses; no dedicated gust
@@ -129,6 +137,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The hourly prediction no longer rounds stored wind values to one
     decimal; rounding happens at display boundaries (knots rendering in
     `getHourlyForecast`) only.
+- Signal K path names under `electrical.energy.prediction` no longer
+  embed units; the unit lives in the path's metadata (`units: "Wh"`),
+  matching the wind-protection paths above and Signal K convention.
+  Published paths renamed (breaking for external consumers reading these
+  by name):
+  - `…surplusWh` → `…surplus` (the scalar; `…surplus.from` / `…surplus.to`
+    are unchanged, so `surplus` is now a clean parent path).
+  - `…deployment.<id>.missedYieldWh` → `…deployment.<id>.missedYield`.
+  The new `…net` and `…forecast.solar` / `…forecast.consumption` paths
+  (see Added below) are unitless by construction.
 
 ### Added
 - Two new Signal K deltas expose the weather-forecast status the
@@ -147,7 +165,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Published each prediction cycle via `publishAll` (data, not a
   notification), with `sendMeta` metadata for both paths.
 - Signal K metadata for the surplus-energy paths
-  `electrical.energy.prediction.surplusWh` (`Wh`), `surplus.from` and
+  `electrical.energy.prediction.surplus` (`Wh`), `surplus.from` and
   `surplus.to` (`timestamp`), emitted by `sendMeta` alongside the existing
   `timeToFull`/`timeToEmpty`/wind-protection/deployment meta. Consumers and
   instrument panels can now render the surplus value and window endpoints
