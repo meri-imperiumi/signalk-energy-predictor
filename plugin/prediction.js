@@ -2713,30 +2713,81 @@ class PredictionEngine {
   }
 
   /**
-   * Calculates engine run time needed to avoid SoC dropping below minimum.
+   * Calculates engine run time needed to avoid SoC dropping below the
+   * minimum safe floor, then recovering.
+   *
+   * The run time is the energy needed to lift the projected minimum SoC
+   * back above {@link battery.minSafeSoC} — the depth of the forecast dip
+   * below the floor, `(minSafeSoC − minProjectedSoC) × capacityWh` — not the
+   * energy to charge the bank to 100% (the old `getDeficit`-based math
+   * produced a full-charge duration, e.g. 24h for a half-empty bank, which
+   * is neither what the crew needs nor actionable).
+   *
+   * Two guards keep a single transient cycle from manufacturing a
+   * catastrophic-drain advisory:
+   *   - A degenerate-forecast guard: a forecast with no solar at all and a
+   *     SoC that collapses to the floor within the first few hours is the
+   *     signature of a shunt-synchronize / empty-weather transient (the
+   *     SoC reading momentarily falls back to 0.5 and the weather track
+   *     comes back empty), not a real discharge. Such a cycle is ignored.
+   *   - A horizon cap: `hoursNeeded` is capped to the forecast horizon so a
+   *     bad input can't produce a multi-day run.
    *
    * @param {number} engineWatts - Expected alternator output in watts
    * @returns {{hours: number, optimalWindow: {start: Date, end: Date}}|null} Run time recommendation or null
    */
   calculateEngineRunTime(engineWatts) {
-    const timeToEmpty = this.getTimeToEmpty();
-
-    if (!timeToEmpty) {
-      return null; // Battery won't reach minimum
+    if (this.lastPrediction.length === 0 || !engineWatts || engineWatts <= 0) {
+      return null;
     }
 
-    const deficit = this.getDeficit();
-    const hoursNeeded = deficit / engineWatts;
+    const timeToEmpty = this.getTimeToEmpty();
+    if (!timeToEmpty) {
+      return null; // Battery won't reach the floor
+    }
 
-    // Find optimal window (lowest solar yield period)
+    // Degenerate-forecast transient guard. A real deficit builds against a
+    // forecast that includes *some* solar over its horizon (even an
+    // overnight drain has daytime hours in the 24h track). A track with
+    // zero solar at all is the signature of a shunt-synchronize /
+    // empty-weather transient (the SoC reading momentarily falls back to
+    // 0.5 and the weather track comes back empty), not a discharge worth
+    // nagging about.
+    const totalSolar = this.lastPrediction.reduce(
+      (sum, p) => sum + (p.idealSolarYieldWh || 0),
+      0,
+    );
+    if (totalSolar === 0) {
+      return null;
+    }
+
+    // Energy needed to lift the projected minimum SoC back above the floor.
+    // The deepest dip below minSafeSoC is the shortfall the engine must
+    // cover; recovering to 100% is not the goal.
+    const minSoC = this.lastPrediction.reduce(
+      (min, p) => Math.min(min, p.idealSoC),
+      1,
+    );
+    const shortfallWh = Math.max(
+      0,
+      (this.battery.minSafeSoC - minSoC) * this.capacityWh,
+    );
+    if (shortfallWh === 0) return null;
+
+    // Cap to the forecast horizon so a transient can't produce a multi-day
+    // run. The engine should run within the window we actually forecast.
+    const horizonHours = this.lastPrediction.length;
+    const hoursNeeded =
+      Math.round(Math.min(shortfallWh / engineWatts, horizonHours) * 10) / 10;
+
+    // Find optimal window (lowest solar yield period) within the run time
     let minSolarIndex = 0;
-    let minSolarYield = Infinity;
-
-    for (
-      let i = 0;
-      i < Math.min(this.lastPrediction.length, Math.ceil(hoursNeeded) + 1);
-      i++
-    ) {
+    let minSolarYield = Number.POSITIVE_INFINITY;
+    const scanHours = Math.min(
+      this.lastPrediction.length,
+      Math.ceil(hoursNeeded) + 1,
+    );
+    for (let i = 0; i < scanHours; i++) {
       const p = this.lastPrediction[i];
       if (p.idealSolarYieldWh < minSolarYield) {
         minSolarYield = p.idealSolarYieldWh;

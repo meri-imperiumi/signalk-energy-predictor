@@ -96,6 +96,25 @@ test("app clears the chart and events list together on window change", () => {
   );
 });
 
+test('events list header reads "Events" and interleaves advisories', () => {
+  const source = readFileSync(
+    path.join(PUBLIC_DIR, "ep-actions-list.js"),
+    "utf8",
+  );
+  // The section is a general Events list now, not just deploy/stow
+  assert.match(source, /header\.textContent = "Events"/);
+  // Surplus ("surplus") and engine-run deficit ("engine_run") advisories are
+  // rendered as a third event kind alongside detected/recommended
+  assert.match(source, /kind: "advisory"/);
+  assert.match(source, /advisoryBadge/);
+  assert.match(source, /"surplus"/);
+  assert.match(source, /"engine_run"/);
+  // Surplus advisories render the elective-load suggestions the plugin
+  // records alongside the terse notification message
+  assert.match(source, /ev\.loads\?\.length/);
+  assert.match(source, /Could run:/);
+});
+
 test("chart overlays retro-predicted when no recorded cycle covers the window", () => {
   const source = readFileSync(
     path.join(PUBLIC_DIR, "ep-timeline-chart.js"),

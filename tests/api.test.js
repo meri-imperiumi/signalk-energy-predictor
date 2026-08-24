@@ -27,6 +27,7 @@ const {
   registerApiRoutes,
   resolveNavState,
   MAX_WINDOW_DAYS,
+  offsetMinutesFromSamples,
 } = require("../plugin/api.js");
 const openApiSpec = require("../schema/openapi.json");
 
@@ -701,6 +702,197 @@ test("buildDeployStates: empty inputs yield empty lists", () => {
   const res = buildDeployStates([], [], new Date(0), new Date(1));
   assert.deepStrictEqual(res.detected, []);
   assert.deepStrictEqual(res.recommendations, []);
+  assert.deepStrictEqual(res.advisories, []);
+});
+
+test("buildDeployStates: advisories from recorded cycles, deduped + window-filtered", () => {
+  const from = new Date("2026-08-23T00:00:00Z");
+  const to = new Date("2026-08-23T23:59:00Z");
+  // Two cycles report the same surplus window at 14:00; the newer cycle's
+  // message wins. An engine-run advisory at 06:00 is inside the window; an
+  // out-of-window surplus (next day) is dropped.
+  const cycles = [
+    {
+      timestamp: "2026-08-23T08:00:00.000Z",
+      advisories: [
+        {
+          type: "surplus",
+          time: "2026-08-23T14:00:00.000Z",
+          message: "1.2 kWh surplus available 14:00-18:00",
+        },
+      ],
+    },
+    {
+      timestamp: "2026-08-23T08:15:00.000Z",
+      advisories: [
+        {
+          type: "surplus",
+          time: "2026-08-23T14:00:00.000Z",
+          message: "1.5 kWh surplus available 14:00-19:00",
+          surplusWh: 1500,
+          from: "2026-08-23T14:00:00.000Z",
+          to: "2026-08-23T19:00:00.000Z",
+          sustainedW: 150,
+          loads: [{ name: "Watermaker", watts: 150, runHours: 5 }],
+        },
+        {
+          type: "engine_run",
+          time: "2026-08-23T06:00:00.000Z",
+          message:
+            "Run engine for 1.5h between 06:00-07:30 to avoid low battery",
+        },
+        {
+          type: "surplus",
+          time: "2026-08-24T14:00:00.000Z",
+          message: "Out-of-window surplus",
+        },
+      ],
+    },
+  ];
+  const res = buildDeployStates([], cycles, from, to);
+  assert.deepStrictEqual(
+    res.advisories.map((a) => ({ type: a.type, message: a.message })),
+    [
+      {
+        type: "engine_run",
+        message: "Run engine for 1.5h between 06:00-07:30 to avoid low battery",
+      },
+      {
+        type: "surplus",
+        message: "1.5 kWh surplus available 14:00-19:00",
+      },
+    ],
+  );
+  // Structured surplus fields pass through verbatim so the UI can render
+  // richer detail than the terse notification message.
+  const surplus = res.advisories.find((a) => a.type === "surplus");
+  assert.strictEqual(surplus.surplusWh, 1500);
+  assert.deepStrictEqual(surplus.loads, [
+    { name: "Watermaker", watts: 150, runHours: 5 },
+  ]);
+  // Detected/recommendations empty (no samples / no forecast actions)
+  assert.deepStrictEqual(res.detected, []);
+  assert.deepStrictEqual(res.recommendations, []);
+});
+
+test("buildDeployStates: advisory dedup keys on solar-local sun-day, not UTC", () => {
+  // Two cycles forecast the same local-day surplus, but their window
+  // starts straddle UTC midnight (UTC-10 offset): 13:46 local = 23:46 UTC
+  // on Aug 23, and 14:05 local = 00:05 UTC on Aug 24. Keying on UTC date
+  // would split them into two events; keying on the solar-local sun-day
+  // collapses them to one, keeping the newest cycle's version.
+  const from = new Date("2026-08-23T00:00:00Z");
+  const to = new Date("2026-08-25T00:00:00Z");
+  const cycles = [
+    {
+      timestamp: "2026-08-23T08:00:00.000Z",
+      advisories: [
+        {
+          type: "surplus",
+          time: "2026-08-23T23:46:00.000Z", // 13:46 local Aug 23
+          message: "1.4kWh surplus available 13:46-17:46",
+          surplusWh: 1400,
+        },
+      ],
+    },
+    {
+      timestamp: "2026-08-23T08:15:00.000Z",
+      advisories: [
+        {
+          type: "surplus",
+          time: "2026-08-24T00:05:00.000Z", // 14:05 local Aug 23
+          message: "1.6kWh surplus available 14:05-18:05",
+          surplusWh: 1600,
+        },
+      ],
+    },
+  ];
+  const res = buildDeployStates([], cycles, from, to, {
+    solarOffsetMinutes: -10 * 60, // UTC-10
+  });
+  assert.strictEqual(res.advisories.length, 1);
+  assert.strictEqual(res.advisories[0].surplusWh, 1600); // newest wins
+});
+
+test("offsetMinutesFromSamples: derives solar offset from most recent in-window sample", () => {
+  // Longitude 150°E → +600 minutes (UTC+10). Older in-window sample at a
+  // different longitude must NOT win over the most recent one.
+  const from = new Date("2026-08-23T00:00:00Z");
+  const to = new Date("2026-08-23T23:59:00Z");
+  const samples = [
+    {
+      timestamp: "2026-08-23T06:00:00Z",
+      position: { latitude: 0, longitude: 0 }, // would be 0 min
+    },
+    {
+      timestamp: "2026-08-23T18:00:00Z",
+      position: { latitude: 0, longitude: 150 }, // UTC+10
+    },
+  ];
+  assert.strictEqual(offsetMinutesFromSamples(samples, from, to), 600);
+});
+
+test("offsetMinutesFromSamples: returns null when no in-window sample has position", () => {
+  const from = new Date("2026-08-23T00:00:00Z");
+  const to = new Date("2026-08-23T23:59:00Z");
+  const samples = [
+    { timestamp: "2026-08-23T06:00:00Z", position: null },
+    { timestamp: "2026-08-23T18:00:00Z" }, // no position field
+  ];
+  assert.strictEqual(offsetMinutesFromSamples(samples, from, to), null);
+});
+
+test("buildDeployStates: advisories dedupe by calendar day across minute-drift between cycles", () => {
+  // Each cycle's forecast is anchored at its own run timestamp, so the same
+  // logical surplus window (bank hits full at ~14:00) is reported by
+  // consecutive cycles with window starts that drift by minutes (14:00,
+  // 14:08, 14:15). There is at most one surplus event per day, so these
+  // must collapse to ONE event in the Events list keeping the newest
+  // cycle's version — otherwise the list floods with near-duplicates every
+  // cycle.
+  const from = new Date("2026-08-23T00:00:00Z");
+  const to = new Date("2026-08-23T23:59:00Z");
+  const cycles = [
+    {
+      timestamp: "2026-08-23T08:00:00.000Z",
+      advisories: [
+        {
+          type: "surplus",
+          time: "2026-08-23T14:00:00.000Z",
+          message: "1.2 kWh surplus available 14:00-18:00",
+          surplusWh: 1200,
+        },
+      ],
+    },
+    {
+      timestamp: "2026-08-23T08:08:00.000Z",
+      advisories: [
+        {
+          type: "surplus",
+          time: "2026-08-23T14:08:00.000Z",
+          message: "1.5 kWh surplus available 14:08-19:08",
+          surplusWh: 1500,
+        },
+      ],
+    },
+    {
+      timestamp: "2026-08-23T08:15:00.000Z",
+      advisories: [
+        {
+          type: "surplus",
+          time: "2026-08-23T14:15:00.000Z",
+          message: "1.6 kWh surplus available 14:15-19:15",
+          surplusWh: 1600,
+        },
+      ],
+    },
+  ];
+  const res = buildDeployStates([], cycles, from, to);
+  assert.strictEqual(res.advisories.length, 1);
+  assert.strictEqual(res.advisories[0].type, "surplus");
+  // Newest cycle's version wins (last written for that date key)
+  assert.strictEqual(res.advisories[0].surplusWh, 1600);
+  assert.match(res.advisories[0].message, /14:15/);
 });
 
 test("buildDeployStates: prior state from before window suppresses first-entry emission", () => {

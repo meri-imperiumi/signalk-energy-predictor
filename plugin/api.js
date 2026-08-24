@@ -36,6 +36,41 @@ const MS_PER_HOUR = 3600000;
 /** Milliseconds per day */
 const MS_PER_DAY = 24 * MS_PER_HOUR;
 
+/** @returns {number} Solar-local UTC offset in minutes from a longitude. */
+const solarOffsetMinutesFromLongitude = (longitude) => {
+  if (longitude == null || Number.isNaN(longitude)) return null;
+  return Math.round((longitude / 15) * 60);
+};
+
+/**
+ * Derives the vessel's solar-local UTC offset (minutes) from recorded
+ * sample positions, taking the most recent in-window sample with a
+ * usable longitude. Used to key advisory dedup on the solar-local calendar
+ * day (sun-day) rather than UTC, so a surplus window straddling the UTC
+ * midnight boundary doesn't split into two events.
+ * @param {object[]} samples - Recorded sample records
+ * @param {Date} from - Window start
+ * @param {Date} to - Window end
+ * @returns {number|null} offset in minutes, or null if no position
+ */
+function offsetMinutesFromSamples(samples, from, to) {
+  let best = null;
+  let bestMs = -Infinity;
+  for (const s of samples) {
+    const tMs = new Date(s.timestamp).getTime();
+    if (Number.isNaN(tMs) || tMs < from.getTime() || tMs > to.getTime()) {
+      continue;
+    }
+    const lon = s.position?.longitude;
+    if (lon == null || Number.isNaN(lon)) continue;
+    if (tMs > bestMs) {
+      bestMs = tMs;
+      best = lon;
+    }
+  }
+  return solarOffsetMinutesFromLongitude(best);
+}
+
 /**
  * API error carrying an HTTP status code.
  */
@@ -799,7 +834,11 @@ function registerApiRoutes(
       loadRecords(readRecordings, from, to, "cycle"),
     ])
       .then(([allSamples, cycles]) =>
-        res.json(buildDeployStates(allSamples, cycles, from, to)),
+        res.json(
+          buildDeployStates(allSamples, cycles, from, to, {
+            solarOffsetMinutes: offsetMinutesFromSamples(allSamples, from, to),
+          }),
+        ),
       )
       .catch((error) => handleError(error, res));
   });
@@ -1118,9 +1157,15 @@ function buildWindProtectionHistory(records, from, to) {
  * @param {object[]} cycles - Recorded prediction cycles
  * @param {Date} from - Window start
  * @param {Date} to - Window end
- * @returns {{window: {from: string, to: string}, detected: object[], recommendations: object[]}}
+ * @param {object} [opts]
+ * @param {number|null} [opts.solarOffsetMinutes=null] - Vessel solar-local
+ *        UTC offset in minutes; when known, advisory dedup keys on the
+ *        solar-local calendar day (sun-day) rather than UTC, so a surplus
+ *        window straddling UTC midnight doesn't split into two events.
+ * @returns {{window: {from: string, to: string}, detected: object[], recommendations: object[], advisories: object[]}}
  */
-function buildDeployStates(samples, cycles, from, to) {
+function buildDeployStates(samples, cycles, from, to, opts = {}) {
+  const { solarOffsetMinutes = null } = opts;
   // Detected transitions: carry forward last known state per device across
   // unknown (null/absent) gaps, then emit only state changes. Samples before
   // the window establish the prior state so the first in-window sample doesn't
@@ -1215,8 +1260,8 @@ function buildDeployStates(samples, cycles, from, to) {
     .map((cycle) => {
       const hourSet = new Set(); // wall-clock hours this cycle has a point for
       const acts = new Map(); // `${hourTs}|${id}` -> ev (last per hour+device)
-      let startMs = Infinity;
-      let endMs = -Infinity;
+      let startMs = Number.POSITIVE_INFINITY;
+      let endMs = Number.NEGATIVE_INFINITY;
       for (const point of cycle.forecast || []) {
         const t = new Date(point.time).getTime();
         const hourTs = Math.round(t / 3600000) * 3600000;
@@ -1243,6 +1288,7 @@ function buildDeployStates(samples, cycles, from, to) {
         endMs,
         hourSet,
         acts,
+        advisories: cycle.advisories || [],
       };
     })
     .sort((a, b) => a.ts - b.ts);
@@ -1315,10 +1361,49 @@ function buildDeployStates(samples, cycles, from, to) {
   // detected state at its time, it was already filtered above. Consecutive
   // same-action was handled by the idealState check.
 
+  // Advisories (surplus / engine-run deficit / stowage) recorded per
+  // cycle. A given advisory event (e.g. a surplus window starting at
+  // 14:00) is reported by every cycle whose forecast covers it, so we
+  // dedupe keeping the newest cycle's version — the newest forecast is
+  // authoritative (a later cycle can move or resize the window, mirroring
+  // the recommendation-withdrawal logic above). Only advisories whose
+  // action time falls within [from, to] are emitted.
+  //
+  // The dedup key is the solar-local calendar day of the advisory's
+  // action time (a "sun-day"). There is at most one surplus and one
+  // deficit event per sun-day (the bank hits full-and-curtails once per
+  // charging phase; a deficit advisory is the day's low point), so keying
+  // on the local date collapses the near-duplicates that flood the Events
+  // list otherwise: each cycle's forecast is anchored at its own run
+  // timestamp, so the window start drifts by minutes between consecutive
+  // cycles even though it is the *same* logical event, and a window
+  // straddling UTC midnight would otherwise split into two. Using the
+  // solar-local day (shifted by the vessel's longitude-derived offset)
+  // keeps a single charging phase in one bucket. The newest cycle's
+  // version (cyclesIndexed is oldest→newest, so the last `.set` wins) is
+  // the most accurate forecast.
+  const offsetMs = (solarOffsetMinutes || 0) * 60 * 1000;
+  const advisoriesByKey = new Map(); // `${type}|${localDateMs}` -> adv
+  for (const cycle of cyclesIndexed) {
+    for (const adv of cycle.advisories || []) {
+      const tMs = new Date(adv.time).getTime();
+      if (Number.isNaN(tMs)) continue;
+      const localDateMs = new Date(tMs + offsetMs).setUTCHours(0, 0, 0, 0);
+      advisoriesByKey.set(`${adv.type}|${localDateMs}`, adv);
+    }
+  }
+  const advisories = [...advisoriesByKey.values()]
+    .filter((adv) => {
+      const t = new Date(adv.time).getTime();
+      return t >= fromMs && t <= toMs;
+    })
+    .sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
+
   return {
     window: { from: from.toISOString(), to: to.toISOString() },
     detected,
     recommendations,
+    advisories,
   };
 }
 
@@ -1342,4 +1427,5 @@ module.exports = {
   buildDeployStates,
   registerApiRoutes,
   cycleHorizonMs,
+  offsetMinutesFromSamples,
 };

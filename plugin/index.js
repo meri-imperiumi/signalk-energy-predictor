@@ -33,7 +33,9 @@ const {
 } = require("./prediction.js");
 const {
   AdvisoryPublisher,
+  AdvisoryType,
   solarOffsetMinutesFromLongitude,
+  formatWindowTime,
 } = require("./advisory.js");
 const { StateConfidence } = require("./urgency.js");
 const {
@@ -100,6 +102,122 @@ function detectEngineRunning(pathValues) {
   }
 
   return anySignal ? anyRunning : null;
+}
+
+/**
+ * Builds the recorded `advisories` list for a prediction cycle from the
+ * surplus/deficit/stowage opportunities. Each entry carries a stable
+ * `type` ("surplus"/"engine"/"stowage"), the cycle timestamp, a
+ * human-readable message mirroring the Signal K notification text, and —
+ * for the surplus advisory — the structured window data plus a list of
+ * elective-load suggestions the webapp can render in more detail than the
+ * terse notification.
+ *
+ * Deficit is represented by the engine-run advisory (run the engine to
+ * avoid a flat bank); surplus by the surplus-opportunity advisory.
+ * `null` opportunities are omitted (nothing to record).
+ *
+ * @param {object} opts
+ * @param {{surplusWh: number, from: Date, to: Date, suggestedLoadW: number}|null} opts.surplusOpportunity
+ * @param {{hours: number, optimalWindow: {start: Date, end: Date}}|null} opts.engineRunTime
+ * @param {{hour: number, reason: string}|null} opts.stowageOpportunity
+ * @param {Array<{name: string, watts: number, statePath?: string, onValues?: string}>} [opts.opportunisticLoads=[]] -
+ *        Configured elective loads; those already running are skipped
+ * @param {((load: object) => boolean)|null} [opts.isLoadRunning=null] -
+ *        Predicate from `AdvisoryPublisher.isLoadRunning`; null treats
+ *        all loads as not-running (always suggested)
+ * @param {number|null} [opts.localOffsetMinutes=null] - Solar-local UTC
+ *        offset (min) for human-facing times; null uses host timezone
+ * @returns {Array<{type: string, time: string, message: string}>}
+ */
+function buildCycleAdvisories({
+  surplusOpportunity,
+  engineRunTime,
+  stowageOpportunity,
+  opportunisticLoads = [],
+  isLoadRunning = null,
+  localOffsetMinutes = null,
+}) {
+  const now = new Date().toISOString();
+  const advisories = [];
+  if (surplusOpportunity) {
+    const from = formatWindowTime(
+      surplusOpportunity.from,
+      undefined,
+      localOffsetMinutes,
+    );
+    const to = formatWindowTime(
+      surplusOpportunity.to,
+      surplusOpportunity.from,
+      localOffsetMinutes,
+    );
+    let message = `${formatWh(surplusOpportunity.surplusWh)} surplus available ${from}-${to}`;
+    if (surplusOpportunity.suggestedLoadW > 0) {
+      message += ` (~${surplusOpportunity.suggestedLoadW}W sustained)`;
+    }
+    // Elective-load suggestions: the surplus could run each configured
+    // load (if it isn't already running) for `surplusWh / watts` hours,
+    // capped by the window length so we don't suggest running a load past
+    // the moment the bank stops being full.
+    const windowHours =
+      (surplusOpportunity.to.getTime() - surplusOpportunity.from.getTime()) /
+      (3600 * 1000);
+    const loads = (opportunisticLoads || [])
+      .filter((load) => !isLoadRunning?.(load))
+      .filter((load) => load.watts > 0)
+      .map((load) => {
+        const runHours = Math.min(
+          windowHours,
+          surplusOpportunity.surplusWh / load.watts,
+        );
+        return {
+          name: load.name,
+          watts: load.watts,
+          runHours: Math.round(runHours * 10) / 10,
+        };
+      });
+    advisories.push({
+      type: AdvisoryType.SURPLUS_OPPORTUNITY,
+      time: surplusOpportunity.from.toISOString(),
+      message,
+      surplusWh: surplusOpportunity.surplusWh,
+      from: surplusOpportunity.from.toISOString(),
+      to: surplusOpportunity.to.toISOString(),
+      sustainedW: surplusOpportunity.suggestedLoadW,
+      loads,
+    });
+  }
+  if (engineRunTime) {
+    const hours = Math.round(engineRunTime.hours * 10) / 10;
+    const start = formatWindowTime(
+      engineRunTime.optimalWindow.start,
+      undefined,
+      localOffsetMinutes,
+    );
+    const end = formatWindowTime(
+      engineRunTime.optimalWindow.end,
+      undefined,
+      localOffsetMinutes,
+    );
+    advisories.push({
+      type: AdvisoryType.ENGINE_RUN,
+      time: engineRunTime.optimalWindow.start.toISOString(),
+      message: `Run engine for ${hours}h between ${start}-${end} to avoid low battery`,
+      engineHours: hours,
+      windowStart: engineRunTime.optimalWindow.start.toISOString(),
+      windowEnd: engineRunTime.optimalWindow.end.toISOString(),
+    });
+  }
+  if (stowageOpportunity) {
+    advisories.push({
+      type: AdvisoryType.STOW_SOON,
+      time: now,
+      message: `Stow mechanical generators in ${stowageOpportunity.hour}h to reduce drag - ${stowageOpportunity.reason}`,
+      inHours: stowageOpportunity.hour,
+      reason: stowageOpportunity.reason,
+    });
+  }
+  return advisories;
 }
 
 /**
@@ -1204,6 +1322,14 @@ module.exports = (app) => {
 
       // Publish all advisories
       app.debug("Publishing advisories...");
+      // Render human-facing notification times in solar-local time
+      // derived from the vessel's longitude, so a UTC-locked server still
+      // surfaces crew-local clock times. Falls back to the host timezone
+      // when longitude is unknown. Reused for the recorded advisory
+      // messages below.
+      const solarOffsetMinutes = solarOffsetMinutesFromLongitude(
+        ingestionFSM.position.longitude,
+      );
       advisoryPublisher.publishAll({
         hourlyForecast: hourly,
         timeToFull,
@@ -1218,13 +1344,7 @@ module.exports = (app) => {
         isUnderway: underway,
         deployConfidences,
         batterySoC: predictionEngine.getCurrentSoC(),
-        // Render human-facing notification times in solar-local time
-        // derived from the vessel's longitude, so a UTC-locked server
-        // still surfaces crew-local clock times. Falls back to the host
-        // timezone when longitude is unknown.
-        localOffsetMinutes: solarOffsetMinutesFromLongitude(
-          ingestionFSM.position.longitude,
-        ),
+        localOffsetMinutes: solarOffsetMinutes,
         urgencyConfig: pluginConfig.notification?.urgency,
       });
       app.debug(`Advisories published successfully`);
@@ -1238,6 +1358,17 @@ module.exports = (app) => {
         weatherTier,
         forecast: forecastObjects,
         actions: hourly.flatMap((h) => h.actions || []),
+        // Record the surplus/deficit/stowage advisories computed for this
+        // cycle so the webapp's Events list can surface them per window.
+        // Mirrors the messages broadcast as Signal K notifications above.
+        advisories: buildCycleAdvisories({
+          surplusOpportunity,
+          engineRunTime,
+          stowageOpportunity,
+          opportunisticLoads: surplusConfig.opportunisticLoads || [],
+          isLoadRunning: (load) => advisoryPublisher.isLoadRunning(load),
+          localOffsetMinutes: solarOffsetMinutes,
+        }),
       });
 
       app.debug(`Prediction cycle complete: ${hourly.length} hours forecasted`);
@@ -2528,6 +2659,7 @@ module.exports = (app) => {
     recordSample,
     resolveWindProtectionContext,
     publishWindProtection,
+    buildCycleAdvisories,
     get windProtection() {
       return windProtection;
     },

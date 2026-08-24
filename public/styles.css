@@ -252,6 +252,26 @@ ep-actions-list {
   border-color: var(--accent-color);
 }
 
+.ep-action-advisory .ep-action-badge {
+  color: var(--solar-color);
+  border-color: var(--solar-color);
+}
+
+.ep-action-advisory[data-advisory="engine_run"] .ep-action-badge {
+  color: var(--load-color);
+  border-color: var(--load-color);
+}
+
+.ep-action-advisory[data-advisory="surplus"] .ep-action-badge {
+  color: var(--solar-color);
+  border-color: var(--solar-color);
+}
+
+.ep-action-advisory[data-advisory="stow_soon"] .ep-action-badge {
+  color: var(--wind-color);
+  border-color: var(--wind-color);
+}
+
 .ep-action-text {
   color: var(--text-color);
 }

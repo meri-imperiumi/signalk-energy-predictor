@@ -52,6 +52,9 @@ async function ensureRecordingsDir(dataDir) {
  * @param {number} cycle.weatherTier - Weather tier (1-4)
  * @param {object[]} cycle.forecast - Hourly forecast objects
  * @param {object} cycle.actions - Advisory actions for the cycle
+ * @param {object[]} [cycle.advisories] - Surplus/deficit/stowage
+ *        advisories computed for the cycle, each with a `type`
+ *        (`"surplus"`/`"engine_run"`/`"stow_soon"`), a `time` and a `message`
  * @returns {Promise<void>}
  */
 async function recordCycle(app, dataDir, cycle) {
@@ -64,6 +67,7 @@ async function recordCycle(app, dataDir, cycle) {
     weatherTier: cycle.weatherTier,
     forecast: cycle.forecast,
     actions: cycle.actions,
+    advisories: cycle.advisories || [],
   };
 
   const line = `${JSON.stringify(record)}\n`;
@@ -246,9 +250,9 @@ async function pruneOldRecordings(app, dataDir, retentionDays) {
       // Parse file date as UTC to match getRecordingsPath behavior
       const fileDate = new Date(
         Date.UTC(
-          parseInt(match[1], 10),
-          parseInt(match[2], 10) - 1,
-          parseInt(match[3], 10),
+          Number.parseInt(match[1], 10),
+          Number.parseInt(match[2], 10) - 1,
+          Number.parseInt(match[3], 10),
         ),
       );
 
