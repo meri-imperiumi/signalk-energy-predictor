@@ -7,7 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- A single glanceable energy-outlook delta for instrument panels:
+  `electrical.energy.prediction.status` — one of
+  `surplus` (bank fills to 100% and production is curtailed), `rising`
+  (projected SoC ends >5 points above now), `stable` (within 5 points),
+  `deficit` (ends >5 points below now), or `critical` (projected SoC
+  dips below the chemistry threshold: 30% LiFePO4, 45% lead-acid — set via
+  the new `battery.chemistry` config, default `lifepo4`). Critical is
+  checked before surplus (a full-then-empty day still warns). Computed
+  from the ideal track over the next 24 h by
+  `PredictionEngine.getEnergyOutlook()`, published every cycle with
+  metadata.
+- `electrical.energy.prediction.weather.validTo` (`timestamp`) — when the
+  current forecast coverage ends (end of the last covered hour), alongside
+  the existing source/valid-hours paths.
+- `electrical.energy.prediction.forecast.solar24h` (`Wh`) and
+  `…forecast.consumption24h` (`Wh`) — estimated 24 h solar production
+  (ideal track) and house consumption from the current prediction.
+- `environment.wind.gust` (`m/s`) — derived gust (max of recent wind
+  speed samples, the same recipe WPF learning uses; no dedicated gust
+  sensor assumed) published every cycle at the standard Signal K path,
+  null when there isn't enough wind data.
+
 ### Fixed
+- Bad-cycle protection: a degenerate weather forecast — hours with no
+  weather signal at all (every hour GHI 0/null, wind 0/null, gust 0/null;
+  observed in the wild as published 0 Wh solar / 0 kn wind / null
+  corrected-wind cycles) — is now rejected at every layer instead of being
+  published, recorded, and cached as a confident "success":
+  - `parseOpenMeteoResponse` throws on payloads whose radiation, wind and
+    gusts are all zero (complements the existing all-null check), so the
+    FSM falls through to the next tier.
+  - The tier-fetch loop treats a degenerate forecast as a failed tier
+    (never caches it).
+  - Cache restore ignores a poisoned (all-zero) on-disk cache and falls
+    to the stale hybrid / Clear Sky.
+  - The prediction cycle itself skips a degenerate forecast (defense in
+    depth) and keeps the last good cycle's engine state, deltas and
+    wind-protection values until a good forecast arrives.
+  A real forecast always carries signal — daytime GHI, or wind in polar
+  night — so the gate cannot reject legitimate weather.
 - The wind-protection Signal K paths no longer double-apply the learned
   factor: `publishWindProtection` read its "forecast" from the engine's
   `lastForecast`, which already carries the wind-protection correction

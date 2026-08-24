@@ -428,3 +428,101 @@ test.describe("WPF fallback end-to-end: hourly forecast reflects the fallback", 
     await plugin.stop();
   });
 });
+
+test.describe("Bad-cycle protection: degenerate forecast keeps last good cycle", () => {
+  test("runPredictionCycle skips an all-zero forecast and preserves state", async () => {
+    const app = new FakeSignalKApp();
+    app.setSelfPath("navigation.position", {
+      latitude: 60.1,
+      longitude: 21.8,
+    });
+    app.setSelfPath("navigation.state", "anchored");
+
+    const plugin = makePlugin(app);
+    app.dataPath = await mkdtemp(join(tempDir, "t-"));
+    await plugin.start(baseConfig(), () => {});
+    const internals = plugin.__getInternals();
+
+    // Seed a good previous cycle on the engine, with a marker time a real
+    // run would never reproduce.
+    const marker = new Date("2027-01-01T00:00:00Z");
+    internals.predictionEngine.lastRawForecast = [
+      {
+        time: marker,
+        ghi: 500,
+        windSpeedMs: 3,
+        gustSpeedMs: 4,
+        windDirectionDeg: 90,
+        cloudCover: 0,
+      },
+    ];
+    internals.predictionEngine.lastPrediction = [
+      {
+        hour: 0,
+        time: marker,
+        idealSolarYieldWh: 100,
+        idealWindYieldWh: 0,
+        idealHydroYieldWh: 0,
+        houseLoadWh: 50,
+        idealNetWh: 50,
+        idealSoC: 0.9,
+        detectedYieldWh: 0,
+        detectedNetWh: 0,
+        detectedSoC: 0.9,
+        gustSpeedMs: 4,
+        windSpeedMs: 3,
+        forecastWindSpeedMs: 3,
+        forecastGustMs: 4,
+        windDirectionDeg: 90,
+        actions: [],
+      },
+    ];
+
+    // Force the ingestion seam to hand the cycle a degenerate forecast
+    // (the ingestion-layer guards normally prevent this from ever
+    // happening; this tests the cycle-level safety net itself).
+    const fsm = internals.ingestionFSM;
+    fsm.position = { latitude: 60.1, longitude: 21.8 };
+    const origGetForecast = fsm.getForecast.bind(fsm);
+    fsm.getForecast = async () => [
+      {
+        time: new Date(),
+        ghi: 0,
+        cloudCover: null,
+        windSpeedMs: 0,
+        gustSpeedMs: 0,
+        windDirectionDeg: 0,
+      },
+    ];
+
+    let published = false;
+    const pub = internals.advisoryPublisher;
+    const origPublishAll = pub.publishAll.bind(pub);
+    pub.publishAll = (...args) => {
+      published = true;
+      return origPublishAll(...args);
+    };
+
+    try {
+      await internals.runPredictionCycle();
+      assert.strictEqual(
+        published,
+        false,
+        "no advisories published from a degenerate cycle",
+      );
+      assert.strictEqual(
+        internals.predictionEngine.lastRawForecast[0].time,
+        marker,
+        "engine keeps the last good raw forecast (wind-protection values stay good)",
+      );
+      assert.strictEqual(
+        internals.predictionEngine.lastPrediction[0].time,
+        marker,
+        "engine keeps the last good prediction",
+      );
+    } finally {
+      fsm.getForecast = origGetForecast;
+      await plugin.stop();
+    }
+  });
+});

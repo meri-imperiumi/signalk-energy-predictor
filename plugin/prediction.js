@@ -24,6 +24,14 @@ const PREDICTION_HOURS = 24;
 const MAX_PREDICTION_HOURS = 168;
 
 /**
+ * Critical SoC thresholds for the 24h energy outlook, by battery
+ * chemistry: LiFePO4 tolerates deep discharge, lead-acid sulfates below
+ * ~50% (we trip "critical" at 45% to leave margin).
+ */
+const CRITICAL_SOC_LIFEPO4 = 0.3;
+const CRITICAL_SOC_LEAD_ACID = 0.45;
+
+/**
  * House load smoothing window in hours
  */
 const LOAD_SMOOTHING_HOURS = 3;
@@ -964,6 +972,14 @@ class PredictionEngine {
     );
 
     this.capacityWh = battery.capacityAh * battery.systemVoltage;
+    // Critical SoC threshold for the 24h energy outlook: LiFePO4 can be
+    // drawn to 30% without harm, lead-acid should stay above ~50% (we use
+    // 45% as the "will be critical" trip point). Chemistry comes from the
+    // config schema; anything unrecognized falls back to LiFePO4.
+    this.criticalSoC =
+      battery.chemistry === "lead-acid"
+        ? CRITICAL_SOC_LEAD_ACID
+        : CRITICAL_SOC_LIFEPO4;
     this.loadProfile = new LoadProfile({
       config: loadProfileConfig,
       getSelfPath,
@@ -3057,6 +3073,75 @@ class PredictionEngine {
       windowHours > 0 ? Math.round(surplusWh / windowHours) : 0;
 
     return { surplusWh: Math.round(surplusWh), from, to, suggestedLoadW };
+  }
+
+  /**
+   * Computes the overall energy outlook for the next 24 hours — a single
+   * glanceable status for instrument panels:
+   *
+   *  - "critical": the projected SoC dips below the chemistry-specific
+   *    critical threshold (LiFePO4 30%, lead-acid 45%) at any point in the
+   *    window, including right now
+   *  - "surplus":    the bank fills to 100% and production is curtailed
+   *    (the same track-derived surplus the surplus advisory uses)
+   *  - "rising":     the projected SoC ends more than 5 points above now
+   *  - "stable":     the projected SoC ends within 5 points of now
+   *  - "deficit":    the projected SoC ends more than 5 points below now
+   *
+   * Critical is checked before surplus (a full-then-empty day is still a
+   * warning). Uses the *ideal* track (everything deployed per the
+   * advisories), consistent with the surplus and engine-run advisories.
+   *
+   * @returns {{status: "surplus"|"rising"|"stable"|"deficit"|"critical",
+   *           currentSoC: number, endSoC: number, minSoC: number,
+   *           criticalSoC: number, surplusWh: number, hours: number}|null}
+   *          null when no prediction has been run
+   */
+  getEnergyOutlook() {
+    if (this.lastPrediction.length === 0) return null;
+
+    const hours = Math.min(24, this.lastPrediction.length);
+    const track = this.lastPrediction.slice(0, hours);
+    const currentSoC = this.getCurrentSoC();
+
+    // Surplus over the window: same track-clamp math as
+    // findSurplusOpportunity (energy the 100% SoC clamp throws away), but
+    // without its notification policy gates (min Wh, daytime-only at rest)
+    // — the status should state the physics, not the alert policy.
+    let surplusWh = 0;
+    let socStart = currentSoC;
+    for (const p of track) {
+      const headroom = (1 - Math.min(socStart, 1)) * this.capacityWh;
+      surplusWh += Math.max(0, p.idealNetWh - headroom);
+      socStart = p.idealSoC;
+    }
+
+    const endSoC = track[track.length - 1].idealSoC;
+    const minSoC = Math.min(currentSoC, ...track.map((p) => p.idealSoC));
+
+    let status;
+    if (minSoC < this.criticalSoC) {
+      status = "critical";
+    } else if (surplusWh > 0) {
+      status = "surplus";
+    } else {
+      const delta = endSoC - currentSoC;
+      if (Math.abs(delta) <= 0.05) {
+        status = "stable";
+      } else {
+        status = delta > 0 ? "rising" : "deficit";
+      }
+    }
+
+    return {
+      status,
+      currentSoC,
+      endSoC,
+      minSoC,
+      criticalSoC: this.criticalSoC,
+      surplusWh: Math.round(surplusWh),
+      hours,
+    };
   }
 
   /**

@@ -51,6 +51,14 @@ function buildPluginSchema() {
             minimum: 0.05,
             maximum: 0.5,
           },
+          chemistry: {
+            type: "string",
+            title: "Battery Chemistry",
+            description:
+              "Battery chemistry. Sets the critical-SoC threshold for the 24h energy outlook status: LiFePO4 30%, lead-acid 45%",
+            default: "lifepo4",
+            enum: ["lifepo4", "lead-acid"],
+          },
           socPath: {
             type: "string",
             title: "SoC Path",

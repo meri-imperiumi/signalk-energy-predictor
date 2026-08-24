@@ -140,6 +140,35 @@ const Tier = {
  */
 
 /**
+ * Whether a forecast carries no weather signal at all: every hour has
+ * no GHI, no wind and no gust (null or ≤ 0).
+ *
+ * A real forecast always has *something*: nonzero radiation in daylight
+ * (Open-Meteo reports zeros for night hours, not nulls), or nonzero wind
+ * in polar night. An all-zero forecast is a broken payload (observed in
+ * the wild: a tier-1 "success" with 0 kn wind and 0 Wh solar for the whole
+ * horizon, published and cached). Callers treat such a forecast as a
+ * failed fetch so the fallback chain serves an honest degraded source
+ * (stale cache, hybrid, Clear Sky) instead of confident garbage.
+ *
+ * The one theoretical false positive — 48 h of dead calm during polar
+ * night — is not something NWP APIs produce; rejecting it only means we
+ * fall to Clear Sky, which is equally uninformative there.
+ *
+ * @param {ForecastPoint[]|null|undefined} points
+ * @returns {boolean}
+ */
+function isDegenerateForecast(points) {
+  if (!points || points.length === 0) return false; // emptiness ≠ degenerate
+  return points.every(
+    (p) =>
+      (p.ghi == null || p.ghi <= 0) &&
+      (p.windSpeedMs == null || p.windSpeedMs <= 0) &&
+      (p.gustSpeedMs == null || p.gustSpeedMs <= 0),
+  );
+}
+
+/**
  * Parses and validates an Open-Meteo hourly response into forecast points.
  *
  * Open-Meteo returns `null` for hours where a variable is unavailable. That
@@ -173,6 +202,21 @@ function parseOpenMeteoResponse(data) {
   if (!hourly.shortwave_radiation.some((v) => v != null)) {
     throw new Error(
       "Open-Meteo returned no usable shortwave_radiation values (all null)",
+    );
+  }
+  // A payload whose every variable is null-or-zero carries no weather
+  // signal at all (see isDegenerateForecast): reject it here so the FSM
+  // falls through to the next tier instead of publishing calm-wind,
+  // dark-sky predictions with full confidence.
+  const hasPositive = (arr) =>
+    Array.isArray(arr) && arr.some((v) => v != null && v > 0);
+  if (
+    !hasPositive(hourly.shortwave_radiation) &&
+    !hasPositive(hourly.wind_speed_10m) &&
+    !hasPositive(hourly.wind_gusts_10m)
+  ) {
+    throw new Error(
+      "Open-Meteo payload carries no usable values (radiation, wind and gusts all zero)",
     );
   }
 
@@ -807,7 +851,7 @@ class IngestionFSM {
         );
         continue;
       }
-      if (forecast && forecast.length > 0) {
+      if (forecast && forecast.length > 0 && !isDegenerateForecast(forecast)) {
         this.currentTier = tier;
         this.lastFetchTime = new Date();
         this.lastForecast = this.postProcessForecast(forecast);
@@ -816,6 +860,13 @@ class IngestionFSM {
         );
         await this.cacheForecast();
         return this.lastForecast;
+      }
+      if (forecast && forecast.length > 0) {
+        // Degenerate (all-zero) payload: a "success" that carries no
+        // weather signal. Treat as a failed tier, never cache it.
+        this.app.debug(
+          `Tier ${this.getTierName(tier)} returned a degenerate (all-zero) forecast — trying next tier`,
+        );
       }
     }
 
@@ -906,6 +957,15 @@ class IngestionFSM {
     if (inHorizon.length === 0) {
       this.app.debug(
         "Restore: cached forecast is entirely outside the horizon",
+      );
+      return null;
+    }
+
+    // A poisoned cache (all-zero hours written by a broken fetch) must not
+    // be served as a real forecast — leave it for the stale hybrid.
+    if (isDegenerateForecast(inHorizon)) {
+      this.app.debug(
+        "Restore: cached forecast is degenerate (all-zero) — ignoring",
       );
       return null;
     }
@@ -1183,6 +1243,7 @@ module.exports = {
   fetchLogbookCloudCover,
   generateClearSkyForecast,
   synthesizeGHI,
+  isDegenerateForecast,
   OPEN_METEO_MAX_ATTEMPTS,
   FORECAST_HOURS,
   MAX_FORECAST_HOURS,

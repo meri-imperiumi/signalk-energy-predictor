@@ -13,6 +13,7 @@ const {
   IngestionFSM,
   Tier,
   fetchOpenMeteo,
+  isDegenerateForecast,
   OPEN_METEO_MAX_ATTEMPTS,
   DEFAULT_FORECAST_CACHE_HOURS,
 } = require("../plugin/ingestion.js");
@@ -197,6 +198,124 @@ test.describe("Ingestion fallback chain", () => {
     } finally {
       globalThis.fetch = origFetch;
     }
+  });
+
+  test("all-zero Open-Meteo payload is rejected, not served as a forecast", async () => {
+    const fsm = makeFSM();
+    const origFetch = globalThis.fetch;
+    // A "successful" 200 response whose every variable is zero — observed
+    // in the wild as the source of published 0 Wh solar / 0 kn wind cycles.
+    const times = Array.from({ length: 48 }, (_, i) =>
+      new Date(Date.now() + i * 3600000)
+        .toISOString()
+        .slice(0, 13)
+        .concat(":00"),
+    );
+    globalThis.fetch = async (url) => {
+      if (String(url).includes("open-meteo")) {
+        return {
+          ok: true,
+          json: async () => ({
+            hourly: {
+              time: times,
+              shortwave_radiation: times.map(() => 0),
+              wind_speed_10m: times.map(() => 0),
+              wind_gusts_10m: times.map(() => 0),
+              wind_direction_10m: times.map(() => 0),
+            },
+          }),
+        };
+      }
+      throw new Error("network down");
+    };
+
+    try {
+      const forecast = await fsm.fetchForecast();
+      // Must NOT be accepted as tier 1 — falls through to the honest
+      // offline ladder (hybrid/Clear Sky here, since nothing else answers)
+      assert.notStrictEqual(fsm.currentTier, Tier.OPEN_METEO);
+      assert.ok(forecast.some((p) => (p.ghi ?? 0) > 0));
+      // And it was never degenerate to begin with, by definition
+      assert.ok(!isDegenerateForecast(forecast));
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  test("zero radiation with real wind is a legitimate polar-night forecast", async () => {
+    const fsm = makeFSM();
+    const origFetch = globalThis.fetch;
+    const times = Array.from({ length: 48 }, (_, i) =>
+      new Date(Date.now() + i * 3600000)
+        .toISOString()
+        .slice(0, 13)
+        .concat(":00"),
+    );
+    globalThis.fetch = async (url) => {
+      if (String(url).includes("open-meteo")) {
+        return {
+          ok: true,
+          json: async () => ({
+            hourly: {
+              time: times,
+              shortwave_radiation: times.map(() => 0),
+              wind_speed_10m: times.map(() => 14.4), // 4 m/s everywhere
+              wind_gusts_10m: times.map(() => 21.6),
+              wind_direction_10m: times.map(() => 90),
+            },
+          }),
+        };
+      }
+      throw new Error("network down");
+    };
+
+    try {
+      const forecast = await fsm.fetchForecast();
+      assert.strictEqual(fsm.currentTier, Tier.OPEN_METEO);
+      assert.ok(forecast.some((p) => (p.windSpeedMs ?? 0) > 0));
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+});
+
+test.describe("isDegenerateForecast", () => {
+  test("empty or missing is not degenerate (emptiness is handled elsewhere)", () => {
+    assert.strictEqual(isDegenerateForecast(null), false);
+    assert.strictEqual(isDegenerateForecast([]), false);
+  });
+
+  test("all-null or all-zero hours are degenerate", () => {
+    const t = new Date();
+    assert.strictEqual(
+      isDegenerateForecast([
+        { time: t, ghi: null, windSpeedMs: null, gustSpeedMs: null },
+      ]),
+      true,
+    );
+    assert.strictEqual(
+      isDegenerateForecast([
+        { time: t, ghi: 0, windSpeedMs: 0, gustSpeedMs: 0 },
+      ]),
+      true,
+    );
+  });
+
+  test("any nonzero GHI or wind makes it usable", () => {
+    const t = new Date();
+    assert.strictEqual(
+      isDegenerateForecast([
+        { time: t, ghi: 0, windSpeedMs: null, gustSpeedMs: null },
+        { time: t, ghi: 320, windSpeedMs: null, gustSpeedMs: null },
+      ]),
+      false,
+    );
+    assert.strictEqual(
+      isDegenerateForecast([
+        { time: t, ghi: 0, windSpeedMs: 3.2, gustSpeedMs: null },
+      ]),
+      false,
+    );
   });
 });
 
@@ -488,6 +607,37 @@ test.describe("Offline forecast restore + staleness + uplink cadence", () => {
       assert.strictEqual(fsm.currentTier, Tier.OPEN_METEO);
       assert.ok(forecast.some((p) => p.windSpeedMs === 12));
       assert.ok(forecast.some((p) => p.ghi === 600));
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  test("network down + poisoned (all-zero) cache → ignored, falls to hybrid", async () => {
+    const dir = await mkDataDir();
+    const fsm = fsmWithCache(makeApp(), dir);
+    // Seed a tier-1 "forecast" whose every hour is zero — what a broken
+    // fetch would have written before the degeneracy gates existed.
+    const bucket = weatherPositionBucket(60.17, 24.94);
+    const now = new Date();
+    const dateKey = `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}-${String(now.getUTCDate()).padStart(2, "0")}`;
+    const zeroPoints = Array.from({ length: 6 }, (_, i) => ({
+      time: new Date(now.getTime() + i * 3600000),
+      ghi: 0,
+      cloudCover: null,
+      windSpeedMs: 0,
+      gustSpeedMs: 0,
+      windDirectionDeg: 0,
+      tier: 1,
+    }));
+    await writeWeatherCache(dir, dateKey, bucket, zeroPoints, 1);
+    const origFetch = globalThis.fetch;
+    networkDown();
+    try {
+      const restored = await fsm.restoreForecastFromCache();
+      assert.strictEqual(restored, null, "poisoned cache must not be restored");
+      // And the full chain lands on the honest hybrid instead of the zeros
+      const forecast = await fsm.fetchForecast();
+      assert.ok(!isDegenerateForecast(forecast));
     } finally {
       globalThis.fetch = origFetch;
     }

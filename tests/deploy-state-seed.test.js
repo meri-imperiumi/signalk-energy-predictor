@@ -137,7 +137,7 @@ function baseConfig() {
   };
 }
 
-/** Injects a minimal all-zero forecast into the ingestion FSM. */
+/** Injects a minimal forecast (night solar, steady wind) into the FSM. */
 function injectForecast(plugin) {
   const fsm = plugin.__getInternals().ingestionFSM;
   const now = new Date();
@@ -145,8 +145,8 @@ function injectForecast(plugin) {
   for (let h = 0; h < 24; h++) {
     points.push({
       time: new Date(now.getTime() + h * 3600000),
-      windSpeedKnots: 5,
-      gustSpeedKnots: 8,
+      windSpeedMs: 2.6,
+      gustSpeedMs: 4.1,
       windDirectionDeg: 180,
       ghi: 0,
       temperatureC: 20,

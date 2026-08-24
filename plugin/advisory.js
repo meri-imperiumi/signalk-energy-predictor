@@ -299,6 +299,50 @@ class AdvisoryPublisher {
         },
       },
       {
+        path: `${PREDICTION_BASE}.weather.validTo`,
+        value: {
+          displayName: "Forecast valid until",
+          description:
+            "When the current forecast coverage ends (end of the last covered hour), or null when no forecast is available.",
+          units: "timestamp",
+        },
+      },
+      {
+        path: `${PREDICTION_BASE}.status`,
+        value: {
+          displayName: "Energy outlook status",
+          description:
+            'Overall energy outlook for the next 24 hours: "surplus" (battery fills to 100% and production is curtailed), "rising" (projected SoC ends >5 points above now), "stable" (within 5 points of now), "deficit" (ends >5 points below now), or "critical" (projected SoC dips below the chemistry threshold: 30% LiFePO4, 45% lead-acid). null when no prediction is available.',
+        },
+      },
+      {
+        path: `${PREDICTION_BASE}.forecast.solar24h`,
+        value: {
+          displayName: "Estimated solar production 24h",
+          description:
+            "Estimated solar production over the next 24 hours from the ideal track (everything deployed per the advisories). null when no prediction is available.",
+          units: "Wh",
+        },
+      },
+      {
+        path: `${PREDICTION_BASE}.forecast.consumption24h`,
+        value: {
+          displayName: "Estimated power consumption 24h",
+          description:
+            "Estimated house-bank consumption over the next 24 hours (DC + AC from the learned load profile), in Wh. null when no prediction is available.",
+          units: "Wh",
+        },
+      },
+      {
+        path: "environment.wind.gust",
+        value: {
+          displayName: "Wind gust",
+          description:
+            "Derived wind gust: maximum of recent wind speed samples (no dedicated gust sensor on board). null when there is not enough wind data.",
+          units: "m/s",
+        },
+      },
+      {
         path: `${PREDICTION_BASE}.windProtection.enabled`,
         value: {
           displayName: "Wind protection enabled",
@@ -743,11 +787,68 @@ class AdvisoryPublisher {
    *        (the prediction's effective horizon); 0 when no forecast
    * @returns {void}
    */
-  publishForecastStatus(weatherSource, validHours) {
+  publishForecastStatus(weatherSource, validHours, validTo = null) {
     this.publishDelta({
       [`${PREDICTION_BASE}.weather.source`]: weatherSource ?? null,
       [`${PREDICTION_BASE}.weather.validHours`]:
         Number.isFinite(validHours) && validHours > 0 ? validHours : 0,
+      [`${PREDICTION_BASE}.weather.validTo`]: validTo
+        ? validTo.toISOString()
+        : null,
+    });
+  }
+
+  /**
+   * Publishes the overall energy outlook status for the next 24 hours —
+   * a single glanceable value for instrument panels.
+   *
+   * @param {{status: string}|null} outlook - Energy outlook from
+   *        PredictionEngine.getEnergyOutlook(), or null when no prediction
+   * @returns {void}
+   */
+  publishEnergyOutlook(outlook) {
+    this.publishDelta({
+      [`${PREDICTION_BASE}.status`]: outlook?.status ?? null,
+    });
+  }
+
+  /**
+   * Publishes the estimated 24h production and consumption totals from
+   * the current prediction.
+   *
+   * @param {number|null} solarWh24h - Estimated solar production over the
+   *        next 24 h (Wh, ideal track)
+   * @param {number|null} consumptionWh24h - Estimated house consumption
+   *        over the next 24 h (Wh)
+   * @returns {void}
+   */
+  publishForecastYield(solarWh24h, consumptionWh24h) {
+    this.publishDelta({
+      [`${PREDICTION_BASE}.forecast.solar24h`]: Number.isFinite(solarWh24h)
+        ? Math.round(solarWh24h)
+        : null,
+      [`${PREDICTION_BASE}.forecast.consumption24h`]: Number.isFinite(
+        consumptionWh24h,
+      )
+        ? Math.round(consumptionWh24h)
+        : null,
+    });
+  }
+
+  /**
+   * Publishes the derived wind gust (max of recent wind speed samples) at
+   * the standard Signal K path, in m/s. Only meaningful when wind samples
+   * exist; null otherwise (no fabricating calm).
+   *
+   * @param {number|null} gustMs - Gust estimate in m/s, or null
+   * @returns {void}
+   */
+  publishEnvironmentGust(gustMs) {
+    this.publishDelta({
+      "environment.wind.gust":
+        gustMs != null && Number.isFinite(gustMs)
+          ? Math.round(gustMs * 10) / 10
+          : null,
     });
   }
 
@@ -1031,6 +1132,11 @@ class AdvisoryPublisher {
     batterySoC,
     weatherSource = null,
     validHours = 0,
+    weatherValidTo = null,
+    energyOutlook = null,
+    solarWh24h = null,
+    consumptionWh24h = null,
+    windGustMs = null,
     localOffsetMinutes = null,
     urgencyConfig,
   }) {
@@ -1041,7 +1147,10 @@ class AdvisoryPublisher {
     // Publish forecast and time predictions
     this.publishHourlyForecast(hourlyForecast);
     this.publishTimePredictions(timeToFull, timeToEmpty);
-    this.publishForecastStatus(weatherSource, validHours);
+    this.publishForecastStatus(weatherSource, validHours, weatherValidTo);
+    this.publishEnergyOutlook(energyOutlook);
+    this.publishForecastYield(solarWh24h, consumptionWh24h);
+    this.publishEnvironmentGust(windGustMs);
 
     // Publish deployment state recommendations and notifications
     this.publishDeploymentStates(

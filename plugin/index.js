@@ -10,7 +10,7 @@
 /** @typedef {import("@signalk/server-api").ServerAPI} ServerAPI */
 /** @typedef {import("@signalk/server-api").Plugin} Plugin */
 
-const { IngestionFSM, Tier } = require("./ingestion.js");
+const { IngestionFSM, Tier, isDegenerateForecast } = require("./ingestion.js");
 const { SolarMatrix } = require("./learning.js");
 const {
   WindProtectionStore,
@@ -30,6 +30,7 @@ const {
   toNumber,
   toKnots,
   unwrapPosition,
+  KN_TO_MS,
 } = require("./prediction.js");
 const {
   AdvisoryPublisher,
@@ -434,6 +435,26 @@ module.exports = (app) => {
       return airHeight;
     }
     return DEFAULT_ANEMOMETER_HEIGHT_M;
+  }
+
+  /**
+   * Estimates the current wind gust as the max of recent wind speed
+   * samples across all wind paths (the same recipe the WPF learning and
+   * signalk-meshtastic use — no dedicated gust sensor on board).
+   *
+   * @returns {number|null} Gust estimate in m/s, or null when fewer than
+   *          two samples exist in the window
+   */
+  function currentWindGustMs() {
+    const now = Date.now();
+    const allWindHistory = [
+      ...(windHistory.get("environment.wind.speedApparent") || []),
+      ...(windHistory.get("environment.wind.speedOverGround") || []),
+      ...(windHistory.get("environment.wind.speedTrue") || []),
+    ].filter((s) => s.time >= now - WIND_HISTORY_MS);
+    if (allWindHistory.length < 2) return null;
+    // Samples are stored in knots; the delta is m/s.
+    return Math.max(...allWindHistory.map((s) => s.speed)) * KN_TO_MS;
   }
 
   /**
@@ -1052,6 +1073,20 @@ module.exports = (app) => {
         `Got forecast with ${forecast.length} points, source: ${ingestionFSM.getSourceInfo().source}`,
       );
 
+      // Bad-cycle protection (defense in depth): a degenerate forecast —
+      // hours but no weather signal at all — must never overwrite a good
+      // cycle. Ingestion already rejects such forecasts at every entry
+      // point (tier parse, tier loop, cache restore), so reaching here
+      // means an unexpected path: skip the whole cycle, keep the engine's
+      // last good prediction (and with it every published delta and the
+      // wind-protection values), and retry on the next cycle.
+      if (isDegenerateForecast(forecast)) {
+        app.error(
+          `Degenerate forecast from ${ingestionFSM.getSourceInfo().source} (${forecast.length} all-zero hours) — keeping last good prediction cycle`,
+        );
+        return;
+      }
+
       // navigation.state drives WPF application (only at rest) and deploy
       // recommendations (can't deploy while under way or when state is
       // unknown). signalk-autostate derives it from GPS movement shortly
@@ -1342,6 +1377,25 @@ module.exports = (app) => {
       // real coverage.
       const forecastSourceInfo = ingestionFSM.getSourceInfo();
       const validHours = predictionEngine.lastPrediction?.length ?? 0;
+      // When that coverage ends: end of the last covered hour. Null when
+      // there is no prediction.
+      const weatherValidTo =
+        validHours > 0 && predictionEngine.lastPrediction?.[0]?.time
+          ? new Date(
+              predictionEngine.lastPrediction[0].time.getTime() +
+                validHours * 3600000,
+            )
+          : null;
+      // Overall 24h energy outlook (surplus/rising/stable/deficit/critical)
+      const energyOutlook = predictionEngine.getEnergyOutlook();
+      // Estimated 24h solar production and house consumption from the
+      // ideal track (first 24 covered hours)
+      let solarWh24h = 0;
+      let consumptionWh24h = 0;
+      for (const p of (predictionEngine.lastPrediction || []).slice(0, 24)) {
+        solarWh24h += p.idealSolarYieldWh || 0;
+        consumptionWh24h += p.houseLoadWh || 0;
+      }
       advisoryPublisher.publishAll({
         hourlyForecast: hourly,
         timeToFull,
@@ -1358,6 +1412,11 @@ module.exports = (app) => {
         batterySoC: predictionEngine.getCurrentSoC(),
         weatherSource: forecastSourceInfo.source,
         validHours,
+        weatherValidTo,
+        energyOutlook,
+        solarWh24h: validHours > 0 ? solarWh24h : null,
+        consumptionWh24h: validHours > 0 ? consumptionWh24h : null,
+        windGustMs: currentWindGustMs(),
         localOffsetMinutes: solarOffsetMinutes,
         urgencyConfig: pluginConfig.notification?.urgency,
       });
