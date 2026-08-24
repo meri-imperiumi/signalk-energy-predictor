@@ -1110,6 +1110,64 @@ test.describe("AdvisoryPublisher.sendMeta", () => {
   });
 });
 
+test.describe("AdvisoryPublisher.publishForecastStatus", () => {
+  function makePublisher() {
+    const app = makeFakeApp();
+    app.selfId = "self";
+    return { app, pub: new AdvisoryPublisher(app, "test-plugin") };
+  }
+  function getDelta(app, path) {
+    return app.handleMessageCalls
+      .filter((c) => c.msg.updates)
+      .flatMap((c) => c.msg.updates[0].values)
+      .find((v) => v.path === path);
+  }
+
+  test("publishes the source name and valid-hours as deltas", () => {
+    const { app, pub } = makePublisher();
+    pub.publishForecastStatus("Open-Meteo", 48);
+    const source = getDelta(app, "electrical.energy.prediction.weather.source");
+    const hours = getDelta(
+      app,
+      "electrical.energy.prediction.weather.validHours",
+    );
+    assert.ok(source, "source delta published");
+    assert.strictEqual(source.value, "Open-Meteo");
+    assert.ok(hours, "validHours delta published");
+    assert.strictEqual(hours.value, 48);
+  });
+
+  test("null source and non-positive hours degrade to null/0", () => {
+    const { app, pub } = makePublisher();
+    pub.publishForecastStatus(null, 0);
+    const source = getDelta(app, "electrical.energy.prediction.weather.source");
+    const hours = getDelta(
+      app,
+      "electrical.energy.prediction.weather.validHours",
+    );
+    assert.strictEqual(source.value, null);
+    assert.strictEqual(hours.value, 0);
+  });
+
+  test("sendMeta includes weather.source and weather.validHours", () => {
+    const { app, pub } = makePublisher();
+    pub.sendMeta([]);
+    const metaCall = app.handleMessageCalls.find(
+      (c) => c.msg.updates?.[0]?.meta,
+    );
+    const byPath = {};
+    for (const m of metaCall.msg.updates[0].meta) byPath[m.path] = m.value;
+    assert.ok(
+      byPath["electrical.energy.prediction.weather.source"],
+      "weather.source meta present",
+    );
+    assert.strictEqual(
+      byPath["electrical.energy.prediction.weather.validHours"].units,
+      "h",
+    );
+  });
+});
+
 test.describe("Detected state inference from navigation state", () => {
   test("hydro detected as stowed when moored (even without deployStatePath)", async () => {
     // This test uses the full plugin to test the index.js inference logic

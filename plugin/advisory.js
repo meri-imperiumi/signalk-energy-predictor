@@ -282,6 +282,23 @@ class AdvisoryPublisher {
         },
       },
       {
+        path: `${PREDICTION_BASE}.weather.source`,
+        value: {
+          displayName: "Forecast source",
+          description:
+            "Which weather-forecast source the current prediction is built on (e.g. \"Open-Meteo\", \"Signal K Weather API\", \"Signal K Logbook\", \"Clear Sky Baseline\"), or null when no forecast is available",
+        },
+      },
+      {
+        path: `${PREDICTION_BASE}.weather.validHours`,
+        value: {
+          displayName: "Forecast valid hours",
+          description:
+            "Hours the current forecast actually covers (the prediction's effective horizon). Can be shorter than the configured horizon when a tier returns fewer hours or a stale cache is partially consumed. 0 when no forecast is available.",
+          units: "h",
+        },
+      },
+      {
         path: `${PREDICTION_BASE}.windProtection.enabled`,
         value: {
           displayName: "Wind protection enabled",
@@ -708,6 +725,33 @@ class AdvisoryPublisher {
   }
 
   /**
+   * Publishes the weather-forecast status the current prediction is built
+   * on: which forecast tier is in use and how many hours it actually
+   * covers (the effective horizon, which can be shorter than the
+   * configured one when a tier returns fewer hours or a stale cache is
+   * partially consumed). Lets the crew see at a glance whether they're
+   * on a real forecast ("Open-Meteo, valid 48h") or a degraded fallback
+   * ("Clear Sky, valid 2h").
+   *
+   * Both are data, not a nudge, so they're emitted as plain deltas (no
+   * notification) for the instrument panel / webapp to render.
+   *
+   * @param {string|null} weatherSource - Human-readable source name
+   *        (e.g. "Open-Meteo", "Clear Sky"), or null when no forecast is
+   *        available this cycle
+   * @param {number} validHours - Hours the current forecast actually covers
+   *        (the prediction's effective horizon); 0 when no forecast
+   * @returns {void}
+   */
+  publishForecastStatus(weatherSource, validHours) {
+    this.publishDelta({
+      [`${PREDICTION_BASE}.weather.source`]: weatherSource ?? null,
+      [`${PREDICTION_BASE}.weather.validHours`]:
+        Number.isFinite(validHours) && validHours > 0 ? validHours : 0,
+    });
+  }
+
+  /**
    * Publishes drag reduction advisory (stowage when sufficient solar forecast).
    *
    * Urgency is time-driven (the stowage opportunity is hours away) and
@@ -960,6 +1004,12 @@ class AdvisoryPublisher {
    * @param {boolean} [params.isUnderway=false] - Whether the vessel is under way
    * @param {Map<string, number>} [params.deployConfidences] - Map of device ID to StateConfidence
    * @param {number} [params.batterySoC] - Current battery SoC [0–1]
+   * @param {string|null} [params.weatherSource=null] - Human-readable
+   *        forecast source name in use this cycle (e.g. "Open-Meteo",
+   *        "Signal K Weather API", "Signal K Logbook", "Clear Sky
+   *        Baseline"), or null when no forecast is available
+   * @param {number} [params.validHours=0] - Hours the current forecast
+   *        actually covers (the prediction's effective horizon)
    * @param {number|null} [params.localOffsetMinutes=null] - Solar-local UTC
    *        offset (min) for human-facing times; null uses host timezone
    * @param {object} [params.urgencyConfig] - Urgency config override
@@ -979,6 +1029,8 @@ class AdvisoryPublisher {
     isUnderway = false,
     deployConfidences,
     batterySoC,
+    weatherSource = null,
+    validHours = 0,
     localOffsetMinutes = null,
     urgencyConfig,
   }) {
@@ -989,6 +1041,7 @@ class AdvisoryPublisher {
     // Publish forecast and time predictions
     this.publishHourlyForecast(hourlyForecast);
     this.publishTimePredictions(timeToFull, timeToEmpty);
+    this.publishForecastStatus(weatherSource, validHours);
 
     // Publish deployment state recommendations and notifications
     this.publishDeploymentStates(

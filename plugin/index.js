@@ -1330,6 +1330,14 @@ module.exports = (app) => {
       const solarOffsetMinutes = solarOffsetMinutesFromLongitude(
         ingestionFSM.position.longitude,
       );
+      // Forecast status: which tier the current prediction is built on and
+      // how many hours it actually covers (the effective horizon, which can
+      // be shorter than the configured one when a tier returns fewer hours
+      // or a stale cache is partially consumed). The effective horizon is
+      // lastPrediction.length, which runPrediction caps to the forecast's
+      // real coverage.
+      const forecastSourceInfo = ingestionFSM.getSourceInfo();
+      const validHours = predictionEngine.lastPrediction?.length ?? 0;
       advisoryPublisher.publishAll({
         hourlyForecast: hourly,
         timeToFull,
@@ -1344,6 +1352,8 @@ module.exports = (app) => {
         isUnderway: underway,
         deployConfidences,
         batterySoC: predictionEngine.getCurrentSoC(),
+        weatherSource: forecastSourceInfo.source,
+        validHours,
         localOffsetMinutes: solarOffsetMinutes,
         urgencyConfig: pluginConfig.notification?.urgency,
       });
@@ -1351,8 +1361,7 @@ module.exports = (app) => {
 
       // Record the prediction cycle
       const forecastObjects = predictionEngine.getHourlyForecast();
-      const sourceInfo = ingestionFSM.getSourceInfo();
-      const weatherTier = sourceInfo.tier || 1;
+      const weatherTier = forecastSourceInfo.tier || 1;
       await recorder?.recordCycle({
         timestamp: new Date(),
         weatherTier,

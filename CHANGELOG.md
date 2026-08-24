@@ -8,6 +8,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- Two new Signal K deltas expose the weather-forecast status the
+  current prediction is built on, so the crew can see at a glance whether
+  they're on a real forecast or a degraded fallback:
+  - `electrical.energy.prediction.weather.source` — the forecast source
+    name in use this cycle (e.g. "Open-Meteo", "Signal K Weather API",
+    "Signal K Logbook", "Clear Sky Baseline"), or null when no forecast is
+    available. Short text, not a tier number; the tier-2 string names the
+    Signal K Weather API itself so the provider is identifiable.
+  - `electrical.energy.prediction.weather.validHours` (`h`) — how many
+    hours the current forecast actually covers (the prediction's
+    effective horizon). Can be shorter than the configured horizon when
+    a tier returns fewer hours (e.g. "valid 2h") or the full 48h on a
+    fresh Open-Meteo fetch. 0 when no forecast is available.
+  Published each prediction cycle via `publishAll` (data, not a
+  notification), with `sendMeta` metadata for both paths.
 - Signal K metadata for the surplus-energy paths
   `electrical.energy.prediction.surplusWh` (`Wh`), `surplus.from` and
   `surplus.to` (`timestamp`), emitted by `sendMeta` alongside the existing
