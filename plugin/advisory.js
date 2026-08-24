@@ -20,6 +20,7 @@ const {
   Urgency,
   StateConfidence,
 } = require("./urgency.js");
+const { flipCooldownHoursFor } = require("./combustion.js");
 
 /**
  * FLINsail deployment advisory states.
@@ -41,6 +42,7 @@ const AdvisoryType = {
   DEPLOY_NOW: "deploy_now",
   DEPLOY_SOON: "deploy_soon",
   ENGINE_RUN: "engine_run",
+  GENSET_RUN: "genset_run",
   TIME_TO_FULL: "time_to_full",
   TIME_TO_EMPTY: "time_to_empty",
   DEPLOY_INFO: "deploy_info",
@@ -185,6 +187,10 @@ class AdvisoryPublisher {
     this.activeNotifications = new Map(); // Tracks active notification states
     this.debounceTimers = new Map(); // Per-system debounce timers
     this.lastNotificationTimes = new Map(); // When each system was last notified
+    // Last deploy/stow action notified per device (#11 flip cooldown):
+    // reluctance widens the hysteresis band so a high-friction source
+    // isn't nagged through transient condition flips.
+    this.lastDeployActions = new Map();
   }
 
   /**
@@ -690,51 +696,80 @@ class AdvisoryPublisher {
 
       if (needsChange) {
         const action = rec.recommendedState === "deployed" ? "Deploy" : "Stow";
-        // For a deploy suggestion, the "duration" feeding the urgency
-        // duration gate is the forecast good-output window (the crew is
-        // deciding whether the window is long enough to justify the deck
-        // trip). For a stow recommendation, duration is about how long the
-        // over-limit condition has persisted (an actual-event signal we
-        // don't track per-recommendation yet — pass null so the sustained
-        // default applies).
-        const eventDurationMinutes =
-          rec.recommendedState === "deployed" && rec.goodOutputHours != null
-            ? rec.goodOutputHours * 60
-            : null;
-        let urgency = calculateUrgency({
-          severityRatio: severityRatioFor(rec),
-          timeToActionHours: hoursUntil(rec.recommendedStateTime),
-          isActual: isActualCondition(rec),
-          advisoryType: "deployable",
-          detectedState: currentState,
-          recommendedState: rec.recommendedState,
-          stateConfidence: confidence,
-          deployableType: rec.type,
-          reluctance: rec.reluctance,
-          eventDurationMinutes,
-          config: urgencyConfig,
-        });
-        // A detected/recommended mismatch always warrants at least an
-        // informational alert so the crew knows a state change is advised.
-        // Reluctance and confidence can dampen the *level* (toward visual/
-        // info) but should not suppress the notification entirely (that
-        // would read as "all clear").
-        if (urgency === Urgency.NORMAL) urgency = Urgency.INFO;
-        const notif = urgencyToNotification(urgency, {
-          isNight,
-          advisoryType: "deployable",
-          isUnderway,
-        });
-        // null = held for the morning (at-rest + night + low urgency):
-        // skip publishing entirely so the last notification stands.
-        if (notif != null) {
-          this.publishNotification(
-            `deploy_${rec.id}`,
-            notif.state,
-            `${rec.name}: ${action} now, ${rec.reason}${yieldSuffix}`,
-            { methods: notif.methods },
-          );
+
+        // Flip cooldown (#11): a deployable whose recommendation flips
+        // back within its reluctance-driven cooldown doesn't get re-nagged
+        // — that's the hysteresis band that keeps a high-friction source
+        // (wind generator) from deploy/stow cycling on marginal swings,
+        // while easy sources (hydro) stay responsive. Safety carve-out:
+        // an *actual* over-limit condition (gusts already at the limit)
+        // always notifies, whatever the cooldown.
+        const lastAction = this.lastDeployActions.get(rec.id);
+        const actionKey = action.toLowerCase();
+        const flipped = lastAction != null && lastAction.action !== actionKey;
+        const withinCooldown =
+          lastAction != null &&
+          Date.now() - lastAction.at <
+            flipCooldownHoursFor(rec.reluctance, rec.flipCooldownHours) *
+              3600000;
+        const heldByFlipCooldown =
+          flipped && withinCooldown && !isActualCondition(rec);
+        if (!heldByFlipCooldown) {
+          if (lastAction == null || flipped) {
+            this.lastDeployActions.set(rec.id, {
+              action: actionKey,
+              at: Date.now(),
+            });
+          }
+
+          // For a deploy suggestion, the "duration" feeding the urgency
+          // duration gate is the forecast good-output window (the crew is
+          // deciding whether the window is long enough to justify the deck
+          // trip). For a stow recommendation, duration is about how long the
+          // over-limit condition has persisted (an actual-event signal we
+          // don't track per-recommendation yet — pass null so the sustained
+          // default applies).
+          const eventDurationMinutes =
+            rec.recommendedState === "deployed" && rec.goodOutputHours != null
+              ? rec.goodOutputHours * 60
+              : null;
+          let urgency = calculateUrgency({
+            severityRatio: severityRatioFor(rec),
+            timeToActionHours: hoursUntil(rec.recommendedStateTime),
+            isActual: isActualCondition(rec),
+            advisoryType: "deployable",
+            detectedState: currentState,
+            recommendedState: rec.recommendedState,
+            stateConfidence: confidence,
+            deployableType: rec.type,
+            reluctance: rec.reluctance,
+            eventDurationMinutes,
+            config: urgencyConfig,
+          });
+          // A detected/recommended mismatch always warrants at least an
+          // informational alert so the crew knows a state change is advised.
+          // Reluctance and confidence can dampen the *level* (toward visual/
+          // info) but should not suppress the notification entirely (that
+          // would read as "all clear").
+          if (urgency === Urgency.NORMAL) urgency = Urgency.INFO;
+          const notif = urgencyToNotification(urgency, {
+            isNight,
+            advisoryType: "deployable",
+            isUnderway,
+          });
+          // null = held for the morning (at-rest + night + low urgency):
+          // skip publishing entirely so the last notification stands.
+          if (notif != null) {
+            this.publishNotification(
+              `deploy_${rec.id}`,
+              notif.state,
+              `${rec.name}: ${action} now, ${rec.reason}${yieldSuffix}`,
+              { methods: notif.methods },
+            );
+          }
         }
+        // heldByFlipCooldown: the deltas above already carry the
+        // recommendation; only the notification is held.
       } else {
         // State matches or unknown - clear any existing notification
         this.publishNotification(
@@ -901,15 +936,29 @@ class AdvisoryPublisher {
   }
 
   /**
-   * Publishes engine run advisory when battery depletion is projected.
+   * Publishes combustion-source advisories (#11): genset and engine run
+   * recommendations through the deployment channel.
    *
-   * Urgency is computed from the current battery SoC and the hours until
-   * the optimal window closes (the latest sensible start time), then
-   * mapped through the day/night method table. Battery `alarm`/`high`
-   * (<1h to empty) sound even at night — the boat going dark is urgent
-   * regardless of time.
+   * For each tier ("genset" → GENSET_RUN, "engine" → ENGINE_RUN) exactly
+   * one notification slot exists. A run recommendation whose detected
+   * state differs from "deployed" publishes the run prompt; a "stop"
+   * recommendation (batch complete) while the source is detected running
+   * publishes the stop prompt; anything else clears the slot to normal.
    *
-   * @param {{hours: number, optimalWindow: {start: Date, end: Date}}|null} runTime - Engine run time calculation
+   * Urgency for run prompts is computed from the current battery SoC and
+   * the hours until the optimal window closes (the latest sensible start
+   * time), then mapped through the day/night method table. Battery
+   * `alarm`/`high` (<1h to empty) sound even at night — the boat going
+   * dark is urgent regardless of time.
+   *
+   * The recommended state, detected state, reason, tier and run window
+   * are also published as Signal K values under the standard deployment
+   * paths, so instrument panels treat combustion sources like any other
+   * deployable ("deployed" = running).
+   *
+   * @param {Array<{id: string, name: string, type: "genset"|"engine", tier: number, recommendedState: string, reason: string, detectedState: string|null, watts: number, runHours: number|null, windowStart: Date|null, windowEnd: Date|null}>} recommendations -
+   *        Combustion recommendations from
+   *        PredictionEngine.getCombustionRecommendations()
    * @param {object} [opts]
    * @param {number} [opts.batterySoC] - Current battery SoC [0–1]
    * @param {boolean} [opts.isNight=false] - Whether it is currently nighttime
@@ -921,45 +970,86 @@ class AdvisoryPublisher {
    * @param {object} [opts.urgencyConfig] - Urgency config override
    * @returns {void}
    */
-  publishEngineRunAdvisory(runTime, opts = {}) {
-    const type = AdvisoryType.ENGINE_RUN;
+  publishCombustionAdvisories(recommendations, opts = {}) {
+    const updates = {};
 
-    if (runTime) {
-      const hours = Math.round(runTime.hours * 10) / 10;
-      const off = opts.localOffsetMinutes ?? null;
-      const end = formatWindowTime(runTime.optimalWindow.end, undefined, off);
-      const start = formatWindowTime(
-        runTime.optimalWindow.start,
-        undefined,
-        off,
+    for (const rec of recommendations) {
+      const base = `${PREDICTION_BASE}.deployment.${rec.id}`;
+      updates[`${base}.recommendedState`] = rec.recommendedState;
+      updates[`${base}.detectedState`] = rec.detectedState ?? null;
+      updates[`${base}.reason`] = rec.reason;
+      updates[`${base}.tier`] = rec.tier;
+      updates[`${base}.runHours`] = rec.runHours ?? null;
+      updates[`${base}.windowStart`] = rec.windowStart
+        ? rec.windowStart.toISOString()
+        : null;
+      updates[`${base}.windowEnd`] = rec.windowEnd
+        ? rec.windowEnd.toISOString()
+        : null;
+    }
+    if (Object.keys(updates).length > 0) {
+      this.publishDelta(updates);
+    }
+
+    // One notification slot per tier; the strongest rec per tier wins.
+    for (const tier of ["genset", "engine"]) {
+      const type =
+        tier === "genset" ? AdvisoryType.GENSET_RUN : AdvisoryType.ENGINE_RUN;
+      const rec = recommendations.find(
+        (r) =>
+          r.type === tier &&
+          r.detectedState != null &&
+          r.detectedState !== r.recommendedState,
       );
-      const message = `Run engine for ${hours}h between ${start}-${end} to avoid low battery`;
-      const urgency = calculateUrgency({
-        advisoryType: "engine",
-        batterySoC: opts.batterySoC ?? null,
-        timeToActionHours: hoursUntil(runTime.optimalWindow.end),
-        isActual: false,
-        config: opts.urgencyConfig,
-      });
-      const notif = urgencyToNotification(urgency, {
-        isNight: opts.isNight ?? false,
-        isUnderway: opts.isUnderway ?? false,
-        advisoryType: "engine",
-      });
-      // null = held for the morning (at-rest + night + low urgency):
-      // skip so the last notification stands. Battery alarm/high never
-      // hit this path (they're medium+ and always emit, with sound).
-      if (notif != null) {
-        this.publishNotification(type, notif.state, message, {
-          methods: notif.methods,
-        });
+      if (!rec) {
+        this.publishNotification(
+          type,
+          DeployState.NORMAL,
+          tier === "genset" ? "No genset run needed" : "No engine run needed",
+        );
+        continue;
       }
-    } else {
-      this.publishNotification(
-        type,
-        DeployState.NORMAL,
-        "No engine run needed",
-      );
+      if (rec.recommendedState === "deployed") {
+        const off = opts.localOffsetMinutes ?? null;
+        const end = formatWindowTime(rec.windowEnd, undefined, off);
+        const start = formatWindowTime(rec.windowStart, undefined, off);
+        const message = `Run ${rec.name} for ${rec.runHours}h between ${start}-${end} to avoid low battery`;
+        const urgency = calculateUrgency({
+          advisoryType: "engine",
+          batterySoC: opts.batterySoC ?? null,
+          timeToActionHours: hoursUntil(rec.windowEnd),
+          isActual: false,
+          config: opts.urgencyConfig,
+        });
+        const notif = urgencyToNotification(urgency, {
+          isNight: opts.isNight ?? false,
+          isUnderway: opts.isUnderway ?? false,
+          advisoryType: "engine",
+        });
+        // null = held for the morning (at-rest + night + low urgency):
+        // skip so the last notification stands. Battery alarm/high never
+        // hit this path (they're medium+ and always emit, with sound).
+        if (notif != null) {
+          this.publishNotification(type, notif.state, message, {
+            methods: notif.methods,
+          });
+        }
+      } else {
+        // Batch complete: the source is running but shouldn't be.
+        const notif = urgencyToNotification(Urgency.LOW, {
+          isNight: opts.isNight ?? false,
+          isUnderway: opts.isUnderway ?? false,
+          advisoryType: "engine",
+        });
+        if (notif != null) {
+          this.publishNotification(
+            type,
+            notif.state,
+            `${rec.name}: stop — ${rec.reason}`,
+            { methods: notif.methods },
+          );
+        }
+      }
     }
   }
 
@@ -1098,7 +1188,7 @@ class AdvisoryPublisher {
    * @param {Date|null} params.timeToFull - Time when battery will be full
    * @param {Date|null} params.timeToEmpty - Time when battery will be depleted
    * @param {{hour: number, reason: string}|null} params.stowageOpportunity - Mechanical stowage opportunity
-   * @param {{hours: number, optimalWindow: {start: Date, end: Date}}|null} params.engineRunTime - Engine run time
+   * @param {Array<object>} [params.combustionRecommendations=[]] - Combustion-source recommendations (#11)
    * @param {Array<{id: string, name: string, type: string, recommendedState: string, reason: string}>} params.deploymentRecommendations - Deployment recommendations
    * @param {Map<string, string|null>} params.currentDeployStates - Map of device ID to current state
    * @param {boolean} [params.isNight=false] - Whether it is currently nighttime
@@ -1121,7 +1211,7 @@ class AdvisoryPublisher {
     timeToFull,
     timeToEmpty,
     stowageOpportunity,
-    engineRunTime,
+    combustionRecommendations = [],
     surplusOpportunity,
     opportunisticLoads = [],
     deploymentRecommendations = [],
@@ -1171,8 +1261,8 @@ class AdvisoryPublisher {
       urgencyConfig,
     });
 
-    // Publish engine run advisory
-    this.publishEngineRunAdvisory(engineRunTime, {
+    // Publish combustion-source (genset/engine) run advisories
+    this.publishCombustionAdvisories(combustionRecommendations, {
       batterySoC,
       isNight,
       isUnderway,

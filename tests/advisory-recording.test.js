@@ -35,13 +35,21 @@ test("buildCycleAdvisories: records surplus, engine-run (deficit) and stowage ad
       to: new Date("2026-08-23T18:00:00Z"),
       suggestedLoadW: 150,
     },
-    engineRunTime: {
-      hours: 1.5,
-      optimalWindow: {
-        start: new Date("2026-08-23T06:00:00Z"),
-        end: new Date("2026-08-23T07:30:00Z"),
+    combustionRecommendations: [
+      {
+        id: "main",
+        name: "Engine",
+        type: "engine",
+        tier: 3,
+        recommendedState: "deployed",
+        reason: "bank projected below the 20% floor for 4h",
+        detectedState: "stowed",
+        watts: 100,
+        runHours: 1.5,
+        windowStart: new Date("2026-08-23T06:00:00Z"),
+        windowEnd: new Date("2026-08-23T07:30:00Z"),
       },
-    },
+    ],
     stowageOpportunity: {
       hour: 3,
       reason: "Deficit covered by hour 3, 800Wh solar remaining",
@@ -58,7 +66,7 @@ test("buildCycleAdvisories: records surplus, engine-run (deficit) and stowage ad
       },
       {
         type: "engine_run",
-        message: "Run engine for 1.5h between 06:00-07:30 to avoid low battery",
+        message: "Run Engine for 1.5h between 06:00-07:30 to avoid low battery",
       },
       {
         type: "stow_soon",
@@ -80,7 +88,7 @@ test("buildCycleAdvisories: omits null opportunities", () => {
 
   const advisories = buildCycleAdvisories({
     surplusOpportunity: null,
-    engineRunTime: null,
+    combustionRecommendations: [],
     stowageOpportunity: null,
     localOffsetMinutes: 0,
   });
@@ -98,7 +106,7 @@ test("buildCycleAdvisories: surplus message omits sustained wattage when zero", 
       to: new Date("2026-08-23T16:00:00Z"),
       suggestedLoadW: 0,
     },
-    engineRunTime: null,
+    combustionRecommendations: [],
     stowageOpportunity: null,
     localOffsetMinutes: 0,
   });
@@ -121,7 +129,7 @@ test("buildCycleAdvisories: surplus carries structured data + elective-load sugg
       to: new Date("2026-08-23T18:00:00Z"),
       suggestedLoadW: 150,
     },
-    engineRunTime: null,
+    combustionRecommendations: [],
     stowageOpportunity: null,
     opportunisticLoads: [
       { name: "Watermaker", watts: 150 },
@@ -166,13 +174,21 @@ test("buildCycleAdvisories: engine-run advisory carries structured window data",
 
   const advisories = buildCycleAdvisories({
     surplusOpportunity: null,
-    engineRunTime: {
-      hours: 1.5,
-      optimalWindow: {
-        start: new Date("2026-08-23T06:00:00Z"),
-        end: new Date("2026-08-23T07:30:00Z"),
+    combustionRecommendations: [
+      {
+        id: "main",
+        name: "Engine",
+        type: "engine",
+        tier: 3,
+        recommendedState: "deployed",
+        reason: "bank projected below the 20% floor for 4h",
+        detectedState: "stowed",
+        watts: 100,
+        runHours: 1.5,
+        windowStart: new Date("2026-08-23T06:00:00Z"),
+        windowEnd: new Date("2026-08-23T07:30:00Z"),
       },
-    },
+    ],
     stowageOpportunity: null,
     localOffsetMinutes: 0,
   });

@@ -48,6 +48,7 @@ function makePredictionEngine({
   navState,
   speed,
   app,
+  observedGustMs,
 }) {
   const a = app || makeFakeApp();
   if (navState != null) a.setSelfPath("navigation.state", navState);
@@ -61,6 +62,8 @@ function makePredictionEngine({
     getEfficiency: () => 0.7,
     getSelfPath: (path) => a.getSelfPath(path),
     app: a,
+    getObservedGustMs:
+      observedGustMs != null ? () => observedGustMs : undefined,
   });
 }
 
@@ -137,6 +140,31 @@ test.describe("Deployment recommendations: FLINsail", () => {
     assert.strictEqual(rec.recommendedState, "stowed");
     assert.match(rec.reason, /25/);
     assert.match(rec.reason, /20/);
+  });
+
+  test("observed gusts at the limit stow FLINsail even when forecast is calm", () => {
+    // The crew's real-world complaint: live gusts over the limit but the
+    // forecast says it's calm — no stow notification fired. Observed gusts
+    // must override the forecast for the current-hour stow verdict.
+    const engine = makePredictionEngine({
+      solarArrays: [
+        {
+          id: "flinsail",
+          type: "deployable",
+          capacityWp: 300,
+          gustLimitKnots: 20,
+        },
+      ],
+      navState: "anchored",
+      observedGustMs: msFromKnots(25),
+    });
+    engine.runPrediction(makeForecastWithGusts(5, 4)); // calm forecast
+    const rec = engine
+      .getDeploymentRecommendations()
+      .find((r) => r.id === "flinsail");
+    assert.strictEqual(rec.recommendedState, "stowed");
+    assert.match(rec.reason, /observed gusts 25kn/);
+    assert.ok(rec.currentGustMs >= rec.limitMs, "gust at/above limit");
   });
 
   test("deploys FLINsail when at anchor and gusts below limit", () => {
@@ -232,6 +260,30 @@ test.describe("Deployment recommendations: wind generators", () => {
       .find((r) => r.id === "windgen");
     assert.strictEqual(rec.recommendedState, "stowed");
     assert.match(rec.reason, /35/);
+  });
+
+  test("observed gusts at the limit stow wind gen even when forecast is calm", () => {
+    const engine = makePredictionEngine({
+      generators: [
+        {
+          id: "windgen",
+          type: "wind",
+          deployable: true,
+          maxWindKnots: 30,
+          powerPath: "electrical.windgen.power",
+          manufacturerCurve: "5,10,10,50,15,100,20,150,25,200,30,250",
+        },
+      ],
+      navState: "moored",
+      observedGustMs: msFromKnots(35),
+    });
+    engine.runPrediction(makeForecastWithGusts(10, 8)); // calm forecast
+    const rec = engine
+      .getDeploymentRecommendations()
+      .find((r) => r.id === "windgen");
+    assert.strictEqual(rec.recommendedState, "stowed");
+    assert.match(rec.reason, /observed gusts 35kn/);
+    assert.ok(rec.currentGustMs >= rec.limitMs, "gust at/above limit");
   });
 
   test("deploys wind generator when wind is sufficient and gusts below max", () => {
@@ -3738,7 +3790,21 @@ test.describe("24-hour clock in engine run advisory", () => {
     // Create a runTime with specific window
     const start = new Date("2026-01-01T22:54:00Z");
     const end = new Date("2026-01-02T08:04:00Z");
-    pub.publishEngineRunAdvisory({ hours: 9.2, optimalWindow: { start, end } });
+    pub.publishCombustionAdvisories([
+      {
+        id: "main",
+        name: "Engine",
+        type: "engine",
+        tier: 3,
+        recommendedState: "deployed",
+        reason: "bank projected below the 20% floor for 4h",
+        detectedState: "stowed",
+        watts: 100,
+        runHours: 9.2,
+        windowStart: start,
+        windowEnd: end,
+      },
+    ]);
 
     const notifCalls = app.handleMessageCalls
       .filter(
@@ -3750,7 +3816,9 @@ test.describe("24-hour clock in engine run advisory", () => {
       )
       .flatMap((c) => c.msg.updates[0].values);
 
-    const notif = notifCalls.find((v) => v.path.startsWith("notifications."));
+    const notif = notifCalls.find((v) =>
+      v.path.startsWith("notifications.electrical.energy.engine_run"),
+    );
     assert.ok(notif);
     assert.match(notif.value.message, /\d{2}:\d{2}-\d{2}:\d{2}/);
     // Should NOT contain AM/PM

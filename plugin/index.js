@@ -114,13 +114,16 @@ function detectEngineRunning(pathValues) {
  * elective-load suggestions the webapp can render in more detail than the
  * terse notification.
  *
- * Deficit is represented by the engine-run advisory (run the engine to
- * avoid a flat bank); surplus by the surplus-opportunity advisory.
- * `null` opportunities are omitted (nothing to record).
+ * Deficit is represented by the combustion run advisories (run the
+ * genset/engine to avoid a flat bank, #11); surplus by the
+ * surplus-opportunity advisory. `null` opportunities are omitted
+ * (nothing to record).
  *
  * @param {object} opts
  * @param {{surplusWh: number, from: Date, to: Date, suggestedLoadW: number}|null} opts.surplusOpportunity
- * @param {{hours: number, optimalWindow: {start: Date, end: Date}}|null} opts.engineRunTime
+ * @param {Array<{id: string, name: string, type: "genset"|"engine", recommendedState: string, reason: string, runHours: number|null, windowStart: Date|null, windowEnd: Date|null}>} [opts.combustionRecommendations=[]] -
+ *        Combustion-source recommendations (#11); "deployed" entries
+ *        (run suggestions) become recorded advisories
  * @param {{hour: number, reason: string}|null} opts.stowageOpportunity
  * @param {Array<{name: string, watts: number, statePath?: string, onValues?: string}>} [opts.opportunisticLoads=[]] -
  *        Configured elective loads; those already running are skipped
@@ -133,7 +136,7 @@ function detectEngineRunning(pathValues) {
  */
 function buildCycleAdvisories({
   surplusOpportunity,
-  engineRunTime,
+  combustionRecommendations = [],
   stowageOpportunity,
   opportunisticLoads = [],
   isLoadRunning = null,
@@ -188,25 +191,45 @@ function buildCycleAdvisories({
       loads,
     });
   }
-  if (engineRunTime) {
-    const hours = Math.round(engineRunTime.hours * 10) / 10;
+  for (const rec of combustionRecommendations) {
+    // Only run suggestions are recorded as advisories; "stop" (batch
+    // complete) and no-recommendation states are lifecycle, not events.
+    if (rec.recommendedState !== "deployed" || rec.runHours == null) {
+      continue;
+    }
     const start = formatWindowTime(
-      engineRunTime.optimalWindow.start,
+      rec.windowStart,
       undefined,
       localOffsetMinutes,
     );
-    const end = formatWindowTime(
-      engineRunTime.optimalWindow.end,
-      undefined,
-      localOffsetMinutes,
-    );
+    const end = formatWindowTime(rec.windowEnd, undefined, localOffsetMinutes);
+    const noun = rec.type === "genset" ? "genset" : rec.name || "engine";
+    // "Load it well": engines and gensets dislike running unloaded, so
+    // suggest concurrent opportunistic loads (watermaker, water heater —
+    // the #7 list) that fit within the source's output. A load bigger
+    // than the source would drain the bank it's trying to charge.
+    const windowHours =
+      (rec.windowEnd.getTime() - rec.windowStart.getTime()) / 3600000;
+    const loads = (opportunisticLoads || [])
+      .filter((load) => !isLoadRunning?.(load))
+      .filter((load) => load.watts > 0 && load.watts <= rec.watts)
+      .map((load) => ({
+        name: load.name,
+        watts: load.watts,
+        runHours: Math.round(windowHours * 10) / 10,
+      }));
     advisories.push({
-      type: AdvisoryType.ENGINE_RUN,
-      time: engineRunTime.optimalWindow.start.toISOString(),
-      message: `Run engine for ${hours}h between ${start}-${end} to avoid low battery`,
-      engineHours: hours,
-      windowStart: engineRunTime.optimalWindow.start.toISOString(),
-      windowEnd: engineRunTime.optimalWindow.end.toISOString(),
+      type:
+        rec.type === "genset"
+          ? AdvisoryType.GENSET_RUN
+          : AdvisoryType.ENGINE_RUN,
+      sourceId: rec.id,
+      time: rec.windowStart.toISOString(),
+      message: `Run ${noun} for ${rec.runHours}h between ${start}-${end} to avoid low battery`,
+      engineHours: rec.runHours,
+      windowStart: rec.windowStart.toISOString(),
+      windowEnd: rec.windowEnd.toISOString(),
+      loads,
     });
   }
   if (stowageOpportunity) {
@@ -231,10 +254,15 @@ const DEFAULT_CONFIG = {
     systemVoltage: 12,
     minSafeSoC: 0.2,
     socPath: "electrical.batteries.house.capacity.stateOfCharge",
+    // Legacy single-alternator setting (pre-#11 configs); normalized into
+    // a default "main" engine by getActiveEngines when no engines array
+    // is configured.
     engineAlternatorWatts: 100,
   },
   solarArrays: [],
   mechanicalGenerators: [],
+  engines: [],
+  gensets: [],
   learning: {
     enabled: true,
     saveIntervalMinutes: 15,
@@ -388,6 +416,58 @@ module.exports = (app) => {
         ...g,
         curve: parseManufacturerCurve(g.manufacturerCurve),
       }));
+  }
+
+  /**
+   * Configured engines, with the legacy single-alternator setting
+   * (`battery.engineAlternatorWatts`) normalized into a default "main"
+   * engine entry when no engines are configured. Engine ids are Signal K
+   * propulsion instance names — "main", "port", "starboard", whatever
+   * the vessel has.
+   *
+   * @param {object} config - Plugin configuration
+   * @returns {Array<{id: string, name?: string, alternatorWatts: number}>}
+   */
+  function getActiveEngines(config) {
+    // An explicit engines array is authoritative — an empty one means the
+    // vessel has no engine tier (or all electric), so the legacy fallback
+    // must not resurrect a "main" engine.
+    if (Array.isArray(config?.engines)) {
+      return config.engines.filter(
+        (e) =>
+          e && typeof e.id === "string" && e.id !== "" && e.enabled !== false,
+      );
+    }
+    const legacyWatts = config?.battery?.engineAlternatorWatts;
+    if (typeof legacyWatts === "number" && legacyWatts > 0) {
+      return [
+        {
+          id: "main",
+          name: "Engine",
+          alternatorWatts: legacyWatts,
+        },
+      ];
+    }
+    return [];
+  }
+
+  /**
+   * Configured gensets (dedicated generators). Most boats have none —
+   * tier 2 is simply empty then.
+   *
+   * @param {object} config - Plugin configuration
+   * @returns {Array<{id: string, name?: string, outputWatts: number}>}
+   */
+  function getActiveGensets(config) {
+    return (config?.gensets || []).filter(
+      (g) =>
+        g &&
+        typeof g.id === "string" &&
+        g.id !== "" &&
+        typeof g.outputWatts === "number" &&
+        g.outputWatts > 0 &&
+        g.enabled !== false,
+    );
   }
 
   /**
@@ -1295,9 +1375,12 @@ module.exports = (app) => {
       const timeToEmpty = predictionEngine.getTimeToEmpty();
       const stowageOpportunity = predictionEngine.findStowageOpportunity();
 
-      const engineRunTime = predictionEngine.calculateEngineRunTime(
-        pluginConfig.battery?.engineAlternatorWatts || 100,
-      );
+      // Combustion sources (#11): gensets + engine(s) as deployable
+      // generators with tiered reluctance. Evolves the old
+      // engine-run-time calculation — run window, sustained-violation
+      // gating, batching and cooldown all come from the tier evaluation.
+      const combustionRecommendations =
+        predictionEngine.getCombustionRecommendations();
 
       // Find a surplus-energy opportunity (battery forecast full while
       // yield continues — watermaker/ice-maker case; motoring side-effect).
@@ -1401,7 +1484,7 @@ module.exports = (app) => {
         timeToFull,
         timeToEmpty,
         stowageOpportunity,
-        engineRunTime,
+        combustionRecommendations,
         surplusOpportunity,
         opportunisticLoads: surplusConfig.opportunisticLoads || [],
         deploymentRecommendations,
@@ -1435,7 +1518,7 @@ module.exports = (app) => {
         // Mirrors the messages broadcast as Signal K notifications above.
         advisories: buildCycleAdvisories({
           surplusOpportunity,
-          engineRunTime,
+          combustionRecommendations,
           stowageOpportunity,
           opportunisticLoads: surplusConfig.opportunisticLoads || [],
           isLoadRunning: (load) => advisoryPublisher.isLoadRunning(load),
@@ -2495,6 +2578,14 @@ module.exports = (app) => {
           id: g.id,
           type: "mechanical",
         })),
+        ...getActiveGensets(config).map((g) => ({
+          id: g.id,
+          type: "genset",
+        })),
+        ...getActiveEngines(config).map((e) => ({
+          id: e.id,
+          type: "engine",
+        })),
       ];
       advisoryPublisher.sendMeta(metaDevices);
 
@@ -2518,6 +2609,19 @@ module.exports = (app) => {
           capacityWp: getActiveCapacity(a),
         })),
         mechanicalGenerators: getActiveGenerators(config),
+        gensets: getActiveGensets(config),
+        engines: getActiveEngines(config),
+        combustionConfig: config.combustion,
+        // Dynamic any-engine detection: scans every subscribed propulsion
+        // instance (arbitrary names — "port"/"starboard" work without
+        // listing them twice in config). Configured engines remain the
+        // fallback for exact-path probing.
+        getEngineRunning: () => detectEngineRunning(deltaState),
+        // Observed (live) wind gust in m/s — max of recent speed samples.
+        // Reality overrides forecast for the current-hour stow verdict: a
+        // real gust at the limit must drive a "stow now" even when the
+        // forecast says it's calm.
+        getObservedGustMs: () => currentWindGustMs(),
         getEfficiency,
         getSelfPath: (path) => deltaState.get(path) ?? app.getSelfPath(path),
         getWindProtection,
@@ -2737,6 +2841,8 @@ module.exports = (app) => {
     resolveWindProtectionContext,
     publishWindProtection,
     buildCycleAdvisories,
+    getActiveEngines,
+    getActiveGensets,
     get windProtection() {
       return windProtection;
     },

@@ -5,6 +5,68 @@
  * @file schema.js
  */
 
+const { DEFAULT_TIER_SETTINGS } = require("./combustion.js");
+
+/**
+ * Builds the per-tier property set for the combustion run-discipline
+ * config (see plugin/combustion.js #11). Defaults mirror
+ * DEFAULT_TIER_SETTINGS so the Admin UI shows what the engine does.
+ *
+ * @param {"genset"|"engine"} tier
+ * @returns {object} JSON Schema properties object
+ */
+function tierSettings(tier) {
+  const d = DEFAULT_TIER_SETTINGS[tier] || DEFAULT_TIER_SETTINGS.engine;
+  const props = {
+    sustainedHours: {
+      type: "number",
+      title: "Sustained Violation Hours",
+      description:
+        "Recommend a run only when the projected SoC stays below the minimum safe floor for at least this many consecutive hours (a bank already below the floor deploys immediately)",
+      default: d.sustainedHours,
+      minimum: 1,
+      maximum: 24,
+    },
+    minRunMinutes: {
+      type: "number",
+      title: "Minimum Run",
+      description:
+        "Shortest useful run in minutes — never start the source for less (engines dislike short cold runs)",
+      default: d.minRunMinutes,
+      minimum: 0,
+      maximum: 480,
+    },
+    cooldownHours: {
+      type: "number",
+      title: "Cooldown",
+      description:
+        "After a detected run ends, suppress new run recommendations for this many hours (engines dislike frequent cold starts)",
+      default: d.cooldownHours,
+      minimum: 0,
+      maximum: 48,
+    },
+    socMargin: {
+      type: "number",
+      title: "Batch SoC Margin",
+      description:
+        "Run until SoC reaches floor + this margin (fraction) — finish the batch, don't stop the moment the floor is cleared",
+      default: d.socMargin,
+      minimum: 0,
+      maximum: 0.5,
+    },
+  };
+  if (d.nightHold !== undefined) {
+    props.nightHold = {
+      type: "boolean",
+      title: "Hold at Night",
+      description:
+        "At night, prefer waiting for the morning solar window when the SoC floor isn't breached before sunrise (a bank already below the floor still deploys immediately)",
+      default: d.nightHold,
+    };
+  }
+  return props;
+}
+
 /**
  * Builds the JSON Schema for the plugin configuration.
  *
@@ -65,16 +127,121 @@ function buildPluginSchema() {
             description: "Signal K path for battery state of charge",
             default: "electrical.batteries.house.capacity.stateOfCharge",
           },
-          engineAlternatorWatts: {
-            type: "number",
-            title: "Engine Alternator Output",
-            description:
-              "Expected alternator output when engine is running (watts)",
-            default: 100,
-            minimum: 50,
-          },
         },
         required: ["capacityAh", "systemVoltage", "minSafeSoC"],
+      },
+      engines: {
+        type: "array",
+        title: "Propulsion Engines",
+        description:
+          "Propulsion engines (0+; monohulls usually one, catamarans often port + starboard). The engine is a high-reluctance deployable generator: recommended only when a sustained deficit leaves no renewable recovery path. Engine IDs are Signal K propulsion instance names — use whatever your vessel has (main, port, starboard, …)",
+        items: {
+          type: "object",
+          title: "Engine",
+          properties: {
+            id: {
+              type: "string",
+              title: "Engine ID",
+              description:
+                "Signal K propulsion instance name (e.g., 'main', 'port', 'starboard')",
+              minLength: 1,
+            },
+            name: {
+              type: "string",
+              title: "Display Name",
+              description: "Human-readable name for advisories",
+              default: "",
+            },
+            alternatorWatts: {
+              type: "number",
+              title: "Alternator Output",
+              description:
+                "Expected alternator output when this engine runs (watts). 0 for electric drives or engines without an alternator — they are consumers and never recommended as generators",
+              default: 0,
+              minimum: 0,
+            },
+            enabled: {
+              type: "boolean",
+              title: "Enabled",
+              description: "Enable this engine for prediction",
+              default: true,
+            },
+          },
+          required: ["id"],
+        },
+      },
+      gensets: {
+        type: "array",
+        title: "Gensets",
+        description:
+          "Dedicated generators (diesel/DC generator, fuel cell). Most boats have none. A genset is the designated charger: it deploys before the main engine (night runs and at-anchor charging are unremarkable for it), still behind renewables",
+        items: {
+          type: "object",
+          title: "Genset",
+          properties: {
+            id: {
+              type: "string",
+              title: "Genset ID",
+              description: "Unique identifier (e.g., 'dc-generator')",
+              minLength: 1,
+            },
+            name: {
+              type: "string",
+              title: "Display Name",
+              description: "Human-readable name for advisories",
+              default: "",
+            },
+            outputWatts: {
+              type: "number",
+              title: "Output",
+              description: "Charging output in watts",
+              minimum: 1,
+            },
+            statePath: {
+              type: "string",
+              title: "State Path",
+              description:
+                "Signal K path for the genset state (e.g., electrical.generators.0.state). Values matching 'On Values' mean running",
+            },
+            onValues: {
+              type: "string",
+              title: "On Values",
+              description:
+                "Comma-separated state values meaning running (default: started,on,online,running,active)",
+            },
+            powerPath: {
+              type: "string",
+              title: "Power Path",
+              description:
+                "Signal K path for the genset power output (watts). Positive output means running; used when no state path is set",
+            },
+            enabled: {
+              type: "boolean",
+              title: "Enabled",
+              description: "Enable this genset for prediction",
+              default: true,
+            },
+          },
+          required: ["id", "outputWatts"],
+        },
+      },
+      combustion: {
+        type: "object",
+        title: "Combustion Run Discipline",
+        description:
+          "How reluctantly the genset and the main engine are recommended as generators (#11). Deficit escalates renewables → genset → engine; each tier deploys only on a sustained violation, runs a useful batch, then cools down",
+        properties: {
+          genset: {
+            type: "object",
+            title: "Genset Tier",
+            properties: tierSettings("genset"),
+          },
+          engine: {
+            type: "object",
+            title: "Engine Tier",
+            properties: tierSettings("engine"),
+          },
+        },
       },
       solarArrays: {
         type: "array",
@@ -245,6 +412,14 @@ function buildPluginSchema() {
                 medium: "Medium — deploy for a couple hours of output",
                 high: "High — deploy only for most of a day of output",
               },
+            },
+            flipCooldownHours: {
+              type: "number",
+              title: "Flip cooldown (hours)",
+              description:
+                "How long after a deploy/stow recommendation the opposite recommendation is held (published as a delta but not notified) — the hysteresis band that stops a marginal wind generator from deploy/stow cycling on every lull. Leave blank to use the reluctance default (Low 1h, Medium 2h, High 8h).",
+              minimum: 0,
+              maximum: 48,
             },
             maxWindKnots: {
               type: "number",

@@ -164,6 +164,9 @@ test.describe("LoadProfile", () => {
   test("gates samples when engine is running", () => {
     const lp = new LoadProfile({
       config: { enabled: true },
+      // Engine detection is per configured engine (ids are Signal K
+      // propulsion instance names — "port"/"starboard" work the same).
+      engines: [{ id: "main", alternatorWatts: 100 }],
       getSelfPath: (path) =>
         path === "propulsion.main.state" ? "started" : null,
       app: { debug: () => {}, error: () => {} },

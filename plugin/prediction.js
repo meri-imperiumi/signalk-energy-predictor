@@ -9,6 +9,13 @@
 
 const { sunPosition, nextSunrise, nextSunset, lastSunset } =
   require("./solar.js");
+const {
+  evaluateCombustionTier,
+  updateCombustionRuns,
+  resolveGensetRunning,
+  detectEngineRunning,
+  resolveTierSettings,
+} = require("./combustion.js");
 const { theoreticalPower } = require("./learning.js");
 const { formatWh, solarOffsetMinutesFromLongitude, formatLocalHHMM } =
   require("./format.js");
@@ -286,8 +293,20 @@ class LoadProfile {
    * @param {number} [params.config.outlierFactor=3] - Factor for spike gate
    * @param {(path: string) => unknown} params.getSelfPath - Function to read Signal K values
    * @param {object} params.app - Signal K server API (for logging)
+   * @param {Array<{id: string}>} [params.engines] - Configured engines
+   *        (ids are Signal K propulsion instance names, e.g. "port"),
+   *        used as the fallback for engine-running detection
+   * @param {() => (boolean|null)} [params.getEngineRunning] - Dynamic
+   *        engine-running detector (scans all propulsion instances); wins
+   *        over the configured-engines fallback
    */
-  constructor({ config = {}, getSelfPath, app } = {}) {
+  constructor({
+    config = {},
+    getSelfPath,
+    app,
+    engines,
+    getEngineRunning,
+  } = {}) {
     // Configuration
     this.enabled = config.enabled !== false;
     this.alpha = config.alpha ?? 0.05;
@@ -296,6 +315,8 @@ class LoadProfile {
 
     this.getSelfPath = getSelfPath;
     this.app = app;
+    this.engines = engines || [];
+    this.getEngineRunning = getEngineRunning || null;
 
     // 8 bins: 2 state classes × 4 sun phases
     // Each bin tracks AC and DC separately
@@ -371,40 +392,33 @@ class LoadProfile {
   }
 
   /**
-   * Checks if engine is currently running.
+   * Checks if any engine is currently running.
+   *
+   * The dynamic detector (when injected — it scans every subscribed
+   * propulsion instance, whatever the names) wins. Otherwise the
+   * configured engines are probed individually: each id is a Signal K
+   * propulsion instance name ("main", "port", "starboard", …), so a
+   * catamaran with port/starboard engines is fully covered by config.
+   * An engine with no alternator (electric drive) still counts as an
+   * engine here — running means "consumer active", which the learning
+   * gates must exclude.
    *
    * @returns {boolean|null} true if any engine is running, false if all stopped, null if unknown
    */
   isEngineRunning() {
+    if (this.getEngineRunning) {
+      const v = this.getEngineRunning();
+      if (v != null) return v;
+    }
     let anyRunning = false;
     let anySignal = false;
-
-    // Check propulsion.*.state
-    for (const path of ["propulsion.main.state", "propulsion.aux.state"]) {
-      const val = this.getSelfPath(path);
-      if (val != null) {
+    for (const engine of this.engines) {
+      const v = detectEngineRunning(engine, this.getSelfPath);
+      if (v != null) {
         anySignal = true;
-        if (val === "started") {
-          anyRunning = true;
-        }
+        if (v === true) anyRunning = true;
       }
     }
-
-    // Check propulsion.*.revolutions
-    for (const path of [
-      "propulsion.main.revolutions",
-      "propulsion.aux.revolutions",
-    ]) {
-      const val = this.getSelfPath(path);
-      const rpm = toNumber(val);
-      if (rpm != null) {
-        anySignal = true;
-        if (rpm > 0) {
-          anyRunning = true;
-        }
-      }
-    }
-
     return anySignal ? anyRunning : null;
   }
 
@@ -927,6 +941,18 @@ class PredictionEngine {
    * @param {number} params.battery.minSafeSoC - Minimum safe SoC [0, 1]
    * @param {object[]} params.solarArrays - Solar array configurations
    * @param {object[]} params.mechanicalGenerators - Wind/hydro generator configurations
+   * @param {object[]} [params.gensets] - Dedicated generators (diesel/DC
+   *        generator, fuel cell) — tier-2 combustion sources (#11)
+   * @param {object[]} [params.engines] - Propulsion engines — tier-3
+   *        combustion sources (#11). Each `{id, name?, alternatorWatts}`;
+   *        ids are Signal K propulsion instance names ("main", "port",
+   *        "starboard", …). An engine with `alternatorWatts` 0 (electric
+   *        drive, no alternator) is a consumer, never a generator
+   * @param {() => (boolean|null)} [params.getEngineRunning] - Dynamic
+   *        engine-running detector (scans all propulsion instances,
+   *        whatever their names); wins over configured-engine probing
+   * @param {object} [params.combustionConfig] - Per-tier reluctance settings
+   *        (`{genset: {...}, engine: {...}}`); see plugin/combustion.js
    * @param {(arrayId: string, isSailing: boolean, azimuth: number, elevation: number, awa?: number) => number} getEfficiency - Function to get efficiency from learning matrix
    * @param {(path: string) => unknown} getSelfPath - Function to read Signal K values
    * @param {(forecastSpeedMs: number, forecastGustMs: number|null, windDirectionDeg: number, sunElevationRad: number) => {speed: number, gust: number}|null} [params.getWindProtection] -
@@ -940,6 +966,11 @@ class PredictionEngine {
     battery,
     solarArrays,
     mechanicalGenerators,
+    gensets,
+    engines,
+    combustionConfig,
+    getEngineRunning,
+    getObservedGustMs,
     getEfficiency,
     getSelfPath,
     getWindProtection,
@@ -958,8 +989,32 @@ class PredictionEngine {
     this.mechanicalGenerators = (mechanicalGenerators || []).map(
       normalizeGeneratorWindConfig,
     );
+    // Combustion sources (#11): gensets (tier 2) and the main engine
+    // (tier 3) are deployable generators with per-tier reluctance
+    // settings. "deployed" means running.
+    this.gensets = (gensets || []).filter(
+      (g) => g && typeof g.outputWatts === "number" && g.outputWatts > 0,
+    );
+    // Engines are propulsion first: arbitrary Signal K instance names
+    // ("main", "port", "starboard", …), 0+ per vessel. An engine only
+    // counts as a generator when its alternatorWatts > 0 — electric
+    // drives and alternator-less engines are consumers, not chargers.
+    this.engines = (engines || []).filter(
+      (e) => e && typeof e.id === "string" && e.id !== "",
+    );
+    this.combustionSettings = {
+      genset: resolveTierSettings("genset", combustionConfig?.genset),
+      engine: resolveTierSettings("engine", combustionConfig?.engine),
+    };
+    /** Run-transition state per combustion source id: runningSince
+     * (batching minimum-run accounting) and lastRunEnd (cooldown). */
+    this.combustionRuns = new Map();
     this.getEfficiency = getEfficiency;
     this.getSelfPath = getSelfPath;
+    // Observed (live) wind gust in m/s — reality overrides forecast for
+    // the current-hour stow verdict (a real gust at the limit must drive
+    // a "stow now" even when the forecast is calm).
+    this.getObservedGustMs = getObservedGustMs || null;
     this.getWindProtection = getWindProtection || (() => null);
     this.windProtectionConfig = windProtectionConfig || {};
     this.getDisplayName =
@@ -984,6 +1039,8 @@ class PredictionEngine {
       config: loadProfileConfig,
       getSelfPath,
       app,
+      engines: this.engines,
+      getEngineRunning,
     });
     this.lastPrediction = [];
     /** Raw (pre-WPF) forecast from the last run, for publishing raw values */
@@ -1981,6 +2038,18 @@ class PredictionEngine {
     const speedThroughWater = this.getSpeedThroughWater() ?? 0;
     const maxGust = this.getMaxForecastGust();
     const maxWind = this.getMaxForecastWind();
+    // Observed (live) gust overrides forecast for the current-hour stow
+    // verdict: a real gust at or above the limit must drive a "stow now"
+    // even when the forecast says it's calm. The forecast still governs
+    // the *window* (tonight's worst) and the deploy/stow planning horizon.
+    const observedGustMs = this.getObservedGustMs?.() ?? null;
+    // Effective current gust for the stow verdict = the worse of observed
+    // and the current forecast hour.
+    const forecastCurrentGust = this.getCurrentGustMs() ?? 0;
+    const effectiveCurrentGust =
+      observedGustMs != null
+        ? Math.max(observedGustMs, forecastCurrentGust)
+        : forecastCurrentGust;
 
     // FLINsail (deployable solar arrays). The current recommendedState is
     // the *current hour's* ideal state (from computeDeployableSolarStates,
@@ -2029,7 +2098,14 @@ class PredictionEngine {
 
       const name = this.getDisplayName(array);
       const gustLimit = array.gustLimitMs ?? msFromKnots(20);
-      const currentGust = this.getCurrentGustMs() ?? 0;
+      // Observed gust overrides forecast for the stow verdict: a real gust
+      // at/above the limit must read as "stow now" even if the forecast is
+      // calm. computeDeployableSolarStates still uses the WPF-corrected
+      // forecast for the night-block max, so we pass the effective current
+      // gust into the fallback verdict below.
+      const currentGust = effectiveCurrentGust;
+      const observedOverLimit =
+        observedGustMs != null && observedGustMs >= gustLimit;
       // User-facing reasons render knots (sailors read knots).
       const gustLimitKn = gustLimit * MS_TO_KN;
       const currentGustKn = currentGust * MS_TO_KN;
@@ -2048,6 +2124,22 @@ class PredictionEngine {
           recommendedSideTime: null,
         });
       } else {
+        // Observed gusts at/above the limit override the forecast verdict:
+        // reality beats forecast for a "stow now" safety call.
+        if (observedOverLimit) {
+          recommendations.push({
+            id: array.id,
+            name,
+            type: "solar-deployable",
+            recommendedState: "stowed",
+            reason: `observed gusts ${Math.round(observedGustMs * MS_TO_KN)}kn ≥ limit ${Math.round(gustLimitKn)}kn`,
+            currentGustMs: observedGustMs,
+            limitMs: gustLimit,
+            recommendedSide: null,
+            recommendedSideTime: null,
+          });
+          continue;
+        }
         // Current hour's ideal state (accounts for WPF + night block)
         const currentState =
           currentSolarStates?.[0]?.get(array.id) ??
@@ -2164,7 +2256,14 @@ class PredictionEngine {
         // User-facing reasons render knots.
         const maxWindKn = maxWindMs * MS_TO_KN;
         const minDeployWindKn = minDeployWind * MS_TO_KN;
-        const maxGustKn = maxGust * MS_TO_KN;
+        // Observed gust overrides the forecast max for the stow verdict: a
+        // real gust at/above the limit must read as "stow now" even when
+        // the forecast window stays under the limit.
+        const observedOverLimit =
+          observedGustMs != null && observedGustMs >= maxWindMs;
+        const effectiveMaxGust =
+          observedGustMs != null ? Math.max(observedGustMs, maxGust) : maxGust;
+        const maxGustKn = effectiveMaxGust * MS_TO_KN;
         const maxWindValueKn = maxWind * MS_TO_KN;
 
         if (underway) {
@@ -2197,14 +2296,16 @@ class PredictionEngine {
                   ? "vessel nav state unknown"
                   : `cannot deploy while ${navState}`,
             });
-          } else if (maxGust >= maxWindMs) {
+          } else if (effectiveMaxGust >= maxWindMs) {
             recommendations.push({
               id: generator.id,
               name,
               type: "wind",
               recommendedState: "stowed",
-              reason: `forecast gusts ${Math.round(maxGustKn)}kn exceed limit of ${Math.round(maxWindKn)}kn`,
-              currentGustMs: maxGust,
+              reason: observedOverLimit
+                ? `observed gusts ${Math.round(observedGustMs * MS_TO_KN)}kn ≥ limit of ${Math.round(maxWindKn)}kn`
+                : `forecast gusts ${Math.round(maxGustKn)}kn exceed limit of ${Math.round(maxWindKn)}kn`,
+              currentGustMs: effectiveMaxGust,
               limitMs: maxWindMs,
             });
           } else if (this.wouldSolarFillBattery()) {
@@ -2270,8 +2371,172 @@ class PredictionEngine {
         // (#11/#12 cross-ref). Falls back to undefined so the urgency
         // module's type-level default applies when unset.
         reluctance: device?.reluctance,
+        // Per-device flip-cooldown override (#11): when set, widens the
+        // deploy/stow hysteresis band for this renewable source beyond the
+        // reluctance default. Used by AdvisoryPublisher to hold opposite
+        // recommendation notifications during transient condition swings.
+        flipCooldownHours: device?.flipCooldownHours,
       };
     });
+  }
+
+  /**
+   * Computes deployment recommendations for the combustion sources
+   * (#11): dedicated gensets (tier 2) and the propulsion engine(s) as a
+   * high-reluctance deployable generator (tier 3). "Deployed" means
+   * running.
+   *
+   * The tiers escalate independently at their own deficit thresholds
+   * (the genset deploys at a lower sustained-violation bar than the main
+   * engine), so a deficit first surfaces the genset, and only a deeper/
+   * longer one escalates to the engine. Each tier recommends at most one
+   * source — the most capable one available (largest output/alternator):
+   * run the charger you have, not everything at once.
+   *
+   * Engines are propulsion first: only engines with `alternatorWatts > 0`
+   * can be recommended as generators (electric drives and
+   * alternator-less engines are consumers). Engine detection covers ALL
+   * configured engines regardless — a running electric drive must gate
+   * load learning and counts as a run for cooldown tracking.
+   *
+   * The returned recommendations ride the same deployment channel as
+   * renewables (same shape, `type` "genset"/"engine", plus run window
+   * fields), with combustion-specific fields: `tier` (2 genset / 3
+   * engine), `watts`, `runHours`, `windowStart`, `windowEnd`.
+   *
+   * @param {object} [opts]
+   * @param {Date} [opts.now=new Date()] - Current time (overridable for tests)
+   * @returns {Array<{id: string, name: string, type: "genset"|"engine", tier: number, recommendedState: "deployed"|"stowed", reason: string, detectedState: "deployed"|"stowed"|null, watts: number, runHours: number|null, windowStart: Date|null, windowEnd: Date|null}>}
+   */
+  getCombustionRecommendations(opts = {}) {
+    if (this.lastPrediction.length === 0) return [];
+    const now = opts.now ?? new Date();
+    const currentSoC = this.getCurrentSoC();
+
+    // Night context for the engine tier's night hold (prefer waiting for
+    // the morning solar window when the floor isn't breached before
+    // sunrise). Computed from the vessel position; unknown position skips
+    // the gate (no fabricated sun times).
+    const position = unwrapPosition(this.getSelfPath("navigation.position"));
+    let isNight = false;
+    let sunrise = null;
+    if (position && position.latitude != null) {
+      const sunAlt = sunPosition(
+        now,
+        position.latitude,
+        position.longitude ?? 0,
+      ).altitude;
+      isNight = sunAlt <= 0;
+      sunrise = nextSunrise(now, position.latitude, position.longitude ?? 0);
+    }
+
+    // --- Detected states -------------------------------------------------
+    // Gensets: state path or power-path detection. Engines: per-instance
+    // propulsion detection (configured ids are the instance names).
+    // Booleans normalize to the deployment vocabulary ("deployed" =
+    // running) so the recs ride the same channel as renewables.
+    const detected = new Map();
+    for (const genset of this.gensets) {
+      const running = resolveGensetRunning(genset, this.getSelfPath);
+      detected.set(
+        genset.id,
+        running == null ? null : running ? "deployed" : "stowed",
+      );
+    }
+    for (const engine of this.engines) {
+      const running = detectEngineRunning(engine, this.getSelfPath);
+      detected.set(
+        engine.id,
+        running == null ? null : running ? "deployed" : "stowed",
+      );
+    }
+
+    // Track run transitions for batching/cooldown across cycles. Engines
+    // started for propulsion count as runs too — frequent cold starts are
+    // what the cooldown exists to avoid.
+    updateCombustionRuns(this.combustionRuns, detected, now);
+
+    const common = {
+      track: this.lastPrediction,
+      minSafeSoC: this.battery.minSafeSoC,
+      capacityWh: this.capacityWh,
+      currentSoC,
+      now,
+      isNight,
+      sunrise,
+    };
+
+    const evaluateSource = (source, tier) => {
+      const settings =
+        tier === "genset"
+          ? this.combustionSettings.genset
+          : this.combustionSettings.engine;
+      const run = this.combustionRuns.get(source.id) ?? {
+        runningSince: null,
+        lastRunEnd: null,
+      };
+      return evaluateCombustionTier({
+        ...common,
+        watts: source.outputWatts ?? source.alternatorWatts,
+        settings,
+        running: detected.get(source.id) === true,
+        runningSince: run.runningSince,
+        lastRunEnd: run.lastRunEnd,
+      });
+    };
+
+    const recs = [];
+
+    // --- Tier 2: gensets --------------------------------------------------
+    // At most one run recommendation: the largest-output genset that
+    // warrants a run. Other gensets still get state tracking above.
+    const gensetCandidates = this.gensets
+      .map((g) => ({ g, result: evaluateSource(g, "genset") }))
+      .filter((x) => x.result != null)
+      .sort((a, b) => (b.g.outputWatts || 0) - (a.g.outputWatts || 0));
+    if (gensetCandidates.length > 0) {
+      const { g, result } = gensetCandidates[0];
+      recs.push({
+        id: g.id,
+        name: this.getDisplayName(g),
+        type: "genset",
+        tier: 2,
+        recommendedState: result.recommendedState,
+        reason: result.reason,
+        detectedState: detected.get(g.id) ?? null,
+        watts: g.outputWatts,
+        runHours: result.runHours,
+        windowStart: result.windowStart,
+        windowEnd: result.windowEnd,
+      });
+    }
+
+    // --- Tier 3: engines --------------------------------------------------
+    // Only engines with an alternator can be generator candidates; the
+    // strongest alternator wins the recommendation.
+    const engineCandidates = this.engines
+      .filter((e) => e.alternatorWatts > 0)
+      .map((e) => ({ e, result: evaluateSource(e, "engine") }))
+      .filter((x) => x.result != null)
+      .sort((a, b) => b.e.alternatorWatts - a.e.alternatorWatts);
+    if (engineCandidates.length > 0) {
+      const { e, result } = engineCandidates[0];
+      recs.push({
+        id: e.id,
+        name: this.getDisplayName(e),
+        type: "engine",
+        tier: 3,
+        recommendedState: result.recommendedState,
+        reason: result.reason,
+        detectedState: detected.get(e.id) ?? null,
+        watts: e.alternatorWatts,
+        runHours: result.runHours,
+        windowStart: result.windowStart,
+        windowEnd: result.windowEnd,
+      });
+    }
+
+    return recs;
   }
 
   /**
@@ -2581,23 +2846,30 @@ class PredictionEngine {
         houseLoadW = averageLoad.dcWh + averageLoad.acWh;
       }
 
-      // Motoring side-effect: when the engine is running for propulsion
-      // (under way), the alternator charges the bank as a byproduct. The
+      // Motoring side-effect: when engines are running for propulsion
+      // (under way), their alternators charge the bank as a byproduct. The
       // ideal track must account for this so the SoC projection reflects
       // reality — arriving somewhere by motor at midday almost guarantees a
       // full battery with hours of sun left (the surplus-advisory headline
       // case). At-anchor engine runs are deficit response by definition and
-      // are NOT modeled here (the engine-run advisory owns those).
+      // are NOT modeled here (the combustion advisory owns those).
       //
-      // Engine state is read once per cycle (current state, same assumption
-      // as the rest of the engine — a route-aware version is future work);
-      // underway is already determined above. Only add alternator input when
-      // both hold, gated behind engineAlternatorWatts so default behavior is
-      // unchanged when unset/zero.
-      const alternatorWh =
-        underway && engineRunning === true
-          ? this.battery?.engineAlternatorWatts || 0
-          : 0;
+      // Engine state is read once per cycle from the configured engines
+      // (same assumption as the rest of the engine — a route-aware version
+      // is future work); underway is already determined above. Only engines
+      // with an alternator contribute — an electric drive motoring is a
+      // consumer, not a charger.
+      let alternatorWh = 0;
+      if (underway && engineRunning === true) {
+        for (const engine of this.engines) {
+          if (
+            engine.alternatorWatts > 0 &&
+            detectEngineRunning(engine, this.getSelfPath) === true
+          ) {
+            alternatorWh += engine.alternatorWatts;
+          }
+        }
+      }
 
       const idealNetWh =
         idealSolarYieldWh + mechanicalYieldWh + alternatorWh - houseLoadW;
@@ -2824,102 +3096,6 @@ class PredictionEngine {
     }
 
     return null;
-  }
-
-  /**
-   * Calculates engine run time needed to avoid SoC dropping below the
-   * minimum safe floor, then recovering.
-   *
-   * The run time is the energy needed to lift the projected minimum SoC
-   * back above {@link battery.minSafeSoC} — the depth of the forecast dip
-   * below the floor, `(minSafeSoC − minProjectedSoC) × capacityWh` — not the
-   * energy to charge the bank to 100% (the old `getDeficit`-based math
-   * produced a full-charge duration, e.g. 24h for a half-empty bank, which
-   * is neither what the crew needs nor actionable).
-   *
-   * Two guards keep a single transient cycle from manufacturing a
-   * catastrophic-drain advisory:
-   *   - A degenerate-forecast guard: a forecast with no solar at all and a
-   *     SoC that collapses to the floor within the first few hours is the
-   *     signature of a shunt-synchronize / empty-weather transient (the
-   *     SoC reading momentarily falls back to 0.5 and the weather track
-   *     comes back empty), not a real discharge. Such a cycle is ignored.
-   *   - A horizon cap: `hoursNeeded` is capped to the forecast horizon so a
-   *     bad input can't produce a multi-day run.
-   *
-   * @param {number} engineWatts - Expected alternator output in watts
-   * @returns {{hours: number, optimalWindow: {start: Date, end: Date}}|null} Run time recommendation or null
-   */
-  calculateEngineRunTime(engineWatts) {
-    if (this.lastPrediction.length === 0 || !engineWatts || engineWatts <= 0) {
-      return null;
-    }
-
-    const timeToEmpty = this.getTimeToEmpty();
-    if (!timeToEmpty) {
-      return null; // Battery won't reach the floor
-    }
-
-    // Degenerate-forecast transient guard. A real deficit builds against a
-    // forecast that includes *some* solar over its horizon (even an
-    // overnight drain has daytime hours in the 24h track). A track with
-    // zero solar at all is the signature of a shunt-synchronize /
-    // empty-weather transient (the SoC reading momentarily falls back to
-    // 0.5 and the weather track comes back empty), not a discharge worth
-    // nagging about.
-    const totalSolar = this.lastPrediction.reduce(
-      (sum, p) => sum + (p.idealSolarYieldWh || 0),
-      0,
-    );
-    if (totalSolar === 0) {
-      return null;
-    }
-
-    // Energy needed to lift the projected minimum SoC back above the floor.
-    // The deepest dip below minSafeSoC is the shortfall the engine must
-    // cover; recovering to 100% is not the goal.
-    const minSoC = this.lastPrediction.reduce(
-      (min, p) => Math.min(min, p.idealSoC),
-      1,
-    );
-    const shortfallWh = Math.max(
-      0,
-      (this.battery.minSafeSoC - minSoC) * this.capacityWh,
-    );
-    if (shortfallWh === 0) return null;
-
-    // Cap to the forecast horizon so a transient can't produce a multi-day
-    // run. The engine should run within the window we actually forecast.
-    const horizonHours = this.lastPrediction.length;
-    const hoursNeeded =
-      Math.round(Math.min(shortfallWh / engineWatts, horizonHours) * 10) / 10;
-
-    // Find optimal window (lowest solar yield period) within the run time
-    let minSolarIndex = 0;
-    let minSolarYield = Number.POSITIVE_INFINITY;
-    const scanHours = Math.min(
-      this.lastPrediction.length,
-      Math.ceil(hoursNeeded) + 1,
-    );
-    for (let i = 0; i < scanHours; i++) {
-      const p = this.lastPrediction[i];
-      if (p.idealSolarYieldWh < minSolarYield) {
-        minSolarYield = p.idealSolarYieldWh;
-        minSolarIndex = i;
-      }
-    }
-
-    const now = new Date();
-    const windowStart = new Date(now.getTime() + minSolarIndex * 3600000);
-    const windowEnd = new Date(windowStart.getTime() + hoursNeeded * 3600000);
-
-    return {
-      hours: hoursNeeded,
-      optimalWindow: {
-        start: windowStart,
-        end: windowEnd,
-      },
-    };
   }
 
   /**

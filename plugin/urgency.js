@@ -567,5 +567,6 @@ module.exports = {
   DEFAULT_CONFIG,
   calculateUrgency,
   urgencyToNotification,
+  resolveReluctance,
   mergeConfig,
 };

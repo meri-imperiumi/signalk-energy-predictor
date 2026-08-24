@@ -665,17 +665,25 @@ test("publishDeploymentStates: underway + night still emits deploy suggestion", 
   assert.ok(n && n.state !== "normal", "underway never suppresses");
 });
 
-test("publishEngineRunAdvisory: low battery at night → alarm keeps sound", () => {
+test("publishCombustionAdvisories: low battery at night → alarm keeps sound", () => {
   const app = makeFakeApp();
   const pub = new AdvisoryPublisher(app, "test");
-  pub.publishEngineRunAdvisory(
-    {
-      hours: 1,
-      optimalWindow: {
-        start: new Date(Date.now() + 60 * 60 * 1000),
-        end: new Date(Date.now() + 2 * 60 * 60 * 1000),
+  pub.publishCombustionAdvisories(
+    [
+      {
+        id: "main",
+        name: "Engine",
+        type: "engine",
+        tier: 3,
+        recommendedState: "deployed",
+        reason: "bank projected below the 20% floor for 4h",
+        detectedState: "stowed",
+        watts: 100,
+        runHours: 1,
+        windowStart: new Date(Date.now() + 60 * 60 * 1000),
+        windowEnd: new Date(Date.now() + 2 * 60 * 60 * 1000),
       },
-    },
+    ],
     { batterySoC: 0.08, isNight: true },
   );
   const n = findNotif(app, "notifications.electrical.energy.engine_run");

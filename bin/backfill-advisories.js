@@ -76,7 +76,6 @@ function loadConfig(configPath) {
     capacityAh: 400,
     systemVoltage: 12,
     minSafeSoC: 0.2,
-    engineAlternatorWatts: 100,
   };
   const surplusDefaults = {
     fullThreshold: 0.95,
@@ -85,13 +84,50 @@ function loadConfig(configPath) {
     opportunisticLoads: [],
   };
   if (!existsSync(configPath)) {
-    return { battery: batteryDefaults, surplus: surplusDefaults };
+    return {
+      battery: batteryDefaults,
+      surplus: surplusDefaults,
+      engines: [{ id: "main", name: "Engine", alternatorWatts: 100 }],
+      gensets: [],
+      combustion: {},
+    };
   }
   const raw = JSON.parse(readFileSyncSafe(configPath));
   const cfg = raw.configuration || raw || {};
   const battery = { ...batteryDefaults, ...(cfg.battery || {}) };
   const surplus = { ...surplusDefaults, ...(cfg.surplus || {}) };
-  return { battery, surplus };
+  // Combustion sources (#11): engines with their alternators, gensets,
+  // and per-tier run discipline. Pre-#11 configs carry a single
+  // battery.engineAlternatorWatts — normalized into a default "main"
+  // engine when no engines array is configured (mirrors the plugin's
+  // getActiveEngines).
+  let engines = Array.isArray(cfg.engines)
+    ? cfg.engines.filter((e) => e && e.id)
+    : [];
+  if (
+    engines.length === 0 &&
+    typeof cfg.battery?.engineAlternatorWatts === "number" &&
+    cfg.battery.engineAlternatorWatts > 0 &&
+    !Array.isArray(cfg.engines)
+  ) {
+    engines = [
+      {
+        id: "main",
+        name: "Engine",
+        alternatorWatts: cfg.battery.engineAlternatorWatts,
+      },
+    ];
+  }
+  const gensets = (cfg.gensets || []).filter(
+    (g) => g && g.id && typeof g.outputWatts === "number",
+  );
+  return {
+    battery,
+    surplus,
+    engines,
+    gensets,
+    combustion: cfg.combustion || {},
+  };
 }
 
 function readFileSyncSafe(p) {
@@ -140,7 +176,9 @@ async function processDayFile(filePath, opts) {
       cycleTime,
       minSafeSoC: opts.battery.minSafeSoC,
       capacityWh: opts.battery.capacityAh * opts.battery.systemVoltage,
-      engineAlternatorWatts: opts.battery.engineAlternatorWatts,
+      engines: opts.engines || [],
+      gensets: opts.gensets || [],
+      combustion: opts.combustion || {},
       localOffsetMinutes: opts.localOffsetMinutes ?? null,
       opportunisticLoads: opts.surplus.opportunisticLoads || [],
     });
@@ -190,7 +228,10 @@ async function main() {
   const configPath = expandPath(
     values.config || join(dirname(dataDir), "signalk-energy-predictor.json"),
   );
-  const { battery, surplus } = loadConfig(configPath);
+  const { battery, surplus, engines, gensets, combustion } =
+    loadConfig(configPath);
+  const engineList =
+    engines.map((e) => `${e.id}:${e.alternatorWatts}W`).join(", ") || "none";
 
   console.error(
     `Backfilling advisories ${from.toISOString()} → ${to.toISOString()}`,
@@ -198,13 +239,16 @@ async function main() {
   console.error(`  data-dir: ${dataDir}`);
   console.error(`  config:   ${configPath}`);
   console.error(
-    `  battery:  ${battery.capacityAh}Ah @ ${battery.systemVoltage}V, floor ${battery.minSafeSoC}, alt ${battery.engineAlternatorWatts}W`,
+    `  battery:  ${battery.capacityAh}Ah @ ${battery.systemVoltage}V, floor ${battery.minSafeSoC}, engines ${engineList}`,
   );
   console.error(`  dry-run:  ${values["dry-run"] ? "yes" : "no"}`);
 
   const opts = {
     battery,
     surplus,
+    engines,
+    gensets,
+    combustion,
     localOffsetMinutes: null,
   };
 

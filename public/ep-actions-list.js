@@ -40,7 +40,7 @@ function deviceLabel(id) {
  */
 function advisoryBadge(type) {
   if (type === "surplus") return "surplus";
-  if (type === "engine_run") return "deficit";
+  if (type === "engine_run" || type === "genset_run") return "deficit";
   if (type === "stow_soon") return "drag";
   return "advisory";
 }
@@ -188,9 +188,16 @@ class EpActionsList extends HTMLElement {
         reason.textContent = ev.reason;
         li.append(reason);
       }
-      // Surplus advisories carry structured elective-load suggestions the
-      // UI can render in more detail than the terse notification message.
-      if (ev.kind === "advisory" && ev.type === "surplus" && ev.loads?.length) {
+      // Surplus and combustion-run advisories carry structured
+      // elective-load suggestions the UI can render in more detail than
+      // the terse notification message.
+      if (
+        ev.kind === "advisory" &&
+        (ev.type === "surplus" ||
+          ev.type === "engine_run" ||
+          ev.type === "genset_run") &&
+        ev.loads?.length
+      ) {
         const loads = document.createElement("span");
         loads.className = "ep-action-reason";
         loads.textContent = `Could run: ${ev.loads

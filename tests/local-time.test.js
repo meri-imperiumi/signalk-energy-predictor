@@ -214,20 +214,31 @@ test("publishSurplusAdvisory: default (no offset) keeps legacy host-timezone beh
   );
 });
 
-// --- publishEngineRunAdvisory: solar-local text ---
+// --- publishCombustionAdvisories: solar-local text ---
 
-test("publishEngineRunAdvisory: window times are solar-local", () => {
+test("publishCombustionAdvisories: window times are solar-local", () => {
   const app = makeFakeApp();
   const pub = new AdvisoryPublisher(app, "test-plugin");
   // Engine window 23:00-01:00 UTC at 30°E (+02:00) → 01:00-03:00 local.
   const start = new Date("2025-08-25T23:00:00Z");
   const end = new Date("2025-08-26T01:00:00Z");
   const off = solarOffsetMinutesFromLongitude(30);
-  pub.publishEngineRunAdvisory(
-    {
-      hours: 2,
-      optimalWindow: { start, end },
-    },
+  pub.publishCombustionAdvisories(
+    [
+      {
+        id: "main",
+        name: "Engine",
+        type: "engine",
+        tier: 3,
+        recommendedState: "deployed",
+        reason: "bank projected below the 20% floor for 4h",
+        detectedState: "stowed",
+        watts: 100,
+        runHours: 2,
+        windowStart: start,
+        windowEnd: end,
+      },
+    ],
     { batterySoC: 0.1, isNight: false, localOffsetMinutes: off },
   );
   const n = findEngineRun(app);

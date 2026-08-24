@@ -11,7 +11,7 @@
  * (or null) result.
  *
  * The live prediction engine methods (`findSurplusOpportunity`,
- * `calculateEngineRunTime`, `findStowageOpportunity`) can't be reused
+ * `getCombustionRecommendations`, `findStowageOpportunity`) can't be reused
  * directly for history because they gate on `Date.now()` (lead-time horizon)
  * and read live position/underway state. These helpers take the cycle
  * timestamp and an optional position as explicit inputs instead.
@@ -20,7 +20,11 @@
  */
 
 const { formatWh } = require("./format.js");
-const { sunPosition, nextSunset } = require("./solar.js");
+const { sunPosition, nextSunset, nextSunrise } = require("./solar.js");
+const {
+  evaluateCombustionTier,
+  resolveTierSettings,
+} = require("./combustion.js");
 
 /**
  * @typedef {Object} ForecastPoint
@@ -160,64 +164,83 @@ function recomputeSurplus(forecast, opts = {}) {
 }
 
 /**
- * Recomputes the engine-run (deficit) advisory from a forecast track,
- * gated against the cycle timestamp. Mirrors the corrected
- * {@link PredictionEngine#calculateEngineRunTime}: the run time is the
- * energy to lift the projected minimum SoC back above the floor (not to
- * 100%), capped to the horizon, and a degenerate no-solar track is rejected
- * as a transient.
+ * Recomputes the combustion run advisories (genset/engine deficit
+ * response, #11) from a forecast track, gated against the cycle
+ * timestamp. Mirrors the live tier evaluation
+ * ({@link module:combustion~evaluateCombustionTier}): sustained-violation
+ * gate, minimum useful run, batch margin, horizon cap, and the
+ * degenerate no-solar transient guard.
  *
  * @param {ForecastPoint[]} forecast - Hourly forecast points
- * @param {number} engineWatts - Alternator output in watts
+ * @param {Array<{id: string, name?: string, alternatorWatts: number}>} engines -
+ *        Configured engines (largest alternator wins the recommendation)
+ * @param {Array<{id: string, name?: string, outputWatts: number}>} gensets -
+ *        Configured gensets (largest output wins the recommendation)
  * @param {object} [opts]
  * @param {number} opts.minSafeSoC - Minimum safe SoC [0,1]
  * @param {number} opts.capacityWh - Battery capacity in Wh
  * @param {Date} [opts.cycleTime=new Date()] - When the cycle ran
- * @returns {{hours: number, optimalWindow: {start: Date, end: Date}}|null}
+ * @param {object} [opts.combustion] - Per-tier settings overrides
+ * @param {{latitude: number, longitude: number}|null} [opts.position] -
+ *        Vessel position for the engine tier's night hold
+ * @returns {Array<{source: object, tier: "genset"|"engine", result: object}>}
  */
-function recomputeEngineRun(forecast, engineWatts, opts = {}) {
-  if (!forecast || forecast.length === 0 || !engineWatts || engineWatts <= 0) {
-    return null;
-  }
-  const { minSafeSoC, capacityWh, cycleTime = new Date() } = opts;
-  if (minSafeSoC == null || capacityWh == null) return null;
+function recomputeCombustion(forecast, engines, gensets, opts = {}) {
+  if (!forecast || forecast.length === 0) return [];
+  const {
+    minSafeSoC,
+    capacityWh,
+    cycleTime = new Date(),
+    combustion = {},
+    position = null,
+  } = opts;
+  if (minSafeSoC == null || capacityWh == null) return [];
 
-  // Gate: does the track reach the floor at all?
-  const reachesFloor = forecast.some((p) => p.idealSoC <= minSafeSoC);
-  if (!reachesFloor) return null;
-
-  // Degenerate transient guard: no solar at all → empty-weather glitch.
-  const totalSolar = forecast.reduce(
-    (sum, p) => sum + (p.idealSolarYieldWh || 0),
-    0,
-  );
-  if (totalSolar === 0) return null;
-
-  const minSoC = forecast.reduce((min, p) => Math.min(min, p.idealSoC), 1);
-  const shortfallWh = Math.max(0, (minSafeSoC - minSoC) * capacityWh);
-  if (shortfallWh === 0) return null;
-
-  const horizonHours = forecast.length;
-  const hoursNeeded =
-    Math.round(Math.min(shortfallWh / engineWatts, horizonHours) * 10) / 10;
-
-  // Optimal window: the lowest-solar hour within the run time
-  let minSolarIndex = 0;
-  let minSolarYield = Number.POSITIVE_INFINITY;
-  const scanHours = Math.min(forecast.length, Math.ceil(hoursNeeded) + 1);
-  for (let i = 0; i < scanHours; i++) {
-    if (forecast[i].idealSolarYieldWh < minSolarYield) {
-      minSolarYield = forecast[i].idealSolarYieldWh;
-      minSolarIndex = i;
-    }
+  // Night context for the engine tier's night hold, from the recorded
+  // position when available.
+  let isNight = false;
+  let sunrise = null;
+  if (position && position.latitude != null) {
+    isNight =
+      sunPosition(cycleTime, position.latitude, position.longitude ?? 0)
+        .altitude <= 0;
+    sunrise = nextSunrise(
+      cycleTime,
+      position.latitude,
+      position.longitude ?? 0,
+    );
   }
 
-  const windowStart = new Date(cycleTime.getTime() + minSolarIndex * 3600000);
-  const windowEnd = new Date(windowStart.getTime() + hoursNeeded * 3600000);
-  return {
-    hours: hoursNeeded,
-    optimalWindow: { start: windowStart, end: windowEnd },
+  const evaluate = (sources, tier, wattsOf) => {
+    const settings = resolveTierSettings(tier, combustion?.[tier]);
+    return sources
+      .map((source) => ({
+        source,
+        tier,
+        result: evaluateCombustionTier({
+          track: forecast,
+          minSafeSoC,
+          capacityWh,
+          watts: wattsOf(source),
+          settings,
+          currentSoC: forecast[0]?.idealSoC,
+          now: cycleTime,
+          isNight,
+          sunrise,
+        }),
+      }))
+      .filter(
+        (x) => x.result != null && x.result.recommendedState === "deployed",
+      )
+      .sort((a, b) => wattsOf(b.source) - wattsOf(a.source));
   };
+
+  const out = [];
+  const gensetRuns = evaluate(gensets, "genset", (g) => g.outputWatts);
+  if (gensetRuns.length > 0) out.push(gensetRuns[0]);
+  const engineRuns = evaluate(engines, "engine", (e) => e.alternatorWatts);
+  if (engineRuns.length > 0) out.push(engineRuns[0]);
+  return out;
 }
 
 /**
@@ -272,7 +295,9 @@ function recomputeStowage(forecast, opts = {}) {
  * @param {Date} opts.cycleTime - When the cycle ran
  * @param {number} opts.minSafeSoC - Battery floor [0,1]
  * @param {number} opts.capacityWh - Battery capacity (Wh)
- * @param {number} opts.engineAlternatorWatts - Alternator output (W)
+ * @param {Array<{id: string, name?: string, alternatorWatts: number}>} [opts.engines=[]] - Configured engines
+ * @param {Array<{id: string, name?: string, outputWatts: number}>} [opts.gensets=[]] - Configured gensets
+ * @param {object} [opts.combustion={}] - Per-tier run-discipline settings
  * @param {{latitude: number, longitude: number}|null} [opts.position] - Vessel position
  * @param {boolean} [opts.underway=false] - Under way (disables surplus night gate)
  * @param {number|null} [opts.localOffsetMinutes=null] - Solar-local UTC offset
@@ -284,7 +309,9 @@ function recomputeAdvisories(forecast, opts) {
     cycleTime,
     minSafeSoC,
     capacityWh,
-    engineAlternatorWatts,
+    engines = [],
+    gensets = [],
+    combustion = {},
     position,
     underway = false,
     localOffsetMinutes = null,
@@ -332,30 +359,34 @@ function recomputeAdvisories(forecast, opts) {
     });
   }
 
-  const engine = recomputeEngineRun(forecast, engineAlternatorWatts, {
+  for (const run of recomputeCombustion(forecast, engines, gensets, {
     minSafeSoC,
     capacityWh,
     cycleTime,
-  });
-  if (engine) {
+    combustion,
+    position,
+  })) {
     const { formatWindowTime } = require("./advisory.js");
+    const { source, tier, result } = run;
+    const name = source.name || (tier === "genset" ? "genset" : "engine");
     const start = formatWindowTime(
-      engine.optimalWindow.start,
+      result.windowStart,
       undefined,
       localOffsetMinutes,
     );
     const end = formatWindowTime(
-      engine.optimalWindow.end,
+      result.windowEnd,
       undefined,
       localOffsetMinutes,
     );
     advisories.push({
-      type: "engine_run",
-      time: engine.optimalWindow.start.toISOString(),
-      message: `Run engine for ${engine.hours}h between ${start}-${end} to avoid low battery`,
-      engineHours: engine.hours,
-      windowStart: engine.optimalWindow.start.toISOString(),
-      windowEnd: engine.optimalWindow.end.toISOString(),
+      type: tier === "genset" ? "genset_run" : "engine_run",
+      sourceId: source.id,
+      time: result.windowStart.toISOString(),
+      message: `Run ${name} for ${result.runHours}h between ${start}-${end} to avoid low battery`,
+      engineHours: result.runHours,
+      windowStart: result.windowStart.toISOString(),
+      windowEnd: result.windowEnd.toISOString(),
     });
   }
 
@@ -379,7 +410,7 @@ function recomputeAdvisories(forecast, opts) {
 
 module.exports = {
   recomputeSurplus,
-  recomputeEngineRun,
+  recomputeCombustion,
   recomputeStowage,
   recomputeAdvisories,
 };

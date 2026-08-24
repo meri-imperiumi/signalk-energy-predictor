@@ -8,6 +8,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Combustion sources as deployable generators (#11).** Gensets and
+  engine alternators are now first-class deployable energy sources alongside
+  solar/wind/hydro, modeled as two reluctance tiers (genset below engine):
+  - New `engines[]` config (each with a Signal K propulsion `id`, optional
+    display `name`, and `alternatorWatts`; `alternatorWatts: 0` marks an
+    electric drive that must never generate a run recommendation) replaces
+    the old single `battery.engineAlternatorWatts`. Existing configs are
+    normalized into a default `{ id: "main" }` engine at load time.
+  - New `gensets[]` config (each with `id`, `outputWatts`, and optional
+    `statePath`/`powerPath` for run detection).
+  - New `combustion` tier settings: per-tier `sustainedHours`,
+    `minRunMinutes`, `cooldownHours`, `socMargin`, and engine-only
+    `nightHold` (engine recommendations are held for sunrise when the
+    breach happens overnight; gensets run at night).
+  - The engine tier escalates only when no genset is configured or the
+    genset is already running; each tier recommends at most one source
+    (largest output wins).
+  - Combustion run recommendations publish through the existing deployment
+    channel (`electrical.energy.prediction.deployment.<id>.*`) with a
+    `runHours`/`windowStart`/`windowEnd` window, plus `engine_run` and
+    `genset_run` notifications with "Run engine for 2.5h between …" phrasing
+    and concurrent "load it well" elective-load suggestions sized to the
+    source's output.
+- **Renewables flip-cooldown hysteresis (#11).** Deploy/stow recommendations
+  for renewables no longer re-nag on transient condition flips: each
+  deployable's reluctance sets a cooldown band (low 1 h, medium 2 h, high 8
+  h, per-device overridable via `flipCooldownHours`) during which an
+  *opposite* recommendation is published as a delta but not notified. An
+  actual over-limit condition (gusts already at the limit) always breaks
+  through.
 - A single glanceable energy-outlook delta for instrument panels:
   `electrical.energy.prediction.status` — one of
   `surplus` (bank fills to 100% and production is curtailed), `rising`
@@ -31,6 +61,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   null when there isn't enough wind data.
 
 ### Fixed
+- Observed gusts now drive a stow recommendation. Previously only
+  *forecast* gusts fed the deployable-solar (FLINsail) and wind-generator
+  stow verdict, so a real gust already at the limit produced no
+  notification when the forecast was calm. The live (observed) gust —
+  max of recent `environment.wind.speed*` samples — now overrides the
+  forecast for the current-hour stow verdict, and an over-limit
+  observed gust is treated as an *actual* condition that breaks through
+  the renewables flip-cooldown and always notifies ("Stow now, observed
+  gusts 25kn ≥ limit 20kn").
 - Bad-cycle protection: a degenerate weather forecast — hours with no
   weather signal at all (every hour GHI 0/null, wind 0/null, gust 0/null;
   observed in the wild as published 0 Wh solar / 0 kn wind / null
