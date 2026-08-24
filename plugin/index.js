@@ -621,8 +621,12 @@ module.exports = (app) => {
     if (!advisoryPublisher) return;
     const base = "electrical.energy.prediction.windProtection";
 
-    // Resolve the current forecast point (nearest now) for direction + sun
-    const forecast = predictionEngine?.lastForecast || [];
+    // Resolve the current forecast point (nearest now) for direction + sun.
+    // Reads the RAW (pre-WPF) forecast: lastForecast already carries the
+    // wind-protection correction, and resolveWindProtectionContext applies
+    // it again — using the corrected store here would double-apply the
+    // factor + height translation.
+    const forecast = predictionEngine?.lastRawForecast || [];
     const now = new Date();
     const current = forecast.find(
       (p) => Math.abs(p.time.getTime() - now.getTime()) < 1800000,

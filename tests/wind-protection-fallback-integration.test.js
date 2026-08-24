@@ -192,17 +192,27 @@ test.describe("WPF fallback publish: factorSource paths", () => {
 
     // Give the prediction engine a forecast covering now so the publisher
     // can resolve the current point. We only need wind direction + speed.
+    // Seed BOTH stores: lastRawForecast (what publishWindProtection reads)
+    // with the raw 10 kn point, and lastForecast (the corrected store) with
+    // what the engine would have produced after applying the 0.66 fallback
+    // + height translation, so the publish path can't accidentally read the
+    // corrected store and double-apply without failing the assertions below.
     const engine = plugin.__getInternals().predictionEngine;
-    engine.lastForecast = [
+    const rawSpeedMs = msFromKnots(10);
+    engine.lastRawForecast = [
       {
         time: now,
-        windSpeedMs: msFromKnots(10),
+        windSpeedMs: rawSpeedMs,
         gustSpeedMs: null,
         windDirectionDeg: 90, // sector 2 (E), unlearned → adjacent fallback
         ghi: 0,
         cloudCover: 0,
       },
     ];
+    engine.lastForecast = engine.lastRawForecast.map((p) => ({
+      ...p,
+      windSpeedMs: rawSpeedMs * 0.66 * 0.9359, // once-corrected stand-in
+    }));
 
     // Capture published deltas via the advisory publisher.
     const pub = plugin.__getInternals().advisoryPublisher;
@@ -237,6 +247,19 @@ test.describe("WPF fallback publish: factorSource paths", () => {
       "gustFactorSource path published",
     );
     assert.strictEqual(published[`${base}.gustFactorSource`], "none");
+    // forecastSpeed is the RAW forecast; correctedSpeed applies the 0.66
+    // fallback factor and the 10 m → 5 m height translation exactly ONCE
+    // (10 kn × 0.66 × 0.9359 ≈ 6.18 kn ≈ 3.18 m/s). A double application
+    // (reading the corrected store) would land near 1.96 m/s.
+    assert.ok(
+      Math.abs(published[`${base}.forecastSpeed`] - rawSpeedMs) < 1e-9,
+      `forecastSpeed should be the raw ${rawSpeedMs.toFixed(3)} m/s, got ${published[`${base}.forecastSpeed`]}`,
+    );
+    const expectedCorrected = rawSpeedMs * 0.66 * 0.9359;
+    assert.ok(
+      Math.abs(published[`${base}.correctedSpeed`] - expectedCorrected) < 0.02,
+      `correctedSpeed should be ~${expectedCorrected.toFixed(3)} m/s (single application), got ${published[`${base}.correctedSpeed`]}`,
+    );
 
     await plugin.stop();
   });
@@ -255,20 +278,20 @@ test.describe("WPF identity passthrough: no learned data at all", () => {
     app.dataPath = await mkdtemp(join(tempDir, "t-"));
     await plugin.start(baseConfig(), () => {});
 
-    // Seed the engine's corrected-forecast store with a current point in
-    // m/s (the engine's canonical unit).
+    // Seed the engine's forecast stores with a current point in m/s (the
+    // engine's canonical unit). Nothing is learned, so raw == corrected.
     const now = new Date();
     const engine = plugin.__getInternals().predictionEngine;
-    engine.lastForecast = [
-      {
-        time: now,
-        windSpeedMs: msFromKnots(10),
-        gustSpeedMs: msFromKnots(18),
-        windDirectionDeg: 90,
-        ghi: 0,
-        cloudCover: 0,
-      },
-    ];
+    const rawPoint = {
+      time: now,
+      windSpeedMs: msFromKnots(10),
+      gustSpeedMs: msFromKnots(18),
+      windDirectionDeg: 90,
+      ghi: 0,
+      cloudCover: 0,
+    };
+    engine.lastRawForecast = [rawPoint];
+    engine.lastForecast = [rawPoint];
 
     const pub = plugin.__getInternals().advisoryPublisher;
     let published = null;

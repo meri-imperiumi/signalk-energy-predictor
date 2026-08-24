@@ -970,6 +970,8 @@ class PredictionEngine {
       app,
     });
     this.lastPrediction = [];
+    /** Raw (pre-WPF) forecast from the last run, for publishing raw values */
+    this.lastRawForecast = [];
     this.lastForecast = [];
   }
 
@@ -2646,6 +2648,7 @@ class PredictionEngine {
     this.shiftSolarActionsToSunBoundaries(predictions, latitude, longitude);
 
     this.lastPrediction = predictions;
+    this.lastRawForecast = forecast;
     this.lastForecast = correctedForecast;
     return predictions;
   }

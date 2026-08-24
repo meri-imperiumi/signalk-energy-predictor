@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- The wind-protection Signal K paths no longer double-apply the learned
+  factor: `publishWindProtection` read its "forecast" from the engine's
+  `lastForecast`, which already carries the wind-protection correction
+  (factor + 10 m → device-height translation), and then corrected it a
+  second time — so `correctedSpeed`/`correctedGust` published values like
+  0.99 m/s where the correct once-corrected value was 3.3 m/s, and
+  `forecastSpeed`/`forecastGust` published the corrected value instead of
+  the raw forecast. The engine now also keeps the raw (pre-WPF) forecast
+  (`lastRawForecast`) and the publisher reads that, so `forecastSpeed` is
+  the raw forecast and `correctedSpeed` applies factor + height exactly
+  once. The prediction engine's own gates were unaffected (they consume
+  the corrected forecast once, by design).
+
 ### Changed
 - Wind speeds are now carried in m/s (Signal K's standard unit) in the
   prediction engine's internals and in the wind-protection Signal K
