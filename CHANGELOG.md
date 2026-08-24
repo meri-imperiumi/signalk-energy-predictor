@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Forecast cache-hit logging no longer spams. `getForecast()` is called
+  on the 15-minute prediction cycle *and* on every wind-protection
+  learning run (throttled to 5 min), and each call logged when it served
+  the cached forecast ("Using cached forecast…", "…serving stale
+  in-memory forecast"). These are the expected, normal-case returns, so
+  they now log once per fetch and stay quiet on repeat cache hits until
+  the next actual fetch resets the flags.
+
 ## [0.4.0] - 2026-08-24
 
 ### Added

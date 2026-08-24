@@ -560,6 +560,19 @@ class IngestionFSM {
      * allow a fetch sooner.
      */
     this.lastOnlineFetchAttempt = 0;
+    /**
+     * Whether we've already announced the current "serving stale" stretch
+     * since the last successful fetch. These paths return a cached forecast
+     * on *every* getForecast() call, so logging each one would spam the
+     * debug stream; we log once per fetch and stay quiet until the next
+     * actual fetch resets the flag.
+     */
+    this.announcedStaleServe = false;
+    /**
+     * Whether we've already logged the current within-window cache-hit
+     * stretch since the last fetch. Logged once per fetch, then quiet.
+     */
+    this.announcedCacheHit = false;
   }
 
   /**
@@ -855,6 +868,8 @@ class IngestionFSM {
         this.currentTier = tier;
         this.lastFetchTime = new Date();
         this.lastForecast = this.postProcessForecast(forecast);
+        this.announcedStaleServe = false;
+        this.announcedCacheHit = false;
         this.app.debug(
           `Got ${this.lastForecast.length} forecast points from ${this.getTierName(tier)}`,
         );
@@ -996,6 +1011,8 @@ class IngestionFSM {
     // fetch timestamp; writeWeatherCache rewrites the file on every fetch).
     this.lastFetchTime = new Date(fetchedAt);
     this.lastForecast = this.postProcessForecast(inHorizon);
+    this.announcedStaleServe = false;
+    this.announcedCacheHit = false;
     this.app.debug(
       `Restored ${this.lastForecast.length} forecast points from disk (best tier ${bestTier}, fetched ~${Math.round((now - this.lastFetchTime.getTime()) / 3600000)}h ago)`,
     );
@@ -1086,6 +1103,8 @@ class IngestionFSM {
     this.currentTier = tier;
     this.lastFetchTime = new Date(nowMs);
     this.lastForecast = points;
+    this.announcedStaleServe = false;
+    this.announcedCacheHit = false;
     this.app.debug(
       `Stale hybrid: ${points.length} points (solar: ${cloudCover != null ? "logbook oktas" : "clear sky"}, wind: latest-known ${latestWind.speedMs ?? "?"}m/s)`,
     );
@@ -1138,9 +1157,12 @@ class IngestionFSM {
       this.lastForecast.length > 0 &&
       Date.now() - this.lastFetchTime.getTime() < maxAge
     ) {
-      this.app.debug(
-        `Using cached forecast (age: ${Math.round((Date.now() - this.lastFetchTime.getTime()) / 60000)}min, tier: ${this.currentTier}, points: ${this.lastForecast.length}, first: ${this.lastForecast[0]?.time.toISOString()})`,
-      );
+      if (!this.announcedCacheHit) {
+        this.app.debug(
+          `Using cached forecast (age: ${Math.round((Date.now() - this.lastFetchTime.getTime()) / 60000)}min, tier: ${this.currentTier}, points: ${this.lastForecast.length}, first: ${this.lastForecast[0]?.time.toISOString()})`,
+        );
+        this.announcedCacheHit = true;
+      }
       return this.lastForecast;
     }
 
@@ -1149,9 +1171,12 @@ class IngestionFSM {
     const now = Date.now();
     if (this.uplinkOnline) {
       if (now - this.lastOnlineFetchAttempt < UPLINK_ONLINE_FETCH_INTERVAL_MS) {
-        this.app.debug(
-          `Forecast eligible but uplink refetched recently; serving stale in-memory forecast`,
-        );
+        if (!this.announcedStaleServe) {
+          this.app.debug(
+            `Forecast eligible but uplink refetched recently; serving stale in-memory forecast`,
+          );
+          this.announcedStaleServe = true;
+        }
         return this.lastForecast;
       }
     } else {
@@ -1159,9 +1184,12 @@ class IngestionFSM {
         this.lastFetchAttempt &&
         now - this.lastFetchAttempt.getTime() < UPLINK_OFFLINE_PROBE_MS
       ) {
-        this.app.debug(
-          `Forecast eligible but no uplink and offline probe rate-limited; serving stale in-memory forecast`,
-        );
+        if (!this.announcedStaleServe) {
+          this.app.debug(
+            `Forecast eligible but no uplink and offline probe rate-limited; serving stale in-memory forecast`,
+          );
+          this.announcedStaleServe = true;
+        }
         return this.lastForecast;
       }
     }
