@@ -562,6 +562,43 @@ test.describe("route registration", () => {
       assert.ok(summary.body.predictionAccuracy.hoursCompared >= 1);
     });
   });
+
+  test("GET /api/vessel returns the solar-local offset from the live position", async () => {
+    await withFixtures(async (dataDir) => {
+      const router = makeRouter();
+      // 30°E → +120 minutes solar-local offset
+      registerApiRoutes(router, {
+        app: {
+          debug() {},
+          error() {},
+          getSelfPath: () => ({
+            value: { latitude: 0, longitude: 30 },
+          }),
+        },
+        getConfig: () => CONFIG,
+        dataDir,
+      });
+      const res = makeRes();
+      await router.routes.get("/api/vessel")({}, res);
+      assert.strictEqual(res.statusCode, null);
+      assert.strictEqual(res.body.solarOffsetMinutes, 120);
+    });
+  });
+
+  test("GET /api/vessel returns null offset when the position is unknown", async () => {
+    await withFixtures(async (dataDir) => {
+      const router = makeRouter();
+      registerApiRoutes(router, {
+        app: { debug() {}, error() {}, getSelfPath: () => null },
+        getConfig: () => CONFIG,
+        dataDir,
+      });
+      const res = makeRes();
+      await router.routes.get("/api/vessel")({}, res);
+      assert.strictEqual(res.statusCode, null);
+      assert.strictEqual(res.body.solarOffsetMinutes, null);
+    });
+  });
 });
 
 test.describe("OpenAPI spec", () => {
@@ -893,6 +930,155 @@ test("buildDeployStates: advisories dedupe by calendar day across minute-drift b
   // Newest cycle's version wins (last written for that date key)
   assert.strictEqual(res.advisories[0].surplusWh, 1600);
   assert.match(res.advisories[0].message, /14:15/);
+});
+
+test("buildDeployStates: stamp advisories with forecastAt (cycle run time)", () => {
+  // Each emitted advisory carries the ISO timestamp of the cycle that
+  // produced it, so the UI can show "as forecast at HH:MM" and let the
+  // crew correlate a historical surplus with what actually happened.
+  const from = new Date("2026-08-23T00:00:00Z");
+  const to = new Date("2026-08-23T23:59:00Z");
+  const cycles = [
+    {
+      timestamp: "2026-08-23T08:00:00.000Z",
+      advisories: [
+        {
+          type: "surplus",
+          time: "2026-08-23T14:00:00.000Z",
+          message: "1.2 kWh surplus available 14:00-18:00",
+          surplusWh: 1200,
+        },
+      ],
+    },
+    {
+      timestamp: "2026-08-23T08:15:00.000Z",
+      advisories: [
+        {
+          type: "surplus",
+          time: "2026-08-23T14:15:00.000Z",
+          message: "1.6 kWh surplus available 14:15-19:15",
+          surplusWh: 1600,
+        },
+      ],
+    },
+  ];
+  const res = buildDeployStates([], cycles, from, to);
+  // Newest cycle's run time wins.
+  assert.strictEqual(res.advisories[0].forecastAt, "2026-08-23T08:15:00.000Z");
+  // Not stale: the newest covering cycle (08:15) is the one that produced it.
+  assert.strictEqual(res.advisories[0].stale, false);
+});
+
+test("buildDeployStates: mark advisory stale when a newer cycle drops it", () => {
+  // The Aug 23 08:00 cycle forecast a surplus for 14:00. A newer cycle at
+  // 08:15 — whose forecast still covers the 14:00 hour — no longer flags a
+  // surplus (the crew ran loads and consumed it, the weather changed, …).
+  // The historical event is kept as a record but marked stale so the UI
+  // doesn't present it as a live current opportunity.
+  const from = new Date("2026-08-23T00:00:00Z");
+  const to = new Date("2026-08-23T23:59:00Z");
+  const cycles = [
+    {
+      timestamp: "2026-08-23T08:00:00.000Z",
+      forecast: [{ time: "2026-08-23T14:00:00.000Z" }],
+      advisories: [
+        {
+          type: "surplus",
+          time: "2026-08-23T14:00:00.000Z",
+          message: "1.2 kWh surplus available 14:00-18:00",
+          surplusWh: 1200,
+        },
+      ],
+    },
+    {
+      // Newer cycle covers the 14:00 hour but produced no surplus advisory
+      timestamp: "2026-08-23T08:15:00.000Z",
+      forecast: [{ time: "2026-08-23T14:00:00.000Z" }],
+      advisories: [],
+    },
+  ];
+  const res = buildDeployStates([], cycles, from, to);
+  assert.strictEqual(res.advisories.length, 1);
+  assert.strictEqual(res.advisories[0].surplusWh, 1200);
+  assert.strictEqual(res.advisories[0].forecastAt, "2026-08-23T08:00:00.000Z");
+  assert.strictEqual(res.advisories[0].stale, true);
+});
+
+test("buildDeployStates: not stale when a newer cycle still flags it", () => {
+  // Both cycles cover the 14:00 hour and both emit a surplus; the newest
+  // cycle's version wins and is NOT stale (the latest forecast still
+  // confirms the surplus, just resized).
+  const from = new Date("2026-08-23T00:00:00Z");
+  const to = new Date("2026-08-23T23:59:00Z");
+  const cycles = [
+    {
+      timestamp: "2026-08-23T08:00:00.000Z",
+      forecast: [{ time: "2026-08-23T14:00:00.000Z" }],
+      advisories: [
+        {
+          type: "surplus",
+          time: "2026-08-23T14:00:00.000Z",
+          message: "1.2 kWh surplus available 14:00-18:00",
+          surplusWh: 1200,
+        },
+      ],
+    },
+    {
+      timestamp: "2026-08-23T08:15:00.000Z",
+      forecast: [{ time: "2026-08-23T14:00:00.000Z" }],
+      advisories: [
+        {
+          type: "surplus",
+          time: "2026-08-23T14:15:00.000Z",
+          message: "1.6 kWh surplus available 14:15-19:15",
+          surplusWh: 1600,
+        },
+      ],
+    },
+  ];
+  const res = buildDeployStates([], cycles, from, to);
+  assert.strictEqual(res.advisories.length, 1);
+  assert.strictEqual(res.advisories[0].surplusWh, 1600);
+  assert.strictEqual(res.advisories[0].stale, false);
+});
+
+test("buildDeployStates: not stale when no newer cycle covers the day", () => {
+  // An older cycle's surplus for a day no newer cycle's forecast reaches is
+  // still the authoritative forecast for that day — not stale. (A cycle
+  // "covers" a day only if its forecast span intersects it; a cycle that ran
+  // later but forecasted a shorter horizon not reaching the day doesn't
+  // overtake it.)
+  const from = new Date("2026-08-23T00:00:00Z");
+  const to = new Date("2026-08-26T00:00:00Z");
+  const cycles = [
+    {
+      // 48h forecast covers Aug 25
+      timestamp: "2026-08-23T08:00:00.000Z",
+      forecast: [
+        { time: "2026-08-23T08:00:00.000Z" },
+        { time: "2026-08-25T14:00:00.000Z" },
+      ],
+      advisories: [
+        {
+          type: "surplus",
+          time: "2026-08-25T14:00:00.000Z",
+          message: "3.1 kWh surplus available 14:00-18:00",
+          surplusWh: 3100,
+        },
+      ],
+    },
+    {
+      // Newer cycle at 08:15 but with a 24h horizon that doesn't reach Aug 25
+      timestamp: "2026-08-23T08:15:00.000Z",
+      forecast: [{ time: "2026-08-23T08:15:00.000Z" }],
+      advisories: [],
+    },
+  ];
+  const res = buildDeployStates([], cycles, from, to);
+  const surplus = res.advisories.find((a) => a.type === "surplus");
+  assert.ok(surplus, "surplus for Aug 25 is preserved");
+  assert.strictEqual(surplus.stale, false);
+  assert.strictEqual(surplus.forecastAt, "2026-08-23T08:00:00.000Z");
 });
 
 test("buildDeployStates: prior state from before window suppresses first-entry emission", () => {

@@ -272,8 +272,19 @@ ep-actions-list {
   border-color: var(--wind-color);
 }
 
+/* A surplus/deficit advisory a newer forecast overtook (the crew acted on
+ * it, the weather changed, …). Kept as history, dimmed so it doesn't read
+ * as a live current opportunity. */
+.ep-action-stale {
+  opacity: 0.6;
+}
+
 .ep-action-text {
   color: var(--text-color);
+}
+
+.ep-action-stale .ep-action-text {
+  text-decoration: line-through;
 }
 
 .ep-action-reason {

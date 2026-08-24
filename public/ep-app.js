@@ -54,6 +54,10 @@ class EpApp extends HTMLElement {
     this.chartEl = chart;
     /** @type {HTMLElement} */
     this.actionsEl = actions;
+    /** @type {HTMLElement} */
+    this.selectorEl = selector;
+    /** @type {number|null} */
+    this.solarOffsetMinutes = null;
 
     selector.addEventListener("ep-window-change", (e) => {
       this.onWindowChange(e.detail);
@@ -67,11 +71,28 @@ class EpApp extends HTMLElement {
     });
     this.stream.connect();
 
-    // Initial load with selector defaults (restored prefs)
+    // Initial load with selector defaults (restored prefs). The solar
+    // offset is fetched from /api/vessel and pushed to the selector (so the
+    // day/week/month window anchors on the vessel's solar-local midnight),
+    // the chart (axis labels, tooltips, day buckets) and the Events list
+    // (event times) — so every user-facing time renders in the crew's
+    // solar-local frame, agreeing with the advisory dedup's sun-day.
     const spec = selector.windowSpec();
     this.mode = spec.mode;
     this.lastSpec = spec;
     this.refresh(spec);
+    fetch(`${API_BASE}/api/vessel`)
+      .then((r) => (r.ok ? r.json() : null))
+      .then((v) => {
+        const off =
+          v && typeof v.solarOffsetMinutes === "number"
+            ? v.solarOffsetMinutes
+            : null;
+        this.applySolarOffset(off);
+      })
+      .catch(() => {
+        // Vessel meta unavailable: keep the browser-timezone fallback
+      });
   }
 
   disconnectedCallback() {
@@ -85,6 +106,23 @@ class EpApp extends HTMLElement {
     this.mode = spec.mode;
     this.lastSpec = spec;
     this.refresh(spec);
+  }
+
+  /**
+   * Pushes the vessel's solar-local UTC offset (from `/api/vessel`) to
+   * the selector, chart and Events list so every user-facing time renders
+   * in the crew's solar-local frame. The selector re-emits a window-change
+   * (re-anchored on solar-local midnight), which triggers a refresh; the
+   * chart and Events list re-render with the new offset. Stored so later
+   * refreshes (live cycle stream) keep using it.
+   * @param {number|null} offsetMinutes
+   */
+  applySolarOffset(offsetMinutes) {
+    if (offsetMinutes === this.solarOffsetMinutes) return;
+    this.solarOffsetMinutes = offsetMinutes;
+    this.chartEl.setSolarOffsetMinutes?.(offsetMinutes);
+    this.actionsEl.setSolarOffsetMinutes?.(offsetMinutes);
+    this.selectorEl.setSolarOffsetMinutes?.(offsetMinutes);
   }
 
   /**

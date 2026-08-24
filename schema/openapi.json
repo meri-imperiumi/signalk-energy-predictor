@@ -168,6 +168,23 @@
           }
         }
       }
+    },
+    "/api/vessel": {
+      "get": {
+        "tags": ["vessel"],
+        "summary": "Vessel meta for user-facing time rendering",
+        "description": "Returns the vessel's solar-local UTC offset (minutes), derived from the current longitude, so the webapp can anchor its day/week/month window and render event times in the crew's solar-local frame rather than the browser's civil timezone. Returns null when the position is unknown (client falls back to the browser timezone).",
+        "responses": {
+          "200": {
+            "description": "Vessel meta",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/Vessel" }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -185,6 +202,16 @@
         "properties": {
           "from": { "type": "string", "format": "date-time" },
           "to": { "type": "string", "format": "date-time" }
+        }
+      },
+      "Vessel": {
+        "type": "object",
+        "properties": {
+          "solarOffsetMinutes": {
+            "type": "integer",
+            "nullable": true,
+            "description": "Solar-local UTC offset in minutes (east positive), derived from the vessel's longitude. Null when the position is unknown."
+          }
         }
       },
       "ForecastHour": {

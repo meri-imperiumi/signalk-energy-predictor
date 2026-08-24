@@ -783,6 +783,26 @@ function registerApiRoutes(
     res.json(await build(records, sourceTypes, from, to));
   }
 
+  // Vessel meta the webapp needs to render user-facing times in the crew's
+  // solar-local frame (what they experience relative to the sun) rather than
+  // the server's or browser's civil timezone. The solar-local UTC offset is
+  // derived from the vessel's current longitude so the Events list and the
+  // window selector key on the same "sun-day" the advisory dedup uses —
+  // otherwise a surplus the crew lives through "this afternoon" can render
+  // under yesterday or tomorrow depending on the browser timezone. Returns
+  // null when the position is unknown so the client falls back to the
+  // browser timezone.
+  router.get("/api/vessel", (_req, res) => {
+    const pos = app.getSelfPath?.("navigation.position");
+    const longitude =
+      pos && typeof pos.value === "object" && pos.value != null
+        ? pos.value.longitude
+        : null;
+    res.json({
+      solarOffsetMinutes: solarOffsetMinutesFromLongitude(longitude),
+    });
+  });
+
   router.get("/api/predictions", (req, res) =>
     handle(req, res, "cycle", (records, _sourceTypes, from, to) =>
       buildPredictions(records, from, to),
@@ -1369,6 +1389,19 @@ function buildDeployStates(samples, cycles, from, to, opts = {}) {
   // the recommendation-withdrawal logic above). Only advisories whose
   // action time falls within [from, to] are emitted.
   //
+  // Staleness: the dedup keeps the newest surviving advisory for its
+  // sun-day, but a later cycle may have run since whose forecast still
+  // covers that day yet produced no advisory of this type — i.e. the
+  // latest forecast overtook it (the crew acted on the surplus and ran
+  // loads, the weather changed, …). We keep the historical event — it's
+  // a real record of what was forecast, and seeing *why* it went away
+  // is useful — but stamp it `stale: true` with `forecastAt` (the cycle
+  // run time that produced it) so the UI can mark it as overtaken rather
+  // than showing it as a live current opportunity. Mirrors the
+  // recommendation-withdrawal logic: the newest cycle covering a day
+  // wins; if it covers the day but has no advisory of this type, the
+  // prior advisory is marked stale rather than dropped.
+  //
   // The dedup key is the solar-local calendar day of the advisory's
   // action time (a "sun-day"). There is at most one surplus and one
   // deficit event per sun-day (the bank hits full-and-curtails once per
@@ -1383,20 +1416,70 @@ function buildDeployStates(samples, cycles, from, to, opts = {}) {
   // version (cyclesIndexed is oldest→newest, so the last `.set` wins) is
   // the most accurate forecast.
   const offsetMs = (solarOffsetMinutes || 0) * 60 * 1000;
+  /** Solar-local sun-day (local-midnight ms) of an advisory action time. */
+  const sunDayOf = (tMs) => new Date(tMs + offsetMs).setUTCHours(0, 0, 0, 0);
+  // typesByDay: sun-day -> Set of advisory types the newest covering cycle
+  // produced for that day. A cycle "covers" a sun-day when its forecast
+  // span [startMs, endMs] intersects that local calendar day.
+  /** @param {{startMs: number, endMs: number}} c @param {number} localDateMs */
+  const cycleCoversDay = (c, localDateMs) => {
+    // localDateMs is local-midnight start of the sun-day. In UTC ms the
+    // day spans [localDateMs - offsetMs, localDateMs + MS_PER_DAY - offsetMs).
+    const dayStartUtc = localDateMs - offsetMs;
+    const dayEndUtc = dayStartUtc + MS_PER_DAY;
+    return c.endMs >= dayStartUtc && c.startMs < dayEndUtc;
+  };
+  /** Newest cycle covering a sun-day, or null. cyclesIndexed is oldest→newest. */
+  const newestCoveringDay = (localDateMs) => {
+    for (let i = cyclesIndexed.length - 1; i >= 0; i--) {
+      if (cycleCoversDay(cyclesIndexed[i], localDateMs))
+        return cyclesIndexed[i];
+    }
+    return null;
+  };
+  const typesByDay = new Map(); // localDateMs -> Set<type> (latest covering cycle's types)
+  for (const c of cyclesIndexed) {
+    for (const adv of c.advisories || []) {
+      const tMs = new Date(adv.time).getTime();
+      if (Number.isNaN(tMs)) continue;
+      const localDateMs = sunDayOf(tMs);
+      const newest = newestCoveringDay(localDateMs);
+      // Only the newest covering cycle's types count for staleness; older
+      // cycles that also covered the day are superseded.
+      if (newest && newest.ts !== c.ts) continue;
+      if (!typesByDay.has(localDateMs)) typesByDay.set(localDateMs, new Set());
+      typesByDay.get(localDateMs).add(adv.type);
+    }
+  }
   const advisoriesByKey = new Map(); // `${type}|${localDateMs}` -> adv
+  const forecastAtByKey = new Map(); // `${type}|${localDateMs}` -> cycle ts (ms)
   for (const cycle of cyclesIndexed) {
     for (const adv of cycle.advisories || []) {
       const tMs = new Date(adv.time).getTime();
       if (Number.isNaN(tMs)) continue;
-      const localDateMs = new Date(tMs + offsetMs).setUTCHours(0, 0, 0, 0);
-      advisoriesByKey.set(`${adv.type}|${localDateMs}`, adv);
+      const localDateMs = sunDayOf(tMs);
+      const key = `${adv.type}|${localDateMs}`;
+      advisoriesByKey.set(key, adv);
+      forecastAtByKey.set(key, cycle.ts);
     }
   }
-  const advisories = [...advisoriesByKey.values()]
-    .filter((adv) => {
+  const advisories = [...advisoriesByKey.entries()]
+    .map(([key, adv]) => {
       const t = new Date(adv.time).getTime();
-      return t >= fromMs && t <= toMs;
+      if (t < fromMs || t > toMs) return null;
+      const cycleTs = forecastAtByKey.get(key);
+      const localDateMs = Number(key.slice(adv.type.length + 1));
+      // Stale if a newer cycle covers this sun-day but didn't emit this
+      // advisory type for it — the latest forecast overtook it.
+      let stale = false;
+      const newest = newestCoveringDay(localDateMs);
+      if (newest && newest.ts !== cycleTs) {
+        const types = typesByDay.get(localDateMs);
+        if (!types?.has(adv.type)) stale = true;
+      }
+      return { ...adv, forecastAt: new Date(cycleTs).toISOString(), stale };
     })
+    .filter((a) => a !== null)
     .sort((a, b) => new Date(a.time).getTime() - new Date(b.time).getTime());
 
   return {

@@ -17,6 +17,8 @@
  *    surplus window or a needed engine run.
  */
 
+import { formatShortDateTime } from "./ep-solar-time.js";
+
 const API_BASE = "/plugins/signalk-energy-predictor";
 
 /**
@@ -48,6 +50,19 @@ class EpActionsList extends HTMLElement {
     super();
     /** @type {{detected: object[], recommendations: object[], advisories: object[]}|null} */
     this._data = null;
+    /** @type {number|null} Solar-local UTC offset (min, east positive)
+     *  from `/api/vessel`; null = browser timezone (fallback). */
+    this.solarOffsetMinutes = null;
+  }
+
+  /**
+   * Sets the vessel's solar-local UTC offset (from `/api/vessel`) and
+   * re-renders so event times move to the solar-local frame.
+   * @param {number|null} offsetMinutes
+   */
+  setSolarOffsetMinutes(offsetMinutes) {
+    this.solarOffsetMinutes = offsetMinutes;
+    if (this.isConnected) this.render();
   }
 
   /**
@@ -99,6 +114,8 @@ class EpActionsList extends HTMLElement {
         type: a.type,
         message: a.message || "",
         loads: a.loads || [],
+        forecastAt: a.forecastAt || null,
+        stale: a.stale === true,
       });
     }
     return events.sort((a, b) => a.time - b.time);
@@ -120,10 +137,10 @@ class EpActionsList extends HTMLElement {
       const li = document.createElement("li");
       li.className = `ep-action ep-action-${ev.kind}`;
       const time = new Date(ev.time);
-      const timeStr = time.toLocaleString(undefined, {
-        dateStyle: "short",
-        timeStyle: "short",
-      });
+      const timeStr = formatShortDateTime(
+        time.getTime(),
+        this.solarOffsetMinutes,
+      );
       const badge = document.createElement("span");
       badge.className = "ep-action-badge";
       const text = document.createElement("span");
@@ -143,6 +160,26 @@ class EpActionsList extends HTMLElement {
         badge.textContent = advisoryBadge(ev.type);
         text.textContent = `At ${timeStr} ${ev.message}`;
         li.dataset.advisory = ev.type;
+        // A newer forecast overtook this advisory (the crew acted on the
+        // surplus, the weather changed, …) but we keep it as a record.
+        // Mark it stale and show when the forecast was made so it doesn't
+        // read as a live current opportunity.
+        if (ev.stale) {
+          li.classList.add("ep-action-stale");
+          badge.textContent = `stale ${advisoryBadge(ev.type)}`;
+        }
+        if (ev.forecastAt) {
+          const fa = formatShortDateTime(
+            new Date(ev.forecastAt).getTime(),
+            this.solarOffsetMinutes,
+          );
+          const note = document.createElement("span");
+          note.className = "ep-action-reason";
+          note.textContent = `forecast at ${fa}${
+            ev.stale ? " — overtaken by a newer forecast" : ""
+          }`;
+          li.append(note);
+        }
       }
       li.append(badge, text);
       if (ev.reason) {

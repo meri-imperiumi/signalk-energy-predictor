@@ -7,7 +7,21 @@
  * grouped bars, plus SoC and wind speed lines.
  *
  * Legend toggles and enabled-series state persist in localStorage.
+ *
+ * All user-facing times (axis labels, tooltip, day bucketing) render in
+ * the vessel's solar-local frame (offset from `/api/vessel`) so the chart
+ * agrees with the window selector and the Events list — a surplus at
+ * solar 14:12 shows as 14:12 everywhere, not shifted by the browser's
+ * civil timezone.
  */
+
+import {
+  formatDayMonth,
+  formatHHMM,
+  formatShortDateTime,
+  solarDayKey,
+  solarDayStart,
+} from "./ep-solar-time.js";
 
 /** Chart drawing area size */
 const WIDTH = 1000;
@@ -170,24 +184,31 @@ const PERIOD_SERIES = [
 ];
 
 /**
- * Local calendar key (YYYY-MM-DD) for a timestamp — the browser's day,
- * used for daily bucketing and bar labels.
+ * Solar-local UTC offset (minutes, east positive) for rendering axis
+ * labels, tooltips and day buckets in the crew's frame. Set by the app
+ * from `/api/vessel`; null = use the browser timezone (fallback).
+ */
+let solarOffsetMinutes = null;
+
+/**
+ * Local calendar key (YYYY-MM-DD) for a timestamp — the solar-local
+ * sun-day, used for daily bucketing and bar labels so a sun-day
+ * straddling UTC midnight stays in one bucket.
  * @param {number} t - epoch ms
  * @returns {string}
  */
 function localDayKey(t) {
-  const d = new Date(t);
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+  return solarDayKey(t, solarOffsetMinutes);
 }
 
 /**
- * Local midnight (epoch ms) for a YYYY-MM-DD key.
+ * Local midnight (epoch ms) for a YYYY-MM-DD key — solar-local midnight
+ * when the offset is known, browser-local midnight otherwise.
  * @param {string} day
  * @returns {number}
  */
 function localDayStart(day) {
-  const [y, m, d] = day.split("-").map(Number);
-  return new Date(y, m - 1, d).getTime();
+  return solarDayStart(day, solarOffsetMinutes);
 }
 
 class EpTimelineChart extends HTMLElement {
@@ -222,6 +243,18 @@ class EpTimelineChart extends HTMLElement {
 
   get data() {
     return this._data;
+  }
+
+  /**
+   * Sets the vessel's solar-local UTC offset (from `/api/vessel`) and
+   * re-renders so axis labels, tooltips and day buckets move to the
+   * solar-local frame. No-op when unchanged.
+   * @param {number|null} offsetMinutes
+   */
+  setSolarOffsetMinutes(offsetMinutes) {
+    if (offsetMinutes === solarOffsetMinutes) return;
+    solarOffsetMinutes = offsetMinutes;
+    if (this.isConnected) this.render();
   }
 
   connectedCallback() {
@@ -765,10 +798,9 @@ class EpTimelineChart extends HTMLElement {
         y: HEIGHT - 8,
         "text-anchor": "middle",
       });
-      const d = new Date(t);
       label.textContent = isDay
-        ? `${String(d.getHours()).padStart(2, "0")}:00`
-        : `${d.getDate()}/${d.getMonth() + 1}`;
+        ? formatHHMM(t, solarOffsetMinutes)
+        : formatDayMonth(t, solarOffsetMinutes);
       svg.appendChild(label);
     }
 
@@ -969,10 +1001,7 @@ class EpTimelineChart extends HTMLElement {
 
     const timeEl = document.createElement("div");
     timeEl.className = "time";
-    timeEl.textContent = new Date(nearest.t).toLocaleString(undefined, {
-      dateStyle: "short",
-      timeStyle: "short",
-    });
+    timeEl.textContent = formatShortDateTime(nearest.t, solarOffsetMinutes);
     this.tooltip.replaceChildren(timeEl);
     for (const d of this.seriesDefs) {
       if (!this.isEnabled(d.id)) continue;

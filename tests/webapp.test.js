@@ -31,9 +31,16 @@ test("every public module passes a syntax check", () => {
 
 test("index.html loads all modules and the stylesheet", () => {
   const html = readFileSync(path.join(PUBLIC_DIR, "index.html"), "utf8");
+  // Library modules imported by other webapp modules via ES imports,
+  // not loaded directly by index.html as a top-level script. These have
+  // no side effects (no custom element, no bootstrap) and are pulled in
+  // by the components that use them, so they must not be required as
+  // top-level <script> sources.
+  const libraries = new Set(["ep-solar-time.js"]);
   for (const file of readdirSync(PUBLIC_DIR)) {
     // icon.png is for the server's webapp list, not the page itself
     if (file === "index.html" || file === "icon.png") continue;
+    if (libraries.has(file)) continue;
     assert.ok(html.includes(`./${file}`), `index.html must reference ${file}`);
   }
   assert.ok(html.includes("<ep-app>"), "index.html must mount ep-app");
@@ -118,6 +125,18 @@ test('events list header reads "Events" and interleaves advisories', () => {
   // records alongside the terse notification message
   assert.match(source, /ev\.loads\?\.length/);
   assert.match(source, /Could run:/);
+  // A surplus a newer forecast overtook is kept as history but marked
+  // stale and shows when the forecast was made (forecastAt), so it
+  // doesn't read as a live current opportunity.
+  assert.match(source, /ep-action-stale/);
+  assert.match(source, /ev\.forecastAt/);
+  assert.match(source, /overtaken by a newer forecast/);
+  // Event times render in the vessel's solar-local frame (shared formatter
+  // from ep-solar-time.js), not the browser's civil timezone, so the
+  // Events list agrees with the window selector and the chart.
+  assert.match(source, /ep-solar-time\.js/);
+  assert.match(source, /formatShortDateTime/);
+  assert.match(source, /setSolarOffsetMinutes/);
 });
 
 test("chart overlays retro-predicted when no recorded cycle covers the window", () => {
@@ -178,32 +197,85 @@ test("window selector exposes Today and hash-based navigation", () => {
   assert.match(source, /hashchange/);
 });
 
-test("window selector spans calendar weeks (Mon–Sun) and months (1st–last)", () => {
+test("window selector anchors the day on the vessel's solar-local midnight", () => {
   const source = readFileSync(
     path.join(PUBLIC_DIR, "ep-window-selector.js"),
     "utf8",
   );
-  // Week window starts on Monday: anchor shifted back to the week's Monday
+  // solarMidnightToday builds a solar-local-midnight instant from the
+  // vessel's longitude-derived offset (east positive), so the day window
+  // is the sun-day the crew experiences — the same day the advisory dedup
+  // keys on — not the browser's civil timezone.
+  assert.match(source, /solarMidnightToday/);
+  assert.match(source, /solarOffsetMinutes/);
+  // setSolarOffsetMinutes lets the app feed /api/vessel's offset in after
+  // load and re-emit so the window re-anchors.
+  assert.match(source, /setSolarOffsetMinutes/);
+  // Browser-timezone fallback when the vessel position is unknown
+  assert.match(source, /offsetMinutes == null/);
+});
+
+test("window selector spans calendar weeks (Mon–Sun) and months (1st–last) in the solar-local frame", () => {
+  const source = readFileSync(
+    path.join(PUBLIC_DIR, "ep-window-selector.js"),
+    "utf8",
+  );
+  // Week window starts on Monday; month window starts on the 1st and ends
+  // on the 1st of the next month (handles variable month length and the
+  // Dec→Jan roll). The fixed-span modeDays helper is gone (it produced
+  // 30-day "months").
   assert.match(source, /MONDAY = 1/);
-  assert.match(source, /anchor\.getDay\(\) - MONDAY/);
-  // Month window starts on the 1st and ends on the 1st of the next month
-  // (handles variable month length and the Dec→Jan roll)
-  assert.match(
-    source,
-    /new Date\(anchor\.getFullYear\(\), anchor\.getMonth\(\), 1\)/,
-  );
-  assert.match(
-    source,
-    /new Date\(start\.getFullYear\(\), start\.getMonth\(\) \+ 1, 1\)/,
-  );
-  // Month stepping moves by calendar month, not a fixed 30 days
-  assert.match(
-    source,
-    /new Date\(anchor\.getFullYear\(\), anchor\.getMonth\(\) \+ direction, 1\)/,
-  );
-  // The fixed-span modeDays helper is gone (it produced 30-day "months")
   assert.doesNotMatch(source, /modeDays/);
   assert.doesNotMatch(source, /30;/);
+});
+
+test("window selector solar-local midnight is the true solar midnight instant, not UTC midnight", async () => {
+  // Exercises the actual helper logic via a controlled Date — the bug
+  // this guards against: returning Date.UTC(y,m,d) (UTC midnight) instead
+  // of Date.UTC(y,m,d) − offset·60·1000, which at UTC−10 makes the sun-day
+  // start at 14:00 the previous civil day ("sometime in the afternoon").
+  const src = readFileSync(
+    path.join(PUBLIC_DIR, "ep-window-selector.js"),
+    "utf8",
+  );
+  // The offset must be subtracted to reach true solar midnight.
+  assert.match(
+    src,
+    /Date\.UTC\(y, m, d\)\s*-\s*offsetMinutes\s*\*\s*60\s*\*\s*1000/,
+  );
+  // Verify by constructing solar midnight for a known case. We can't call
+  // the class (needs a browser), but we replicate the exact arithmetic the
+  // module uses so a regression in the formula is caught.
+  // At UTC−10 (offset −600), solar midnight of 2026-08-23 is 10:00 UTC.
+  const off = -600;
+  const got = new Date(Date.UTC(2026, 7, 23) - off * 60 * 1000);
+  assert.strictEqual(got.toISOString(), "2026-08-23T10:00:00.000Z");
+  // And the wrong (pre-fix) value is 00:00Z — which would be 14:00 local:
+  const wrong = new Date(Date.UTC(2026, 7, 23));
+  assert.notStrictEqual(got.getTime(), wrong.getTime());
+  // Cross-check against the shared formatter's solarDayStart, which must
+  // agree with the selector's midnight arithmetic (both use the same sign).
+  const { solarDayStart } = await import(
+    `file://${path.join(PUBLIC_DIR, "ep-solar-time.js")}`
+  );
+  assert.strictEqual(solarDayStart("2026-08-23", off), got.getTime());
+});
+
+test("chart renders axis labels, tooltips and day buckets in solar-local time", () => {
+  const source = readFileSync(
+    path.join(PUBLIC_DIR, "ep-timeline-chart.js"),
+    "utf8",
+  );
+  // Uses the shared solar-local formatter so the chart agrees with the
+  // window selector and the Events list (one offset, one formatter).
+  assert.match(source, /ep-solar-time\.js/);
+  assert.match(source, /formatHHMM/);
+  assert.match(source, /formatDayMonth/);
+  assert.match(source, /formatShortDateTime/);
+  assert.match(source, /solarDayKey/);
+  assert.match(source, /solarDayStart/);
+  // The app pushes /api/vessel's offset in; the chart re-renders with it.
+  assert.match(source, /setSolarOffsetMinutes/);
 });
 
 test("chart shows hydro actual and hydro predicted series", () => {

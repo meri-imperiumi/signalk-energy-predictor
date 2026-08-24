@@ -5,6 +5,43 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- All user-facing times in the webapp now render in the vessel's
+  solar-local frame, not the browser's civil timezone. A new shared
+  formatter (`public/ep-solar-time.js`) shifts instants by the
+  longitude-derived offset and formats with UTC getters, so the day/week/
+  month window, the chart's axis labels and tooltip, and the Events list
+  event times all agree — a surplus at solar 14:12 shows as 14:12
+  everywhere. The offset is fetched once from `/api/vessel` and pushed to
+  the selector, chart and Events list, so the pieces can't drift apart on
+  a stale fetch. Falls back to the browser timezone when the vessel
+  position is unknown.
+- The webapp's day/week/month window now anchors on the vessel's true
+  solar-local midnight (the UTC instant `Date.UTC(y,m,d) − offset·60·1000`),
+  not UTC midnight of the solar-local date. At UTC−10 the sun-day now
+  starts at 10:00 UTC (= 00:00 solar-local) rather than 00:00 UTC (= 14:00
+  the previous civil day, which read as "the day starts in the
+  afternoon"). Derived from the current longitude via the new `/api/vessel`
+  endpoint, so "today" is the sun-day the crew experiences — the same day
+  the surplus/deficit advisory dedup keys on.
+- Surplus and deficit (engine-run) advisories in the Events list are now
+  stamped with `forecastAt` (the cycle run time that produced them) and a
+  `stale` flag. A historical advisory that a newer forecast overtook —
+  the crew acted on the surplus and ran loads, the weather changed, … —
+  is kept as a record but dimmed, struck through, and marked
+  "overtaken by a newer forecast" rather than reading as a live current
+  opportunity. Mirrors the recommendation-withdrawal logic: the newest
+  cycle covering a sun-day wins; if it covers the day but has no advisory
+  of that type, the prior advisory is marked stale rather than dropped.
+
+### Added
+- `GET /api/vessel` returns the vessel's solar-local UTC offset (minutes,
+  east positive) from the current longitude, for the webapp to anchor its
+  window and render event times in the crew's solar-local frame. Returns
+  null when the position is unknown. Documented in the OpenAPI spec.
+
 ## [0.3.0] - 2026-08-23
 
 ### Changed
