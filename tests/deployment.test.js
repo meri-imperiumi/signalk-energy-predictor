@@ -1052,6 +1052,19 @@ test.describe("AdvisoryPublisher.sendMeta", () => {
         .units,
       "knots",
     );
+    // Surplus-energy paths emitted by publishSurplusAdvisory
+    assert.strictEqual(
+      byPath["electrical.energy.prediction.surplusWh"].units,
+      "Wh",
+    );
+    assert.strictEqual(
+      byPath["electrical.energy.prediction.surplus.from"].units,
+      "timestamp",
+    );
+    assert.strictEqual(
+      byPath["electrical.energy.prediction.surplus.to"].units,
+      "timestamp",
+    );
   });
 
   test("emits per-device deployment meta, with side only for solar-deployable", () => {
@@ -2040,6 +2053,88 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       // ~134° → sun to starboard.
       assert.strictEqual(rec.recommendedSide, "starboard");
       assert.match(rec.reason, /Point starboard for morning/);
+    } finally {
+      Date.now = realNow;
+    }
+  });
+
+  test("pointing reason renders sunrise in solar-local time, not UTC/host", () => {
+    // Regression: the "sun rises HH:MM" in the pointing reason used to
+    // render in the server's host timezone (toLocaleTimeString), which on
+    // a UTC-locked marine box shows UTC. It must render in solar-local
+    // time derived from the vessel's longitude, matching the surplus /
+    // engine-run notification windows.
+    const app = makeFakeApp();
+    // lon 18°E → solar offset round(18/15*60) = +72 min = +01:12
+    app.setSelfPath("navigation.position", {
+      latitude: 60,
+      longitude: 18,
+    });
+    app.setSelfPath("navigation.headingTrue", 5.28);
+    app.setSelfPath("navigation.state", "anchored");
+
+    const engine = new PredictionEngine({
+      battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+      solarArrays: [
+        {
+          id: "flinsail",
+          type: "deployable",
+          capacityWp: 300,
+          gustLimitKnots: 20,
+          powerPath: "electrical.solar.flinsail.power",
+        },
+      ],
+      mechanicalGenerators: [],
+      getEfficiency: () => 0.7,
+      getSelfPath: (path) => app.getSelfPath(path),
+      app,
+    });
+
+    const now = new Date("2026-01-15T22:00:00Z");
+    const forecast = Array.from({ length: 48 }, (_, h) => ({
+      time: new Date(now.getTime() + h * 3600000),
+      ghi: 0,
+      cloudCover: 0,
+      gustSpeedKnots: 0,
+      windSpeedKnots: 10,
+      windDirectionDeg: 90,
+    }));
+    const realNow = Date.now;
+    Date.now = () => now.getTime();
+    try {
+      engine.runPrediction(forecast);
+      const recs = engine.getDeploymentRecommendations();
+      const rec = recs.find((r) => r.id === "flinsail");
+      assert.ok(rec, "deployable recommendation present");
+      // Resolve the sunrise the engine used and compute its solar-local
+      // rendering at lon 18°E (+72 min) and its host-timezone rendering.
+      const sunrise = nextSunrise(now, 60, 18);
+      assert.ok(sunrise, "sunrise resolves");
+      const offsetMin = Math.round((18 / 15) * 60);
+      const solarHHMM = new Date(
+        sunrise.getTime() + offsetMin * 60 * 1000,
+      );
+      const solar = `${String(solarHHMM.getUTCHours()).padStart(2, "0")}:${String(
+        solarHHMM.getUTCMinutes(),
+      ).padStart(2, "0")}`;
+      const host = sunrise.toLocaleTimeString("en-GB", {
+        hour: "2-digit",
+        minute: "2-digit",
+        hour12: false,
+      });
+      // The reason must carry the solar-local sunrise time.
+      assert.ok(
+        rec.reason.includes(solar),
+        `reason "${rec.reason}" should contain solar-local sunrise ${solar}`,
+      );
+      // And it must NOT be the host-timezone rendering when the two differ
+      // (i.e. on a UTC-locked server the reason shows solar-local, not UTC).
+      if (host !== solar) {
+        assert.ok(
+          !rec.reason.includes(`${host}`),
+          `reason "${rec.reason}" should not contain host-timezone sunrise ${host}`,
+        );
+      }
     } finally {
       Date.now = realNow;
     }

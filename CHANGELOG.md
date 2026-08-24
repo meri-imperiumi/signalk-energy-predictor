@@ -7,7 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Signal K metadata for the surplus-energy paths
+  `electrical.energy.prediction.surplusWh` (`Wh`), `surplus.from` and
+  `surplus.to` (`timestamp`), emitted by `sendMeta` alongside the existing
+  `timeToFull`/`timeToEmpty`/wind-protection/deployment meta. Consumers and
+  instrument panels can now render the surplus value and window endpoints
+  with correct units and labels.
+
 ### Changed
+- The sunrise time in the solar-panel pointing recommendation
+  ("Point starboard for morning, sun rises 16:54") now renders in the
+  vessel's solar-local time, not the server's host timezone (which on a
+  UTC-locked marine box showed UTC). The surplus and engine-run advisory
+  windows were already solar-local; this closes the last server-side
+  user-facing string that used the host clock. The solar-local offset is
+  derived from the vessel's longitude, the same source used everywhere
+  else. `solarOffsetMinutesFromLongitude`, `formatLocalHHMM` and
+  `formatLocalMonthDay` moved from `advisory.js` to the shared `format.js`
+  so the prediction engine (which builds the pointing reason) can use them
+  without depending on the advisory layer; `advisory.js` re-exports them for
+  existing callers.
+- Surplus-energy estimates are now computed precisely from the ideal
+  SoC track: surplus is the production that would not be stored into the
+  battery because SoC is at 100% — i.e. `max(0, net − (1.0 − socStartOfHour)·
+  capacityWh)` per hour, where `socStartOfHour` is read from the clamped
+  prediction track. The previous headroom state machine over-counted by
+  granting the absorption tail once at the full hour then treating the
+  next hour as already full, and re-derived headroom with its own
+  discharge/refill rules instead of reading the track's actual clamped
+  SoC. The new figure matches the prediction's own SoC clamp loss exactly.
+  The reported window now also starts at the first hour that actually
+  curtails energy (when the bank reaches 100%), not at the `fullThreshold`
+  (≥0.95) hour used only as the gating anchor.
 - All user-facing times in the webapp now render in the vessel's
   solar-local frame, not the browser's civil timezone. A new shared
   formatter (`public/ep-solar-time.js`) shifts instants by the

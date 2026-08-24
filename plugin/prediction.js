@@ -10,7 +10,8 @@
 const { sunPosition, nextSunrise, nextSunset, lastSunset } =
   require("./solar.js");
 const { theoreticalPower } = require("./learning.js");
-const { formatWh } = require("./format.js");
+const { formatWh, solarOffsetMinutesFromLongitude, formatLocalHHMM } =
+  require("./format.js");
 const SunCalc = require("suncalc");
 
 /**
@@ -819,19 +820,6 @@ function formatBearing(rad) {
 }
 
 /**
- * Formats a Date as a 24-hour time string (HH:MM).
- * @param {Date} date - Date to format
- * @returns {string} Formatted time
- */
-function formatTime(date) {
-  return date.toLocaleTimeString("en-GB", {
-    hour: "2-digit",
-    minute: "2-digit",
-    hour12: false,
-  });
-}
-
-/**
  * Converts a Signal K speed value (m/s) to knots.
  * Handles plain numbers and {value: number} objects.
  * @param {number|object|null} v - Speed in m/s
@@ -1388,6 +1376,12 @@ class PredictionEngine {
         reason: "No sunrise in near future",
       };
     }
+    // Render the sunrise instant in solar-local time (the crew's clock),
+    // not the server's host timezone or UTC. We have lon in scope here.
+    const sunriseLocal = formatLocalHHMM(
+      sunrise,
+      solarOffsetMinutesFromLongitude(lon),
+    );
     const sunrisePos = sunPosition(sunrise, lat, lon);
 
     // For anchored boats, the bow swings into the wind, so predict the
@@ -1406,7 +1400,7 @@ class PredictionEngine {
       return {
         side: null,
         targetTime: sunrise.toISOString(),
-        reason: `No heading — cannot determine side for morning (sunrise ${formatTime(sunrise)})`,
+        reason: `No heading — cannot determine side for morning (sunrise ${sunriseLocal})`,
       };
     }
 
@@ -1416,13 +1410,13 @@ class PredictionEngine {
       return {
         side: null,
         targetTime: sunrise.toISOString(),
-        reason: `Sun rises near dead ahead/astern, no side preference (${formatTime(sunrise)})`,
+        reason: `Sun rises near dead ahead/astern, no side preference (${sunriseLocal})`,
       };
     }
     return {
       side,
       targetTime: sunrise.toISOString(),
-      reason: `Point ${side} for morning, sun rises ${formatTime(sunrise)}`,
+      reason: `Point ${side} for morning, sun rises ${sunriseLocal}`,
     };
   }
 
@@ -2817,13 +2811,16 @@ class PredictionEngine {
    * left).
    *
    * Detection over the ideal SoC track (lastPrediction):
-   *   1. Find the first hour H where idealSoC >= fullThreshold.
+   *   1. Find the first hour H where idealSoC >= fullThreshold — the
+   *      gating anchor for the window (lead-time, day/night, sunset).
    *   2. H must not be within ~1h of sunset (no point alerting at dusk).
-   *   3. From H onward, sum the energy that has nowhere to go per hour:
-   *      max(0, solar + wind + alternator - houseLoad). This is energy the
-   *      charge controller would curtail once the bank is full.
-   *   4. The window runs from H until the last hour with positive surplus
-   *      contribution (typically when the engine stops or the sun sets).
+   *   3. From H onward, surplus per hour is the production that would not
+   *      be stored because SoC is 100%: max(0, net − (1.0 − socStartOfHour)·
+   *      capacityWh), where socStartOfHour is the previous point's clamped
+   *      idealSoC (the full hour's own idealSoC is end-of-hour). This is
+   *      exactly the energy the prediction's SoC clamp throws away.
+   *   4. The window runs from the first hour that actually curtails energy
+   *      until the last (typically when the engine stops or the sun sets).
    *   5. Only alert if the window starts within maxLeadHours (beyond that,
    *      forecast uncertainty makes the alert noise).
    *   6. Only alert if total surplusWh >= minSurplusWh.
@@ -2893,31 +2890,29 @@ class PredictionEngine {
       if (hoursToSunset <= 1) return null;
     }
 
-    // Sum post-full energy that has nowhere to go. The window runs from the
-    // full hour until the last hour that actually curtails energy.
+    // Sum the energy that has nowhere to go once the bank is full.
     //
-    // Crucially, only energy produced *while the bank is full* is curtailed
-    // surplus — a deficit hour discharges the bank and creates headroom,
-    // so a later surplus hour must first refill that drawdown before any
-    // of it is curtailed. Summing every net-positive hour (the old
-    // approach) double-counts: it counts the refill energy as surplus,
-    // inflating the total and stretching the window across an overnight
-    // drawdown into the next day's solar (which is actually refilling the
-    // bank, not being wasted).
+    // Surplus is *precisely* the production that would not be stored into
+    // the battery because SoC is at 100%: for each hour, the bank can absorb
+    // (1.0 - socStartOfHour) * capacityWh before it's full, and anything the
+    // hour's net yield produces beyond that is curtailed (has nowhere to go).
     //
-    // Track headroom (Wh the bank can absorb before it's full again):
-    //   - starts at 0 (bank is full at fullHour)
-    //   - a net-negative hour discharges → headroom grows
-    //   - a net-positive hour first fills headroom; only the excess beyond
-    //     headroom is curtailed surplus
+    // We read socStartOfHour directly from the clamped ideal track
+    // (idealSoC of the previous hour; the full hour's own idealSoC is the
+    // end-of-hour value, already clamped to 1.0). Using the track's SoC —
+    // rather than a parallel headroom state machine — makes the surplus
+    // exact by construction: it is whatever the prediction's own SoC clamp
+    // threw away. This automatically accounts for the absorption tail
+    // (the bank spends hours at 0.96/0.98… still absorbing, so that energy
+    // is not surplus) and for overnight drawdowns (the clamped SoC drops,
+    // so the next morning's solar has real headroom and goes into the bank,
+    // not surplus) — no separate tail-grant or discharge-grows-headroom
+    // bookkeeping, which previously over-counted by granting the tail once
+    // then treating the next hour as already-full.
     const capacityWh = this.capacityWh || 0;
-    // The full hour is at >= fullThreshold, not necessarily at 1.0, so there
-    // may be real absorption headroom left (1.0 - idealSoC) * capacity. Count
-    // that as headroom so the absorption-tail energy isn't reported as
-    // curtailed surplus (it's going into the bank, not being wasted).
+    const startSoC = this.lastPrediction[0].idealSoC;
     let surplusWh = 0;
-    let headroomWh = Math.max(0, (1.0 - fullHour.idealSoC) * capacityWh);
-    let lastIndex = fullHourIndex;
+    let firstSurplusIndex = -1;
     let lastSurplusIndex = -1;
     for (let i = fullHourIndex; i < this.lastPrediction.length; i++) {
       const p = this.lastPrediction[i];
@@ -2926,27 +2921,31 @@ class PredictionEngine {
         p.idealWindYieldWh +
         (p.alternatorWh ?? 0) -
         p.houseLoadWh;
-      if (net < 0) {
-        // Discharging: the bank can absorb this much more before being
-        // full again. Cap at capacity so a deep drawdown can't imply more
-        // refilling room than the bank physically holds.
-        headroomWh = Math.min(headroomWh - net, capacityWh);
-      } else if (net > 0) {
-        const curtailed = Math.max(0, net - headroomWh);
-        if (curtailed > 0) {
-          surplusWh += curtailed;
-          lastSurplusIndex = i;
-        }
-        // The remainder fills headroom (refills the drawdown).
-        headroomWh = Math.max(0, headroomWh - net);
+      if (net <= 0) continue; // not producing → nothing to curtail
+      const socStartOfHour = i > 0 ? this.lastPrediction[i - 1].idealSoC : startSoC;
+      // Headroom the bank can absorb before hitting 100%: (1.0 - socStartOfHour)
+      // * capacity. When capacity is unknown, the only case we can be certain
+      // about is a bank already at 1.0 (headroom 0) — anything below 1.0 has
+      // real headroom we can't quantify, so we conservatively treat it as no
+      // curtailment rather than risk over-counting (the prior bug).
+      const headroomWh =
+        socStartOfHour >= 1.0
+          ? 0
+          : capacityWh > 0
+            ? Math.max(0, (1.0 - socStartOfHour) * capacityWh)
+            : net; // unknown capacity → assume the whole hour absorbs
+      const curtailed = Math.max(0, net - headroomWh);
+      if (curtailed > 0) {
+        surplusWh += curtailed;
+        if (firstSurplusIndex === -1) firstSurplusIndex = i;
+        lastSurplusIndex = i;
       }
-      lastIndex = i;
     }
 
     if (surplusWh < minSurplusWh) return null;
     if (lastSurplusIndex === -1) return null; // no post-full curtailed surplus
 
-    const from = fullHour.time;
+    const from = this.lastPrediction[firstSurplusIndex].time;
     const to = this.lastPrediction[lastSurplusIndex].time;
     const windowHours = (to.getTime() - from.getTime()) / 3600000 + 1; // inclusive of both ends
     const suggestedLoadW =

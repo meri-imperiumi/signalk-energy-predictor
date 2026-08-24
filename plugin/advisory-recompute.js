@@ -53,6 +53,10 @@ const { sunPosition, nextSunset } = require("./solar.js");
  *        window to start
  * @param {boolean} [opts.underway=false] - Whether under way (disables
  *        night gating)
+ * @param {number} [opts.capacityWh=0] - Battery capacity in Wh, needed
+ *        to quantify surplus from hours that spill over from a partial SoC.
+ *        When 0/unknown, only hours that start with the bank already at 100%
+ *        count as surplus (a conservative under-count).
  * @returns {{surplusWh: number, from: Date, to: Date, suggestedLoadW: number}|null}
  */
 function recomputeSurplus(forecast, opts = {}) {
@@ -98,14 +102,21 @@ function recomputeSurplus(forecast, opts = {}) {
     }
   }
 
-  // Sum post-full energy that has nowhere to go, tracking headroom so a
-  // drawdown-then-refill isn't double-counted as surplus. Mirrors the live
-  // engine's headroom logic, including the absorption-tail headroom: the
-  // full hour is at >= fullThreshold (e.g. 0.95), not necessarily 1.0, so
-  // there's real absorption capacity left and the energy going into that
-  // tail isn't curtailed surplus (it's charging the bank).
+  // Surplus is *precisely* the production that would not be stored into
+  // the battery because SoC is at 100%: each hour, the bank can absorb
+  // (1.0 - socStartOfHour) * capacityWh before it's full, and any net yield
+  // beyond that is curtailed. We read socStartOfHour directly from the
+  // clamped track (the previous hour's idealSoC; the full hour's own
+  // idealSoC is end-of-hour, already clamped to 1.0). Using the track's SoC
+  // — rather than a parallel headroom state machine — makes the surplus
+  // exact: it is whatever the prediction's own SoC clamp threw away. This
+  // automatically handles the absorption tail (hours at 0.96/0.98… still
+  // absorb, so not surplus) and overnight drawdowns (clamped SoC drops, so
+  // next-morning solar has real headroom and refills, not surplus) without
+  // the over-counting of the old one-time tail grant.
+  const startSoC = forecast[0].idealSoC;
   let surplusWh = 0;
-  let headroom = Math.max(0, (1.0 - fullHour.idealSoC) * capacityWh);
+  let firstSurplusIndex = -1;
   let lastSurplusIndex = -1;
   for (let i = fullHourIndex; i < forecast.length; i++) {
     const p = forecast[i];
@@ -114,25 +125,30 @@ function recomputeSurplus(forecast, opts = {}) {
       (p.idealWindYieldWh || 0) +
       (p.alternatorWh || 0) -
       (p.houseLoadWh != null ? p.houseLoadWh : 0);
-    if (net < 0) {
-      // Discharging: creates headroom for later surplus to refill first
-      headroom = Math.min(headroom - net, capacityWh);
-      continue;
-    }
-    if (net === 0) continue;
-    // Net-positive: first fills headroom, only the excess is curtailed surplus
+    if (net <= 0) continue; // not producing → nothing to curtail
+    const socStartOfHour = i > 0 ? forecast[i - 1].idealSoC : startSoC;
+    // Headroom the bank can absorb before hitting 100%: (1.0 - socStartOfHour)
+    // * capacity. When capacity is unknown, the only case we can be certain
+    // about is a bank already at 1.0 (headroom 0) — anything below 1.0 has
+    // real headroom we can't quantify, so we conservatively treat it as no
+    // curtailment rather than risk over-counting (the prior bug).
+    const headroom =
+      socStartOfHour >= 1.0
+        ? 0
+        : capacityWh > 0
+          ? Math.max(0, (1.0 - socStartOfHour) * capacityWh)
+          : net; // unknown capacity → assume the whole hour absorbs
     const curtailed = Math.max(0, net - headroom);
     if (curtailed > 0) {
       surplusWh += curtailed;
+      if (firstSurplusIndex === -1) firstSurplusIndex = i;
       lastSurplusIndex = i;
     }
-    // The remainder fills headroom (refills the drawdown).
-    headroom = Math.max(0, headroom - net);
   }
 
   if (surplusWh < minSurplusWh || lastSurplusIndex < 0) return null;
 
-  const from = fullHourTime;
+  const from = new Date(forecast[firstSurplusIndex].time);
   const to = new Date(
     new Date(forecast[lastSurplusIndex].time).getTime() + 3600000,
   );

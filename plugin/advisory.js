@@ -8,7 +8,12 @@
 
 /** @typedef {import("@signalk/server-api").ServerAPI} ServerAPI */
 
-const { formatWh } = require("./format.js");
+const {
+  formatWh,
+  solarOffsetMinutesFromLongitude,
+  formatLocalHHMM,
+  formatLocalMonthDay,
+} = require("./format.js");
 const {
   calculateUrgency,
   urgencyToNotification,
@@ -57,69 +62,10 @@ const NOTIFICATIONS_BASE = "notifications.electrical.energy";
  */
 const DEBOUNCE_MS = 5 * 60 * 1000; // 5 minutes
 
-/**
- * Computes a solar (nautical) UTC offset in minutes from a longitude.
- *
- * Each 15° of longitude is one hour; the sign matches the convention that
- * east longitudes lead UTC (positive offset) and west longitudes lag (negative
- * offset). This is *solar* local time — what the crew experiences relative to
- * the sun — not civil zone time, which can differ by up to ~1h. It is used for
- * human-facing notification text only; all timestamps emitted as deltas stay
- * in UTC (ISO 8601).
- *
- * There is currently no "ship's time" / on-board local-clock source exposed
- * by Signal K, so longitude-derived solar-local is used as a stand-in. If
- * Signal K later exposes a vessel timezone or an explicit ship's-time offset,
- * callers should source the offset from there instead of this function — the
- * dedup keying and the `formatLocalHHMM` rendering are offset-agnostic and
- * only the offset value would change.
- *
- * Returns `null` when the longitude is unknown so callers can fall back to the
- * server's own timezone rendering.
- *
- * @param {number} longitude - Longitude in degrees (positive east)
- * @returns {number|null} Offset from UTC in minutes, or null
- */
-function solarOffsetMinutesFromLongitude(longitude) {
-  if (longitude == null || Number.isNaN(longitude)) return null;
-  // Round to the nearest whole minute so 25.0°E -> +01:40 exactly, and a
-  // vessel drifting a few hundred metres doesn't churn the rendered time.
-  return Math.round((longitude / 15) * 60);
-}
-
-/**
- * Formats a `Date` as `HH:MM` in solar-local time given a UTC offset in
- * minutes, using UTC getters against the shifted instant. This avoids any
- * dependency on the host's `Intl` timezone database (which on a UTC-locked
- * marine server would otherwise render everything in UTC).
- *
- * @param {Date} when - Instant to format
- * @param {number} [offsetMinutes=0] - Solar-local offset from UTC in minutes
- * @returns {string}
- */
-function formatLocalHHMM(when, offsetMinutes = 0) {
-  const shifted = new Date(when.getTime() + offsetMinutes * 60 * 1000);
-  const hh = String(shifted.getUTCHours()).padStart(2, "0");
-  const mm = String(shifted.getUTCMinutes()).padStart(2, "0");
-  return `${hh}:${mm}`;
-}
-
-/**
- * Formats a `Date`'s local calendar day as `Mon D` in solar-local time.
- *
- * @param {Date} when - Instant to format
- * @param {number} [offsetMinutes=0] - Solar-local offset from UTC in minutes
- * @returns {string}
- */
-function formatLocalMonthDay(when, offsetMinutes = 0) {
-  const shifted = new Date(when.getTime() + offsetMinutes * 60 * 1000);
-  const month = shifted.toLocaleString("en-US", {
-    month: "short",
-    timeZone: "UTC",
-  });
-  const day = shifted.getUTCDate();
-  return `${month} ${day}`;
-}
+// solarOffsetMinutesFromLongitude, formatLocalHHMM and formatLocalMonthDay
+// live in ./format.js (shared with the prediction engine, which builds the
+// deployment reason strings that end up in these notifications). Re-exported
+// below for existing callers.
 
 /**
  * Formats a surplus-window endpoint as `HH:MM`, adding a day marker when
@@ -305,6 +251,33 @@ class AdvisoryPublisher {
           displayName: "Time to empty",
           description:
             "Predicted time when the battery will be depleted, or null",
+          units: "timestamp",
+        },
+      },
+      {
+        path: `${PREDICTION_BASE}.surplusWh`,
+        value: {
+          displayName: "Surplus energy",
+          description:
+            "Forecast energy the charge controller would curtail because the battery is full while yield continues — available to run opportunistic loads. 0 when no surplus opportunity is forecast.",
+          units: "Wh",
+        },
+      },
+      {
+        path: `${PREDICTION_BASE}.surplus.from`,
+        value: {
+          displayName: "Surplus window start",
+          description:
+            "Start of the forecast surplus-energy window (the first hour that actually curtails energy), or null",
+          units: "timestamp",
+        },
+      },
+      {
+        path: `${PREDICTION_BASE}.surplus.to`,
+        value: {
+          displayName: "Surplus window end",
+          description:
+            "End of the forecast surplus-energy window (the last hour that curtails energy), or null",
           units: "timestamp",
         },
       },
