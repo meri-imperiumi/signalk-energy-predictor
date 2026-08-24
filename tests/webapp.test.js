@@ -87,7 +87,12 @@ test("chart fetches against the plugin API base used by ep-app", () => {
 });
 
 test("app clears the chart and events list together on window change", () => {
-  const source = readFileSync(path.join(PUBLIC_DIR, "ep-app.js"), "utf8");
+  // Normalize CRLF so the test is robust on Windows checkouts where the
+  // working tree may carry \r\n line endings despite .gitattributes.
+  const source = readFileSync(
+    path.join(PUBLIC_DIR, "ep-app.js"),
+    "utf8",
+  ).replace(/\r\n/g, "\n");
   // refresh() nulls both the chart and the actions (events) list up front so
   // the previous window's data doesn't linger while the new fetch is in flight
   assert.match(
