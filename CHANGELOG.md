@@ -24,6 +24,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `weather.apiBaseUrl` for reverse-proxy or remote-server setups.
 
 ### Fixed
+- The ideal-track solar yield no longer counts deployable arrays
+  (FLINsail) while the vessel is under way. `runPrediction`'s yield loop
+  previously applied only the gust gate, ignoring the per-hour ideal states
+  from `computeDeployableSolarStates` (which stow deployable solar under
+  way), so sailing in sub-limit gusts inflated `idealSoC` — skewing the
+  energy-outlook status optimistic and delaying or suppressing genset/engine
+  run recommendations (#11, #15 update #4). Fixed arrays are unaffected;
+  the detected track still models an actually-deployed array via its
+  skip-stow-gate path.
 - Forecast cache-hit logging no longer spams. `getForecast()` is called
   on the 15-minute prediction cycle *and* on every wind-protection
   learning run (throttled to 5 min), and each call logged when it served

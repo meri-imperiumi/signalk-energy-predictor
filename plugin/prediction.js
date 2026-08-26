@@ -2747,7 +2747,19 @@ class PredictionEngine {
           windGustMs,
           efficiency,
         });
-        idealSolarYieldWh += arrayYield;
+
+        // Ideal track: a deployable array only contributes in hours whose
+        // ideal state is "deployed". computeDeployableSolarStates stows
+        // deployable solar when the vessel is under way, in gusts, and
+        // before gusty nights — but its output previously fed only the
+        // hourly *actions*, never this yield sum, so the ideal track counted
+        // FLINsail Wh under way and inflated idealSoC (skewing the outlook
+        // status and suppressing the combustion run gates). Fixed arrays
+        // always count; under way the hydrogenerator covers generation.
+        const idealState = solarStatesPerHour[h]?.get(array.id);
+        if (array.type !== "deployable" || idealState?.state !== "stowed") {
+          idealSolarYieldWh += arrayYield;
+        }
 
         // Detected track models what each array actually produces given its
         // detected state: stowed -> no yield; actually deployed -> yield
