@@ -13,6 +13,7 @@ const {
   IngestionFSM,
   Tier,
   fetchOpenMeteo,
+  fetchLogbookCloudCover,
   isDegenerateForecast,
   OPEN_METEO_MAX_ATTEMPTS,
   DEFAULT_FORECAST_CACHE_HOURS,
@@ -845,6 +846,128 @@ test.describe("Offline forecast restore + staleness + uplink cadence", () => {
       );
     } finally {
       globalThis.fetch = origFetch;
+    }
+  });
+});
+
+test.describe("Same-server API auth and base URL (work doc #17)", () => {
+  const realFetch = globalThis.fetch;
+  const today = new Date().toISOString().split("T")[0];
+
+  function mockLogbookFetch({
+    entries = [{ observations: { cloudCoverage: 4 } }],
+  } = {}) {
+    const requests = [];
+    globalThis.fetch = async (url, init = {}) => {
+      requests.push({
+        url: String(url),
+        headers: { ...(init.headers || {}) },
+      });
+      if (new URL(String(url)).pathname.endsWith("/logs")) {
+        return { ok: true, json: async () => [today] };
+      }
+      return {
+        ok: true,
+        json: async () =>
+          entries.map((e, i) => ({
+            datetime: new Date(Date.now() - (i + 1) * 3600000).toISOString(),
+            ...e,
+          })),
+      };
+    };
+    return requests;
+  }
+
+  test("logbook fetch sends dual auth headers on both requests when token configured", async () => {
+    const requests = mockLogbookFetch();
+    try {
+      const readings = await fetchLogbookCloudCover(makeApp(), 48, {
+        apiToken: "tok-123",
+      });
+      assert.ok(readings.length > 0);
+      assert.strictEqual(requests.length, 2); // day list + day entries
+      for (const r of requests) {
+        assert.strictEqual(r.headers.Authorization, "Bearer tok-123");
+        assert.strictEqual(r.headers.Cookie, "JAUTHENTICATION=tok-123");
+      }
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  test("logbook fetch sends no auth headers without a token", async () => {
+    const requests = mockLogbookFetch();
+    try {
+      await fetchLogbookCloudCover(makeApp(), 48);
+      assert.ok(requests.length > 0);
+      for (const r of requests) {
+        assert.strictEqual(r.headers.Authorization, undefined);
+        assert.strictEqual(r.headers.Cookie, undefined);
+      }
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  test("base URL defaults to same-instance localhost, honors app port and override", async () => {
+    const urls = [];
+    globalThis.fetch = async (url) => {
+      urls.push(String(url));
+      if (new URL(String(url)).pathname.endsWith("/logs")) {
+        return { ok: true, json: async () => [] };
+      }
+      throw new Error("unexpected");
+    };
+    try {
+      await fetchLogbookCloudCover(makeApp(), 48);
+      assert.ok(urls[0].startsWith("http://localhost:3000/"));
+
+      urls.length = 0;
+      await fetchLogbookCloudCover(
+        { ...makeApp(), config: { port: 8080 } },
+        48,
+      );
+      assert.ok(urls[0].startsWith("http://localhost:8080/"));
+
+      urls.length = 0;
+      await fetchLogbookCloudCover(makeApp(), 48, {
+        apiBaseUrl: "http://192.168.2.105",
+      });
+      assert.ok(urls[0].startsWith("http://192.168.2.105/plugins/"));
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+  });
+
+  test("401 from server API is surfaced via app.error with a fix hint", async () => {
+    const errors = [];
+    const app = {
+      ...makeApp(),
+      error: (msg) => errors.push(msg),
+    };
+    const fsm = new IngestionFSM(app);
+    fsm.position = { latitude: 60.17, longitude: 24.94 };
+
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u.includes("open-meteo")) throw new Error("network down");
+      if (u.includes("signalk")) return { ok: false, status: 401 };
+      throw new Error("unexpected");
+    };
+    try {
+      const forecast = await fsm.fetchForecast();
+      // Falls through to Clear Sky, but the auth failure is visible.
+      assert.strictEqual(fsm.currentTier, Tier.CLEAR_SKY);
+      assert.ok(forecast.length > 0);
+      assert.strictEqual(errors.length, 1);
+      assert.match(errors[0], /401/);
+      assert.match(errors[0], /weather\.apiToken/);
+
+      // Logged once only — later fetches stay quiet until restart.
+      await fsm.fetchForecast();
+      assert.strictEqual(errors.length, 1);
+    } finally {
+      globalThis.fetch = realFetch;
     }
   });
 });

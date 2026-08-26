@@ -346,15 +346,68 @@ async function fetchOpenMeteo(
 }
 
 /**
+ * Resolves the base URL of this Signal K server's own REST API (work doc
+ * #17). The plugin normally runs on the same instance as the APIs it
+ * reads (Signal K Weather, signalk-logbook), so same-instance localhost over
+ * the server's own HTTP port is the default. An explicit override
+ * (`weather.apiBaseUrl`) wins — useful behind a reverse proxy or when reading
+ * another server. Note: signalk-server does not special-case loopback in its
+ * security settings, and there is no in-process "internal request"
+ * mechanism — reads go through the same auth-gated HTTP routes regardless.
+ *
+ * @param {ServerAPI} app
+ * @param {string|undefined} override - Configured base URL override, if any
+ * @returns {string} Base URL without a trailing slash
+ */
+function resolveApiBaseUrl(app, override) {
+  if (override && override.trim() !== "") {
+    return override.trim().replace(/\/+$/, "");
+  }
+  // `app.config` (the server's own settings) is not part of the typed
+  // ServerAPI but is present on signalk-server; fall back to the default
+  // port when it is not.
+  const port = app.config?.port ?? 3000;
+  return `http://localhost:${port}`;
+}
+
+/**
+ * Auth headers for this server's own REST API when security is enabled
+ * (work doc #17). Plugin routes (e.g. signalk-logbook, Signal K Weather)
+ * require an **Admin-level** token: granted via the device Access Request
+ * flow and approved with Admin permission — a readonly approval still
+ * yields 401. The server's auth gate reads the Authorization header; some
+ * plugin code reads the JAUTHENTICATION cookie, so both are sent (same
+ * pattern as signalk-dsc's logbook writer).
+ *
+ * @param {string|undefined} token - Admin-level device token, if configured
+ * @returns {Record<string, string>} Headers to merge into the fetch call
+ */
+function apiAuthHeaders(token) {
+  if (!token || token.trim() === "") return {};
+  return {
+    Authorization: `Bearer ${token}`,
+    Cookie: `JAUTHENTICATION=${token}`,
+  };
+}
+
+/**
  * Fetches forecast data from Signal K Weather API.
  *
  * @param {ServerAPI} app - Signal K server API
  * @param {number} latitude - Latitude in degrees
  * @param {number} longitude - Longitude in degrees
+ * @param {object} [opts]
+ * @param {string} [opts.apiBaseUrl] - Override for the same-server base URL
+ * @param {string} [opts.apiToken] - Admin-level token for auth-gated routes
  * @returns {Promise<ForecastPoint[]>} Array of forecast points
  */
-async function fetchSignalKWeather(app, latitude, longitude) {
-  const baseUrl = app.getSelfPath("system.host") || "http://localhost:3000";
+async function fetchSignalKWeather(
+  app,
+  latitude,
+  longitude,
+  { apiBaseUrl, apiToken } = {},
+) {
+  const baseUrl = resolveApiBaseUrl(app, apiBaseUrl);
   const url = new URL(`${baseUrl}/signalk/v2/api/weather/forecasts/point`);
   url.searchParams.set("lat", latitude.toString());
   url.searchParams.set("lon", longitude.toString());
@@ -366,10 +419,15 @@ async function fetchSignalKWeather(app, latitude, longitude) {
   try {
     const response = await fetch(url.toString(), {
       signal: controller.signal,
+      headers: apiAuthHeaders(apiToken),
     });
 
     if (!response.ok) {
-      throw new Error(`Signal K Weather API returned ${response.status}`);
+      const error = new Error(
+        `Signal K Weather API returned ${response.status}`,
+      );
+      error.status = response.status;
+      throw error;
     }
 
     const data = await response.json();
@@ -403,10 +461,17 @@ async function fetchSignalKWeather(app, latitude, longitude) {
  *
  * @param {ServerAPI} app - Signal K server API
  * @param {number} hoursBack - Hours to look back for logbook entries
+ * @param {object} [opts]
+ * @param {string} [opts.apiBaseUrl] - Override for the same-server base URL
+ * @param {string} [opts.apiToken] - Admin-level token for auth-gated routes
  * @returns {Promise<Array<{time: Date, cloudCover: number}>>} Cloud coverage readings
  */
-async function fetchLogbookCloudCover(app, hoursBack = 48) {
-  const baseUrl = app.getSelfPath("system.host") || "http://localhost:3000";
+async function fetchLogbookCloudCover(
+  app,
+  hoursBack = 48,
+  { apiBaseUrl, apiToken } = {},
+) {
+  const baseUrl = resolveApiBaseUrl(app, apiBaseUrl);
   const url = new URL(`${baseUrl}/plugins/signalk-logbook/logs`);
 
   const controller = new AbortController();
@@ -416,10 +481,13 @@ async function fetchLogbookCloudCover(app, hoursBack = 48) {
     // First, get list of days with entries
     const response = await fetch(url.toString(), {
       signal: controller.signal,
+      headers: apiAuthHeaders(apiToken),
     });
 
     if (!response.ok) {
-      throw new Error(`Logbook API returned ${response.status}`);
+      const error = new Error(`Logbook API returned ${response.status}`);
+      error.status = response.status;
+      throw error;
     }
 
     const days = await response.json();
@@ -440,6 +508,7 @@ async function fetchLogbookCloudCover(app, hoursBack = 48) {
       const dayUrl = new URL(`${url}/${day}`);
       const dayResponse = await fetch(dayUrl.toString(), {
         signal: controller.signal,
+        headers: apiAuthHeaders(apiToken),
       });
 
       if (dayResponse.ok) {
@@ -531,8 +600,18 @@ class IngestionFSM {
    *        them offline (same store/format as the historical backfill cache),
    *        and a cold-start/offline FSM can restore the last good forecast
    *        from it instead of falling straight to clear-sky (work doc #15).
+   * @param {string} [opts.apiBaseUrl] - Override for this server's own REST
+   *        API base URL (weather + logbook reads). Default: same-instance
+   *        `http://localhost:<server port>` (work doc #17).
+   * @param {string} [opts.apiToken] - Admin-level token used to authenticate
+   *        requests to this server's own auth-gated routes. Required when
+   *        server security is enabled; readonly approval is not enough
+   *        (work doc #17).
    */
-  constructor(app, { forecastHours, forecastCacheHours, dataDir } = {}) {
+  constructor(
+    app,
+    { forecastHours, forecastCacheHours, dataDir, apiBaseUrl, apiToken } = {},
+  ) {
     this.app = app;
     this.currentTier = Tier.OPEN_METEO;
     this.forecastHours = Math.min(
@@ -548,6 +627,15 @@ class IngestionFSM {
     this.position = { latitude: null, longitude: null };
     this.cachedCloudCover = []; // From logbook, used as fallback for future hours
     this.dataDir = dataDir || null;
+    this.apiBaseUrl = apiBaseUrl || "";
+    this.apiToken = apiToken || "";
+    /**
+     * Whether we've already logged the current API auth failure (401/403
+     * from the server's own routes). Logged once per FSM lifetime so the
+     * fallback chain's per-fetch catches don't spam; a config change
+     * (setting `weather.apiToken`) restarts the plugin and resets it.
+     */
+    this.announcedAuthFailure = false;
     /**
      * Uplink status driving fetch cadence (work doc #15 update #1). True if
      * internet is available (`network.internet.state` is `online` or
@@ -612,6 +700,30 @@ class IngestionFSM {
       this.lastOnlineFetchAttempt = 0;
     }
     return becameOnline;
+  }
+
+  /**
+   * Surfaces API auth failures (401/403) visibly instead of letting them
+   * disappear into the debug stream (work doc #17). On a server with
+   * security enabled, every same-server read (Signal K Weather, logbook)
+   * fails this way unless `weather.apiToken` carries an Admin-level device
+   * token — the FSM would otherwise silently degrade to Clear Sky. Logged
+   * via `app.error` once per FSM lifetime; other errors are left to the
+   * caller's normal debug logging.
+   *
+   * @param {string} where - Context label for the log message
+   * @param {Error & {status?: number}} error
+   */
+  noteApiAuthFailure(where, error) {
+    if (error?.status !== 401 && error?.status !== 403) return;
+    if (!this.announcedAuthFailure) {
+      this.announcedAuthFailure = true;
+      this.app.error?.(
+        `${where} got ${error.status} from this server's own API: security is blocking the read. ` +
+          `Set an Admin-level token in weather.apiToken (Signal K Access Request approved as Admin), or disable server security. ` +
+          `Falling back to lower weather tiers until then.`,
+      );
+    }
   }
 
   /**
@@ -685,14 +797,20 @@ class IngestionFSM {
 
       case Tier.SIGNAL_K_WEATHER: {
         this.app.debug("Signal K Weather: checking for plugin");
-        return await fetchSignalKWeather(this.app, latitude, longitude);
+        return await fetchSignalKWeather(this.app, latitude, longitude, {
+          apiBaseUrl: this.apiBaseUrl,
+          apiToken: this.apiToken,
+        });
       }
 
       case Tier.LOGBOOK: {
         this.app.debug("Logbook: reading recent cloud cover");
         // Logbook has no forward-looking data - use recent observed cloud
         // cover as a proxy and combine with sun position for a forecast
-        const cloudReadings = await fetchLogbookCloudCover(this.app, 48);
+        const cloudReadings = await fetchLogbookCloudCover(this.app, 48, {
+          apiBaseUrl: this.apiBaseUrl,
+          apiToken: this.apiToken,
+        });
         this.cachedCloudCover = cloudReadings;
         this.app.debug(
           `Logbook: got ${cloudReadings.length} cloud cover readings`,
@@ -859,6 +977,7 @@ class IngestionFSM {
       } catch (error) {
         // A failing tier (network error, timeout) must not abort the
         // fallback chain - try the next tier instead
+        this.noteApiAuthFailure(`Tier ${this.getTierName(tier)}`, error);
         this.app.debug(
           `Tier ${this.getTierName(tier)} failed: ${error.message}`,
         );
@@ -1065,7 +1184,10 @@ class IngestionFSM {
           this.cachedCloudCover[this.cachedCloudCover.length - 1].cloudCover;
         tier = Tier.LOGBOOK;
       } else {
-        const readings = await fetchLogbookCloudCover(this.app, 48);
+        const readings = await fetchLogbookCloudCover(this.app, 48, {
+          apiBaseUrl: this.apiBaseUrl,
+          apiToken: this.apiToken,
+        });
         this.cachedCloudCover = readings;
         if (readings.length > 0) {
           cloudCover = readings[readings.length - 1].cloudCover;
@@ -1073,6 +1195,7 @@ class IngestionFSM {
         }
       }
     } catch (error) {
+      this.noteApiAuthFailure("Stale hybrid: logbook", error);
       this.app.debug?.(`Stale hybrid: logbook unavailable: ${error.message}`);
     }
 

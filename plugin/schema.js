@@ -586,6 +586,20 @@ function buildPluginSchema() {
             minimum: 1,
             maximum: 168,
           },
+          apiBaseUrl: {
+            type: "string",
+            title: "Signal K API Base URL Override",
+            description:
+              "Where to reach this server's own REST API (Signal K Weather and signalk-logbook reads). Defaults to same-instance http://localhost:<server port>; set only when the server is behind a proxy or on another host.",
+            default: "",
+          },
+          apiToken: {
+            type: "string",
+            title: "Signal K API Access Token",
+            description:
+              "Admin-level device token used to authenticate this plugin's reads of its own server's API (Signal K Weather, signalk-logbook). Required when server security is enabled: submit a Signal K Access Request and approve it with Admin permission — a readonly approval still gets 401 on plugin routes.",
+            default: "",
+          },
         },
       },
       recording: {

@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Authenticated reads of this server's own API (work doc #17).** The
+  Signal K Weather API and signalk-logbook reads now authenticate when
+  server security is enabled: new `weather.apiToken` option (device
+  token from the Signal K Access Request flow, approved with **Admin**
+  permission — readonly approval still gets 401 on plugin routes) is sent
+  as both `Authorization: Bearer` and `JAUTHENTICATION` cookie, and a 401/403
+  is surfaced via `app.error` with a fix hint instead of silently degrading
+  to Clear Sky.
+
+### Changed
+- Same-server API base URL now defaults to
+  `http://localhost:<app.config.port>` (same instance as the plugin) instead
+  of the non-existent `system.host` Signal K path; overridable via the new
+  `weather.apiBaseUrl` for reverse-proxy or remote-server setups.
+
 ### Fixed
 - Forecast cache-hit logging no longer spams. `getForecast()` is called
   on the 15-minute prediction cycle *and* on every wind-protection
