@@ -378,6 +378,110 @@ test.describe("LoadProfile", () => {
   });
 });
 
+test.describe("LoadProfile surplus gating", () => {
+  const makeProfile = (isSurplusActive) =>
+    new LoadProfile({
+      config: { enabled: true },
+      getSelfPath: () => null,
+      app: { debug: () => {}, error: () => {} },
+      isSurplusActive,
+    });
+
+  test("gates samples when surplus mode is active (live detector)", () => {
+    const lp = makeProfile(() => true);
+    assert.strictEqual(lp.shouldGate(100, 50, "at-rest:day"), "surplus-mode");
+  });
+
+  test("does not gate when the detector is absent, false, or null", () => {
+    assert.strictEqual(
+      makeProfile(() => false).shouldGate(100, 50, "at-rest:day"),
+      null,
+    );
+    assert.strictEqual(
+      makeProfile(() => null).shouldGate(100, 50, "at-rest:day"),
+      null,
+    );
+    assert.strictEqual(
+      makeProfile(null).shouldGate(100, 50, "at-rest:day"),
+      null,
+    );
+  });
+
+  test("explicit surplusActive override gates ingestSample", () => {
+    const lp = makeProfile(null);
+    const gate = lp.ingestSample({
+      time: new Date("2026-08-26T20:00:00Z"),
+      dcLoadW: 100,
+      acLoadW: 50,
+      position: { latitude: 37.77, longitude: -122.42 },
+      stateClass: StateClass.AT_REST,
+      surplusActive: true,
+    });
+    assert.strictEqual(gate, "surplus-mode");
+  });
+
+  test("explicit override false wins over a true detector", () => {
+    const lp = makeProfile(() => true);
+    const gate = lp.ingestSample({
+      time: new Date("2026-08-26T20:00:00Z"),
+      dcLoadW: 100,
+      acLoadW: 50,
+      position: { latitude: 37.77, longitude: -122.42 },
+      stateClass: StateClass.AT_REST,
+      surplusActive: false,
+    });
+    assert.strictEqual(gate, null);
+  });
+
+  test("surplus samples are excluded from bins and rolling average", () => {
+    const lp = makeProfile(() => true);
+    lp.addSample(500, 0, { latitude: 37.77, longitude: -122.42 });
+    assert.strictEqual(lp.samples.length, 0); // rolling average untouched
+    assert.strictEqual(lp.bins.size, 0); // nothing learned
+
+    // After the surplus window closes, a baseline sample is learned normally
+    lp.isSurplusActive = () => false;
+    lp.addSample(100, 0, { latitude: 37.77, longitude: -122.42 });
+    assert.strictEqual(lp.samples.length, 1);
+    assert.strictEqual(lp.bins.size, 1);
+  });
+
+  test("getLoad stays uncontaminated by surplus-time elective draw", () => {
+    // 20:00Z at lon -122.42 is midday local — deterministic DAY phase
+    const position = { latitude: 37.77, longitude: -122.42 };
+    const lp = new LoadProfile({
+      config: { enabled: true, minDaysPerBin: 1 },
+      getSelfPath: () => null,
+      app: { debug: () => {}, error: () => {} },
+    });
+    // Two baseline days establish the at-rest:day bin at 100W
+    for (const day of ["2026-08-20", "2026-08-21"]) {
+      const gate = lp.ingestSample({
+        time: new Date(`${day}T20:00:00Z`),
+        dcLoadW: 100,
+        acLoadW: 0,
+        position,
+        stateClass: StateClass.AT_REST,
+        surplusActive: false,
+      });
+      assert.strictEqual(gate, null);
+    }
+    // A surplus-time watermaker run (5x the baseline) must not move it
+    const gate = lp.ingestSample({
+      time: new Date("2026-08-22T20:00:00Z"),
+      dcLoadW: 500,
+      acLoadW: 0,
+      position,
+      stateClass: StateClass.AT_REST,
+      surplusActive: true,
+    });
+    assert.strictEqual(gate, "surplus-mode");
+    const load = lp.getLoad(SunPhase.DAY, StateClass.AT_REST);
+    assert.ok(load, "bin should be ready (2 days, min 1)");
+    assert.strictEqual(load.dcWh, 100);
+  });
+});
+
 test.describe("unwrapPosition", () => {
   test("unwraps the app.getSelfPath form ({value: {latitude, longitude}})", () => {
     const pos = unwrapPosition({

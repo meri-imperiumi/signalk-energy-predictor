@@ -22,10 +22,10 @@ const {
 const BAT = { minSafeSoC: 0.2, capacityWh: 4800 };
 const ENGINES = [{ id: "main", name: "Engine", alternatorWatts: 100 }];
 
-function track(points) {
-  const now = Date.now();
+function track(points, now = Date.now()) {
+  const base = now instanceof Date ? now.getTime() : now;
   return points.map((p, i) => ({
-    time: new Date(now + i * 3600000).toISOString(),
+    time: new Date(base + i * 3600000).toISOString(),
     idealSoC: p.soc,
     idealSolarYieldWh: p.solar ?? 0,
     idealWindYieldWh: p.wind ?? 0,
@@ -158,20 +158,23 @@ test("recomputeAdvisories: returns all three types when conditions hold", () => 
   // A cycle that's full (surplus), dips below floor later (engine_run), and
   // has wind early covered by solar (stow_soon) — over a 24h track.
   const now = new Date("2026-08-23T12:00:00Z");
-  const f = track([
-    { soc: 1.0, solar: 300, wind: 200, net: 370, load: 130 }, // surplus + wind active
-    { soc: 1.0, solar: 400, wind: 200, net: 470, load: 130 },
-    { soc: 1.0, solar: 500, wind: 0, net: 370, load: 130 }, // wind stowed, still surplus
-    { soc: 0.9, solar: 100, wind: 0, net: -30, load: 130 }, // surplus window ends
-    { soc: 0.7, solar: 0, net: -130, load: 130 },
-    { soc: 0.5, solar: 0, net: -130, load: 130 },
-    { soc: 0.3, solar: 0, net: -130, load: 130 },
-    { soc: 0.2, solar: 0, net: -130, load: 130 }, // hits floor
-    { soc: 0.18, solar: 20, net: -110, load: 130 }, // dips below floor
-    { soc: 0.15, solar: 20, net: -110, load: 130 },
-    { soc: 0.12, solar: 20, net: -110, load: 130 },
-    { soc: 0.25, solar: 200, net: 70, load: 130 }, // recovering
-  ]);
+  const f = track(
+    [
+      { soc: 1.0, solar: 300, wind: 200, net: 370, load: 130 }, // surplus + wind active
+      { soc: 1.0, solar: 400, wind: 200, net: 470, load: 130 },
+      { soc: 1.0, solar: 500, wind: 0, net: 370, load: 130 }, // wind stowed, still surplus
+      { soc: 0.9, solar: 100, wind: 0, net: -30, load: 130 }, // surplus window ends
+      { soc: 0.7, solar: 0, net: -130, load: 130 },
+      { soc: 0.5, solar: 0, net: -130, load: 130 },
+      { soc: 0.3, solar: 0, net: -130, load: 130 },
+      { soc: 0.2, solar: 0, net: -130, load: 130 }, // hits floor
+      { soc: 0.18, solar: 20, net: -110, load: 130 }, // dips below floor
+      { soc: 0.15, solar: 20, net: -110, load: 130 },
+      { soc: 0.12, solar: 20, net: -110, load: 130 },
+      { soc: 0.25, solar: 200, net: 70, load: 130 }, // recovering
+    ],
+    now,
+  );
   const advisories = recomputeAdvisories(f, {
     cycleTime: now,
     minSafeSoC: BAT.minSafeSoC,
@@ -190,12 +193,15 @@ test("recomputeAdvisories: returns all three types when conditions hold", () => 
 
 test("recomputeAdvisories: writes recorded-shape surplus with structured fields", () => {
   const now = new Date("2026-08-23T12:00:00Z");
-  const f = track([
-    { soc: 1.0, solar: 300, net: 170, load: 130 },
-    { soc: 1.0, solar: 350, net: 220, load: 130 },
-    { soc: 1.0, solar: 400, net: 270, load: 130 },
-    { soc: 0.95, solar: 100, net: -30, load: 130 },
-  ]);
+  const f = track(
+    [
+      { soc: 1.0, solar: 300, net: 170, load: 130 },
+      { soc: 1.0, solar: 350, net: 220, load: 130 },
+      { soc: 1.0, solar: 400, net: 270, load: 130 },
+      { soc: 0.95, solar: 100, net: -30, load: 130 },
+    ],
+    now,
+  );
   const advisories = recomputeAdvisories(f, {
     cycleTime: now,
     minSafeSoC: BAT.minSafeSoC,

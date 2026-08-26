@@ -2081,6 +2081,10 @@ function replayLoadProfile({
       engineRunning: engineRunningAt(point, propulsionCols, columns),
       // Shore power isn't queried from history; treat as absent during replay
       shorePowerConnected: false,
+      // Surplus state isn't reconstructed from history (forecast windows
+      // aren't logged); pin it absent so the injected live detector — which
+      // reads the *current* window/load state — can't gate historical ticks.
+      surplusActive: false,
     });
 
     if (gate) {

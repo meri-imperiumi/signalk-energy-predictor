@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Surplus-mode gate for consumption learning (work doc #18).** Load
+  profile samples taken while a surplus opportunity is active — inside the
+  forecast surplus window, or with an instrumented elective load
+  (`surplus.opportunisticLoads[].statePath`) running — are no longer
+  learned as baseline consumption, and are also kept out of the
+  rolling-average fallback. Elective-load draw (watermaker, ice maker)
+  previously inflated the day bins, producing spurious deficit alerts and
+  suppressing the very surplus advisories that suggested running the loads.
+  Historical replay is unaffected (surplus state isn't reconstructed from
+  history yet).
 - **Authenticated reads of this server's own API (work doc #17).** The
   Signal K Weather API and signalk-logbook reads now authenticate when
   server security is enabled: new `weather.apiToken` option (device

@@ -106,6 +106,24 @@ function detectEngineRunning(pathValues) {
 }
 
 /**
+ * Checks whether a forecast surplus window is currently active.
+ *
+ * Used by the consumption-learning gate (LoadProfile's isSurplusActive
+ * detector): ticks inside the window are elective-load time, not baseline
+ * consumption, and must not be learned.
+ *
+ * @param {{from: Date, to: Date}|null} window - Last surplus window
+ *        (from findSurplusOpportunity), or null when none is forecast
+ * @param {Date} [now] - Current time (defaults to now; injectable for tests)
+ * @returns {boolean} True when now is within [from, to] inclusive
+ */
+function isInSurplusWindow(window, now = new Date()) {
+  if (!window) return false;
+  const t = now.getTime();
+  return t >= window.from.getTime() && t <= window.to.getTime();
+}
+
+/**
  * Builds the recorded `advisories` list for a prediction cycle from the
  * surplus/deficit/stowage opportunities. Each entry carries a stable
  * `type` ("surplus"/"engine"/"stowage"), the cycle timestamp, a
@@ -343,6 +361,9 @@ module.exports = (app) => {
 
   /** @type {AdvisoryPublisher|null} */
   let advisoryPublisher = null;
+
+  /** Last forecast surplus window, for the consumption-learning gate */
+  let lastSurplusWindow = null;
 
   /** @type {Recorder|null} */
   let recorder = null;
@@ -1397,6 +1418,11 @@ module.exports = (app) => {
               minSurplusWh: surplusConfig.minSurplusWh,
               maxLeadHours: surplusConfig.maxLeadHours,
             });
+
+      // Track the latest surplus window for the consumption-learning gate
+      // (LoadProfile's isSurplusActive detector): ticks inside the window
+      // are elective-load time, not baseline draw. null clears it.
+      lastSurplusWindow = surplusOpportunity;
 
       // Get unified deployment recommendations for all deployable systems
       const deploymentRecommendations =
@@ -2621,6 +2647,16 @@ module.exports = (app) => {
         // listing them twice in config). Configured engines remain the
         // fallback for exact-path probing.
         getEngineRunning: () => detectEngineRunning(deltaState),
+        // Surplus-mode detector for the consumption-learning gate
+        // (LoadProfile): inside a forecast surplus window, or with an
+        // instrumented elective load running, samples reflect opportunistic
+        // consumption rather than baseline draw. The load-running backstop
+        // catches loads run outside or past a forecast window.
+        isSurplusActive: () =>
+          isInSurplusWindow(lastSurplusWindow) ||
+          (pluginConfig?.surplus?.opportunisticLoads || []).some(
+            (load) => advisoryPublisher?.isLoadRunning(load) === true,
+          ),
         // Observed (live) wind gust in m/s — max of recent speed samples.
         // Reality overrides forecast for the current-hour stow verdict: a
         // real gust at the limit must drive a "stow now" even when the
@@ -2766,6 +2802,9 @@ module.exports = (app) => {
         recorder.stopPruneInterval();
         recorder = null;
       }
+
+      // Reset surplus-window tracking (consumption-learning gate)
+      lastSurplusWindow = null;
 
       // Unsubscribe from deltas
       for (const unsubscribe of unsubscribes) {

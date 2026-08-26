@@ -299,6 +299,11 @@ class LoadProfile {
    * @param {() => (boolean|null)} [params.getEngineRunning] - Dynamic
    *        engine-running detector (scans all propulsion instances); wins
    *        over the configured-engines fallback
+   * @param {() => (boolean|null)} [params.isSurplusActive] - Dynamic
+   *        surplus-mode detector: true when inside a forecast surplus
+   *        window or an instrumented elective load is running. Gates
+   *        learning like the engine/shore-power states — surplus-time
+   *        draw is elective, not baseline consumption
    */
   constructor({
     config = {},
@@ -306,6 +311,7 @@ class LoadProfile {
     app,
     engines,
     getEngineRunning,
+    isSurplusActive,
   } = {}) {
     // Configuration
     this.enabled = config.enabled !== false;
@@ -317,6 +323,7 @@ class LoadProfile {
     this.app = app;
     this.engines = engines || [];
     this.getEngineRunning = getEngineRunning || null;
+    this.isSurplusActive = isSurplusActive || null;
 
     // 8 bins: 2 state classes × 4 sun phases
     // Each bin tracks AC and DC separately
@@ -444,7 +451,7 @@ class LoadProfile {
    * @param {number} dcLoadW - DC load in watts
    * @param {number} acLoadW - AC load in watts
    * @param {string} binKey - Bin key for the sample
-   * @param {{shorePowerConnected?: boolean|null, engineRunning?: boolean|null}} [overrides] - Historical state overrides
+   * @param {{shorePowerConnected?: boolean|null, engineRunning?: boolean|null, surplusActive?: boolean|null}} [overrides] - Historical state overrides
    * @returns {string|null} Gate name if gated, null if should sample
    */
   shouldGate(dcLoadW, acLoadW, binKey, overrides = {}) {
@@ -457,6 +464,17 @@ class LoadProfile {
     const engineRunning = overrides.engineRunning ?? this.isEngineRunning();
     if (engineRunning === true) {
       return "engine-running";
+    }
+
+    // Surplus mode - drop tick. Elective loads (watermaker, ice maker, …)
+    // run on energy that would otherwise be curtailed, so their draw is
+    // not baseline consumption. Learning it inflates the bins, which both
+    // triggers spurious deficit alerts and suppresses future surplus
+    // advisories (the inflated load "consumes" the forecast headroom
+    // before the bank is forecast full).
+    const surplusActive = overrides.surplusActive ?? this.isSurplusActive?.();
+    if (surplusActive === true) {
+      return "surplus-mode";
     }
 
     // Spike/outlier gate (only check if we have an EMA value).
@@ -527,6 +545,17 @@ class LoadProfile {
    * @returns {void}
    */
   addSample(dcLoadW, acLoadW, position) {
+    // Surplus mode: skip the sample entirely. Elective-load draw must
+    // stay out of both the binned EMAs (gated in shouldGate) and the
+    // rolling-average fallback — the fallback feeds predictions until
+    // bins pass the min-days gate and would inflate them the same way.
+    if (this.isSurplusActive?.() === true) {
+      this.app?.debug?.(
+        `Load profile sample skipped: surplus mode (dc=${Math.round(dcLoadW)}W, ac=${Math.round(acLoadW)}W)`,
+      );
+      return;
+    }
+
     const now = new Date();
 
     // Track in rolling average (fallback)
@@ -568,6 +597,8 @@ class LoadProfile {
    * @param {string} params.stateClass - State class (underway or at-rest)
    * @param {boolean|null} [params.engineRunning] - Engine running at sample time
    * @param {boolean|null} [params.shorePowerConnected] - Shore power at sample time
+   * @param {boolean|null} [params.surplusActive] - Surplus mode at sample
+   *        time (inside a surplus window or elective load running)
    * @returns {string|null} Gate name if the sample was gated, null if ingested
    */
   ingestSample({
@@ -578,6 +609,7 @@ class LoadProfile {
     stateClass,
     engineRunning = null,
     shorePowerConnected = null,
+    surplusActive = null,
   }) {
     if (!this.enabled) {
       return null;
@@ -589,6 +621,7 @@ class LoadProfile {
     const gate = this.shouldGate(dcLoadW, acLoadW, binKey, {
       engineRunning,
       shorePowerConnected,
+      surplusActive,
     });
     if (gate) {
       this.app?.debug?.(
@@ -951,6 +984,9 @@ class PredictionEngine {
    * @param {() => (boolean|null)} [params.getEngineRunning] - Dynamic
    *        engine-running detector (scans all propulsion instances,
    *        whatever their names); wins over configured-engine probing
+   * @param {() => (boolean|null)} [params.isSurplusActive] - Dynamic
+   *        surplus-mode detector, passed through to the LoadProfile
+   *        learning gate (see LoadProfile)
    * @param {object} [params.combustionConfig] - Per-tier reluctance settings
    *        (`{genset: {...}, engine: {...}}`); see plugin/combustion.js
    * @param {(arrayId: string, isSailing: boolean, azimuth: number, elevation: number, awa?: number) => number} getEfficiency - Function to get efficiency from learning matrix
@@ -970,6 +1006,7 @@ class PredictionEngine {
     engines,
     combustionConfig,
     getEngineRunning,
+    isSurplusActive,
     getObservedGustMs,
     getEfficiency,
     getSelfPath,
@@ -1041,6 +1078,7 @@ class PredictionEngine {
       app,
       engines: this.engines,
       getEngineRunning,
+      isSurplusActive,
     });
     this.lastPrediction = [];
     /** Raw (pre-WPF) forecast from the last run, for publishing raw values */
