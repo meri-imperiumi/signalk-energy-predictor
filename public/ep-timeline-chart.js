@@ -840,7 +840,13 @@ class EpTimelineChart extends HTMLElement {
       if (this.tooltip) this.tooltip.style.display = "none";
     });
 
-    this.appendChild(svg);
+    // Scroll wrapper: the card itself must not become a scroll container
+    // (its corner brackets extend outside the box and would add phantom
+    // vertical overflow), so horizontal panning happens in this div
+    const scroll = document.createElement("div");
+    scroll.className = "ep-chart-scroll";
+    scroll.appendChild(svg);
+    this.appendChild(scroll);
 
     // Legend
     const legend = document.createElement("div");

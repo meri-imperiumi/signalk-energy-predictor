@@ -351,7 +351,15 @@ ep-headline-figures .figure .sub {
 ep-timeline-chart {
   display: block;
   padding: 8px;
+}
+
+/* Horizontal pan for the chart on narrow screens lives in an inner
+ * wrapper (not on the card itself): a scroll container would compute
+ * overflow-y: auto and the .sk-card corner brackets, which extend 2px
+ * outside the box, would become 2px of scrollable vertical overflow. */
+.ep-chart-scroll {
   overflow-x: auto;
+  overflow-y: hidden;
 }
 
 .ep-chart-svg {
@@ -519,11 +527,15 @@ ul.ep-actions-list {
 }
 
 .ep-action-advisory[data-advisory="surplus"] .ep-action-badge {
-  color: var(--color-orange);
+  /* Surplus is an opportunity (run elective loads), not a problem —
+   * same teal as recommendations */
+  color: var(--color-teal);
 }
 
 .ep-action-advisory[data-advisory="stow_soon"] .ep-action-badge {
-  color: var(--color-teal);
+  /* Stow drag soon: performance penalty if ignored — orange, not the
+   * teal opportunity color */
+  color: var(--color-orange);
 }
 
 /* A surplus/deficit advisory a newer forecast overtook (the crew acted on

@@ -404,6 +404,84 @@ test("headline figure cards fit the app shell on one line", () => {
   );
 });
 
+test("chart pans horizontally in an inner wrapper, not the card", () => {
+  const css = readFileSync(path.join(PUBLIC_DIR, "styles.css"), "utf8");
+  const js = readFileSync(
+    path.join(PUBLIC_DIR, "ep-timeline-chart.js"),
+    "utf8",
+  );
+  // The wrapper owns the horizontal scroll…
+  const wrapper = css.match(/\.ep-chart-scroll\s*\{[\s\S]*?\n\}/);
+  assert.ok(wrapper, ".ep-chart-scroll rules must exist");
+  assert.match(wrapper[0], /overflow-x: auto/);
+  assert.match(wrapper[0], /overflow-y: hidden/);
+  // …while the card element itself must stay overflow-free: a scroll
+  // container computes overflow-y: auto, and the sk-card corner brackets
+  // (offset -2px outside the box) would turn into phantom vertical scroll
+  const card = css.match(/ep-timeline-chart\s*\{[\s\S]*?\n\}/);
+  assert.ok(card, "ep-timeline-chart rules must exist");
+  assert.doesNotMatch(card[0], /overflow/);
+  // The SVG is mounted inside the wrapper
+  assert.match(js, /className = "ep-chart-scroll"/);
+  assert.match(js, /scroll\.appendChild\(svg\)/);
+});
+
+test("events console badge colors follow the semantic contract", () => {
+  const css = readFileSync(path.join(PUBLIC_DIR, "styles.css"), "utf8");
+  /**
+   * The events pseudo-console maps every event kind to a status color
+   * (spec §9 semantics: green OK, teal opportunity, orange warn, red
+   * problem, grey unknown):
+   *  - detected        → green: factual, normal-operation state change
+   *  - recommended     → teal: actionable opportunity (deploy/stow for
+   *                      yield)
+   *  - surplus         → teal: opportunity (run elective loads)
+   *  - engine/genset   → red: deficit problem (battery won't make it)
+   *  - stow_soon       → orange: warn (drag penalty / hardware
+   *                      protection if ignored)
+   *  - other advisories→ orange: generic warn
+   *  - unknown badge   → grey (base rule)
+   * @type {Array<[RegExp, string]>} badge-rule block → expected color
+   */
+  const contract = [
+    [
+      /\.ep-action-detected\s+\.ep-action-badge\s*\{[\s\S]*?\n\}/,
+      "--color-green",
+    ],
+    [
+      /\.ep-action-recommended\s+\.ep-action-badge\s*\{[\s\S]*?\n\}/,
+      "--color-teal",
+    ],
+    [/\[data-advisory="engine_run"\][\s\S]*?\{[\s\S]*?\n\}/, "--color-red"],
+    [
+      /\[data-advisory="surplus"\]\s*\.ep-action-badge\s*\{[\s\S]*?\n\}/,
+      "--color-teal",
+    ],
+    [
+      /\[data-advisory="stow_soon"\]\s*\.ep-action-badge\s*\{[\s\S]*?\n\}/,
+      "--color-orange",
+    ],
+    [
+      /\.ep-action-advisory\s+\.ep-action-badge\s*\{[\s\S]*?\n\}/,
+      "--color-orange",
+    ],
+  ];
+  for (const [pattern, color] of contract) {
+    const block = css.match(pattern);
+    assert.ok(block, `badge rules for ${pattern.source} must exist`);
+    assert.match(
+      block[0],
+      new RegExp(color),
+      `${pattern.source.split("\\s")[0]} must use ${color}`,
+    );
+  }
+  // Opportunity kinds must NOT read as problems
+  const surplus = css.match(
+    /\[data-advisory="surplus"\]\s*\.ep-action-badge\s*\{[\s\S]*?\n\}/,
+  )[0];
+  assert.doesNotMatch(surplus, /--color-(orange|red)/);
+});
+
 test("app drives day/night theme and offline state from the stream", () => {
   const app = readFileSync(path.join(PUBLIC_DIR, "ep-app.js"), "utf8");
   const stream = readFileSync(
