@@ -334,3 +334,90 @@ test("headline figures show hydro yield", () => {
   assert.match(source, /Hydro yield/);
   assert.match(source, /yield\?\.hydro\?\.totalWh/);
 });
+
+test("webapp follows the tactical console theme spec", () => {
+  const css = readFileSync(path.join(PUBLIC_DIR, "styles.css"), "utf8");
+  // Day/night intensity shifting via data-mode on the document root
+  assert.match(css, /:root\[data-mode="night"\]/);
+  assert.match(css, /--bg-base: #080a0c/);
+  // Flat geometry: every border-radius is zero
+  const radii = css.match(/border-radius:\s*([^;]+);/g) || [];
+  assert.ok(radii.length > 0, "styles must not be empty of rules");
+  for (const r of radii) {
+    assert.match(r, /border-radius:\s*0/, "border-radius must be 0");
+  }
+  // Corner brackets via pseudo-elements on cards
+  assert.match(css, /\.sk-card::before[\s\S]*border-top: 2px solid/);
+  assert.match(css, /\.sk-card::after[\s\S]*border-bottom: 2px solid/);
+  // Theme classes set the local --theme-color
+  for (const t of ["green", "teal", "orange", "red", "offline"]) {
+    assert.match(css, new RegExp(`\\.theme-${t}\\s*\\{`));
+  }
+  // Monospace data font + tabular numerals for telemetry values
+  assert.match(css, /--font-data: ui-monospace/);
+  assert.match(css, /font-variant-numeric: tabular-nums/);
+  // Extended chart palette carries night variants so the timeline keeps
+  // its extra series colors in both modes
+  for (const s of ["solar", "wind", "hydro", "load", "soc", "gust"]) {
+    assert.match(css, new RegExp(`--series-${s}:`));
+  }
+  const nightBlock = css.match(/:root\[data-mode="night"\]\s*\{[\s\S]*?\n\}/);
+  assert.ok(nightBlock, "night mode block must exist");
+  assert.match(nightBlock[0], /--series-solar: #8a5318/);
+});
+
+test("chart series colors come from theme CSS variables", () => {
+  const source = readFileSync(
+    path.join(PUBLIC_DIR, "ep-timeline-chart.js"),
+    "utf8",
+  );
+  // No hardcoded hex series colors remain; strokes/fills resolve via
+  // var() inline styles (presentation attributes cannot resolve vars)
+  assert.match(source, /var\(--series-solar\)/);
+  assert.match(source, /var\(--series-hydro\)/);
+  assert.doesNotMatch(source, /#[0-9a-f]{6}/i);
+});
+
+test("headline figure cards fit the app shell on one line", () => {
+  const css = readFileSync(path.join(PUBLIC_DIR, "styles.css"), "utf8");
+  const figures = readFileSync(
+    path.join(PUBLIC_DIR, "ep-headline-figures.js"),
+    "utf8",
+  );
+  // Card count: the figure() calls in the summary render path (the
+  // null-summary fallback adds one "Summary" card, not more)
+  const cards = (figures.match(/^\s{6}this\.figure\(/gm) || []).length;
+  assert.ok(cards >= 7, "expected the summary figures to render");
+  const grid = css.match(
+    /ep-headline-figures\s*\{[\s\S]*?grid-template-columns:\s*([^;]+);[\s\S]*?gap:\s*([^;]+);/,
+  );
+  assert.ok(grid, "headline figures grid rules must exist");
+  const min = Number(/minmax\(min\((\d+)px/.exec(grid[1])?.[1]);
+  const gap = Number(/(\d+)px/.exec(grid[2])?.[1]);
+  assert.ok(Number.isFinite(min) && Number.isFinite(gap));
+  // ep-app caps the shell at 1100px; every card's minimum track plus the
+  // gaps between them must fit that width so auto-fit keeps one row
+  const shell = 1100;
+  assert.ok(
+    cards * min + (cards - 1) * gap <= shell,
+    `${cards} cards × ${min}px + ${cards - 1} × ${gap}px gap must fit ${shell}px`,
+  );
+});
+
+test("app drives day/night theme and offline state from the stream", () => {
+  const app = readFileSync(path.join(PUBLIC_DIR, "ep-app.js"), "utf8");
+  const stream = readFileSync(
+    path.join(PUBLIC_DIR, "ep-signalk-stream.js"),
+    "utf8",
+  );
+  // Stream: environment.mode subscription + exponential backoff
+  assert.match(stream, /environment\.mode/);
+  assert.match(stream, /minPeriod/);
+  assert.match(stream, /RECONNECT_MAX/);
+  // App: applies data-mode and shows a connection chip
+  assert.match(app, /dataset\.mode = mode === "night" \? "night" : "day"/);
+  assert.match(app, /\[ LIVE \]/);
+  assert.match(app, /\[ OFFLINE \]/);
+  const html = readFileSync(path.join(PUBLIC_DIR, "index.html"), "utf8");
+  assert.match(html, /data-mode="day"/, "index defaults to a theme pre-JS");
+});

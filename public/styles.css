@@ -1,30 +1,116 @@
+/*
+ * Energy Predictor webapp — tactical console theme.
+ *
+ * Follows the Lille Ø Signal K UI spec: flat geometry, 2px corner
+ * brackets, dark canvas in both day and night modes, day/night
+ * intensity shifting via `data-mode` on the document root. The chart
+ * needs more series colors than the spec's semantic set supplies, so
+ * the palette is extended (--series-*, --color-blue, --color-violet)
+ * with the same saturation/brightness family per mode.
+ *
+ * This sheet is linked both at document level (index.html) and inside
+ * <ep-app>'s shadow root: :root rules are effective at document level
+ * (custom properties then inherit into the shadow tree), while the
+ * component rules apply inside the shadow root where the components
+ * live.
+ */
+
 :root {
-  --bg-color: #12141d;
-  --panel-bg: #1b1e2b;
-  --text-color: #e8eaf0;
-  --muted-color: #8a90a3;
-  --border-color: #2a2f42;
-  --accent-color: #4f7cff;
-  --solar-color: #f5b942;
-  --wind-color: #26c6aa;
-  --hydro-color: #4fc3f7;
-  --load-color: #ef5b7b;
-  --soc-color: #9ccc65;
-  --gust-wind-color: #b39ddb;
-  --predicted-opacity: 0.55;
+  color-scheme: dark;
+
+  /* Base canvas (constant across modes) */
+  --bg-base: #080a0c;
+  --bg-panel: #111414;
+  --bg-panel-muted: #0a0c0c;
+
+  /* Semantic colors (day defaults; night overrides below).
+   * RGB triplets feed the faint borders/tints of .theme-* cards. */
+  --color-green: #8dfcbb;
+  --color-green-rgb: 141, 252, 187;
+  --color-teal: #66c6db;
+  --color-teal-rgb: 102, 198, 219;
+  --color-orange: #fca847;
+  --color-orange-rgb: 252, 168, 71;
+  --color-red: #ff5e5e;
+  --color-red-rgb: 255, 94, 94;
+  --color-grey: #666666;
+  --color-grey-rgb: 102, 102, 102;
+
+  /* Extended palette for the timeline chart series (day). */
+  --color-blue: #7aa9ff;
+  --color-blue-rgb: 122, 169, 255;
+  --color-violet: #b48dfc;
+  --color-violet-rgb: 180, 141, 252;
+
+  --series-solar: #fca847;
+  --series-wind: #66c6db;
+  --series-hydro: #7aa9ff;
+  --series-load: #ff5e5e;
+  --series-soc: #8dfcbb;
+  --series-gust: #b48dfc;
+
+  /* Chart furniture */
+  --chart-grid: rgba(160, 160, 181, 0.16);
+  --chart-axis: rgba(160, 160, 181, 0.3);
+
+  --text-main: #ffffff;
+  --text-muted: #a0a0b5;
+
+  --font-ui: system-ui, -apple-system, sans-serif;
+  --font-data: ui-monospace, "Fira Code", monospace;
+
+  --predicted-opacity: 0.75;
+
+  /* Default theme so plain cards still get framed */
+  --theme-color: var(--color-teal);
+  --theme-color-rgb: var(--color-teal-rgb);
+}
+
+/* Night mode (tactical/dimmed): same canvas, dimmed semantic colors to
+ * protect rhodopsin. Applied passively from the Signal K
+ * environment.mode delta by ep-app. */
+:root[data-mode="night"] {
+  --color-green: #4a7555;
+  --color-green-rgb: 74, 117, 85;
+  --color-teal: #33616b;
+  --color-teal-rgb: 51, 97, 107;
+  --color-orange: #8a5318;
+  --color-orange-rgb: 138, 83, 24;
+  --color-red: #8f3333;
+  --color-red-rgb: 143, 51, 51;
+  --color-grey: #333333;
+  --color-grey-rgb: 51, 51, 51;
+
+  --color-blue: #3c5a8f;
+  --color-blue-rgb: 60, 90, 143;
+  --color-violet: #584a75;
+  --color-violet-rgb: 88, 74, 117;
+
+  --series-solar: #8a5318;
+  --series-wind: #33616b;
+  --series-hydro: #3c5a8f;
+  --series-load: #8f3333;
+  --series-soc: #4a7555;
+  --series-gust: #584a75;
+
+  --chart-grid: rgba(102, 102, 119, 0.14);
+  --chart-axis: rgba(102, 102, 119, 0.3);
+
+  --text-main: #c4c4c4;
+  --text-muted: #666677;
 }
 
 * {
   box-sizing: border-box;
   margin: 0;
   padding: 0;
+  border-radius: 0;
 }
 
 body {
-  font-family:
-    -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-  background-color: var(--bg-color);
-  color: var(--text-color);
+  font-family: var(--font-ui);
+  background-color: var(--bg-base);
+  color: var(--text-main);
   line-height: 1.5;
   padding: 16px;
 }
@@ -34,6 +120,83 @@ ep-app {
   max-width: 1100px;
   margin: 0 auto;
 }
+
+/* The same stylesheet is linked inside the shadow root, where :root
+ * cannot match; :host covers the app shell there. */
+:host {
+  display: block;
+  max-width: 1100px;
+  margin: 0 auto;
+  font-family: var(--font-ui);
+}
+
+/* --- Theme classes: local --theme-color + ultra-faint tint ---------- */
+
+.theme-green {
+  --theme-color: var(--color-green);
+  --theme-color-rgb: var(--color-green-rgb);
+}
+.theme-teal {
+  --theme-color: var(--color-teal);
+  --theme-color-rgb: var(--color-teal-rgb);
+}
+.theme-orange {
+  --theme-color: var(--color-orange);
+  --theme-color-rgb: var(--color-orange-rgb);
+}
+.theme-red {
+  --theme-color: var(--color-red);
+  --theme-color-rgb: var(--color-red-rgb);
+}
+.theme-grey {
+  --theme-color: var(--color-grey);
+  --theme-color-rgb: var(--color-grey-rgb);
+}
+.theme-blue {
+  --theme-color: var(--color-blue);
+  --theme-color-rgb: var(--color-blue-rgb);
+}
+.theme-violet {
+  --theme-color: var(--color-violet);
+  --theme-color-rgb: var(--color-violet-rgb);
+}
+.theme-offline {
+  --theme-color: var(--color-grey);
+  --theme-color-rgb: var(--color-grey-rgb);
+}
+
+/* --- Panel framing: 2px corner brackets + faint inner border -------- */
+
+.sk-card {
+  position: relative;
+  border: 1px solid rgba(var(--theme-color-rgb), 0.3);
+  background: rgba(var(--theme-color-rgb), 0.05);
+}
+
+.sk-card::before,
+.sk-card::after {
+  content: "";
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  pointer-events: none;
+}
+
+.sk-card::before {
+  top: -2px;
+  left: -2px;
+  border-top: 2px solid var(--theme-color);
+  border-left: 2px solid var(--theme-color);
+}
+
+.sk-card::after {
+  bottom: -2px;
+  right: -2px;
+  border-bottom: 2px solid var(--theme-color);
+  border-right: 2px solid var(--theme-color);
+}
+
+/* --- App header ----------------------------------------------------- */
 
 .ep-header {
   display: flex;
@@ -45,14 +208,34 @@ ep-app {
 }
 
 .ep-header h1 {
-  font-size: 1.4rem;
-  font-weight: 600;
+  font-size: 1.1rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--color-teal);
+}
+
+.ep-title {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.ep-conn-chip {
+  font-family: var(--font-data);
+  font-size: 0.8rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--theme-color);
 }
 
 .ep-error {
-  color: var(--load-color);
-  font-size: 0.9rem;
+  color: var(--color-red);
+  font-family: var(--font-data);
+  font-size: 0.85rem;
   min-height: 1.4em;
+  width: 100%;
 }
 
 /* Reserved for the future status panel (work doc #8 v1 non-goal) */
@@ -60,98 +243,157 @@ ep-app {
   display: none;
 }
 
+/* --- Window selector: hardware button row --------------------------- */
+
 ep-window-selector {
   display: flex;
-  align-items: center;
+  align-items: stretch;
   gap: 8px;
   margin-bottom: 12px;
   flex-wrap: wrap;
 }
 
 ep-window-selector button {
-  background: var(--panel-bg);
-  color: var(--text-color);
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-  padding: 6px 12px;
+  appearance: none;
+  background: transparent;
+  color: var(--color-teal);
+  border: 1px solid var(--color-teal);
+  border-radius: 0;
+  padding: 6px 14px;
+  min-height: 48px;
+  min-width: 48px;
   cursor: pointer;
-  font-size: 0.9rem;
+  font-family: var(--font-data);
+  font-size: 0.85rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+ep-window-selector button:hover,
+ep-window-selector button:active {
+  background: var(--color-teal);
+  color: var(--bg-base);
 }
 
 ep-window-selector button[aria-pressed="true"] {
-  background: var(--accent-color);
-  border-color: var(--accent-color);
+  background: var(--color-teal);
+  color: var(--bg-base);
 }
 
 ep-window-selector button.nav {
-  padding: 6px 10px;
+  padding: 6px 12px;
+  font-size: 1rem;
 }
 
 ep-window-selector input[type="date"] {
-  background: var(--panel-bg);
-  color: var(--text-color);
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
-  padding: 5px 8px;
+  appearance: none;
+  background: transparent;
+  color: var(--text-main);
+  border: none;
+  border-bottom: 2px solid var(--color-grey);
+  border-radius: 0;
+  padding: 4px 2px;
+  min-height: 48px;
+  font-family: var(--font-data);
   font-size: 0.9rem;
+  font-variant-numeric: tabular-nums;
 }
 
+ep-window-selector input[type="date"]:focus {
+  outline: none;
+  border-bottom-color: var(--color-teal);
+}
+
+/* --- Headline figures ------------------------------------------------ */
+
 ep-headline-figures {
+  /* Seven figure cards must fit the 1100px shell on one line:
+   * 7×140 + 6×8 = 1028px, with headroom for the 1fr tracks to stretch.
+   * Keep (card count × min + gaps × 6) ≤ 1100 when adding cards or
+   * growing the gap/min here. */
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(min(140px, 100%), 1fr));
   gap: 8px;
-  margin-bottom: 12px;
+  margin-bottom: 14px;
 }
 
 ep-headline-figures .figure {
-  background: var(--panel-bg);
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
   padding: 10px 12px;
 }
 
 ep-headline-figures .figure .label {
-  font-size: 0.75rem;
+  font-size: 0.7rem;
+  font-weight: 700;
   text-transform: uppercase;
-  letter-spacing: 0.05em;
-  color: var(--muted-color);
+  letter-spacing: 0.08em;
+  color: var(--theme-color);
 }
 
 ep-headline-figures .figure .value {
-  font-size: 1.25rem;
-  font-weight: 600;
+  font-family: var(--font-data);
+  font-size: clamp(1.25rem, 1rem + 1vw, 1.5rem);
+  font-weight: 700;
+  color: var(--text-main);
+  font-variant-numeric: tabular-nums;
+  line-height: 1.25;
+  margin: 2px 0;
 }
 
 ep-headline-figures .figure .sub {
-  font-size: 0.8rem;
-  color: var(--muted-color);
+  font-family: var(--font-data);
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
 }
+
+/* --- Timeline chart -------------------------------------------------- */
 
 ep-timeline-chart {
   display: block;
-  background: var(--panel-bg);
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
   padding: 8px;
+  overflow-x: auto;
+}
+
+.ep-chart-svg {
+  display: block;
+  width: 100%;
+  min-width: 640px;
+}
+
+.ep-chart-svg text {
+  fill: var(--text-muted);
+  font-family: var(--font-data);
+  font-size: 11px;
 }
 
 .ep-legend {
   display: flex;
   flex-wrap: wrap;
-  gap: 10px;
-  padding: 6px 8px;
-  font-size: 0.85rem;
+  gap: 4px 14px;
+  padding: 8px 6px 4px;
 }
 
 .ep-legend button {
+  appearance: none;
   background: none;
   border: none;
-  color: var(--muted-color);
+  border-radius: 0;
+  color: var(--text-muted);
   cursor: pointer;
-  padding: 2px 4px;
+  padding: 6px 4px;
+  min-height: 48px;
   display: flex;
   align-items: center;
   gap: 6px;
+  font-family: var(--font-data);
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+
+.ep-legend button:hover,
+.ep-legend button:active {
+  color: var(--text-main);
 }
 
 .ep-legend button.off {
@@ -162,114 +404,126 @@ ep-timeline-chart {
 .ep-legend .swatch {
   width: 12px;
   height: 12px;
-  border-radius: 3px;
+  border-radius: 0;
   display: inline-block;
+  flex-shrink: 0;
 }
 
 .ep-legend .swatch.predicted {
   opacity: var(--predicted-opacity);
 }
 
-.ep-chart-svg text {
-  fill: var(--muted-color);
-  font-size: 11px;
-}
-
 .ep-tooltip {
   position: absolute;
   pointer-events: none;
-  background: var(--bg-color);
-  border: 1px solid var(--border-color);
-  border-radius: 6px;
+  background-color: rgba(17, 20, 20, 0.9);
+  border: 1px solid rgba(var(--theme-color-rgb), 0.4);
+  border-radius: 0;
   padding: 6px 10px;
-  font-size: 0.8rem;
+  font-family: var(--font-data);
+  font-size: 0.75rem;
+  font-variant-numeric: tabular-nums;
   white-space: nowrap;
   display: none;
   z-index: 10;
 }
 
 .ep-tooltip .time {
-  color: var(--muted-color);
+  color: var(--text-muted);
   margin-bottom: 2px;
 }
 
 .ep-loading {
-  color: var(--muted-color);
+  color: var(--text-muted);
+  font-family: var(--font-data);
+  font-size: 0.85rem;
   padding: 24px;
   text-align: center;
 }
 
+/* --- Events console (pseudo-terminal) -------------------------------- */
+
 ep-actions-list {
   display: block;
-  background: var(--panel-bg);
-  border: 1px solid var(--border-color);
-  border-radius: 8px;
-  padding: 10px 12px;
-  margin-top: 12px;
+  padding: 10px 14px;
+  margin-top: 14px;
 }
 
 .ep-actions-header {
-  font-size: 0.9rem;
-  font-weight: 600;
-  margin-bottom: 6px;
-  color: var(--text-color);
+  font-size: 0.85rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--theme-color);
+  margin-bottom: 8px;
 }
 
-.ep-actions-list {
+ul.ep-actions-list {
   list-style: none;
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 2px;
 }
 
 .ep-action {
-  display: flex;
+  display: grid;
+  grid-template-columns: 6.5em 1fr auto;
   align-items: baseline;
-  flex-wrap: wrap;
-  gap: 6px;
-  font-size: 0.85rem;
-  padding: 3px 0;
+  column-gap: 10px;
+  font-family: var(--font-data);
+  font-size: 0.8rem;
+  padding: 4px 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.ep-action-time {
+  color: var(--text-muted);
+}
+
+.ep-action-text {
+  color: var(--text-main);
 }
 
 .ep-action-badge {
+  justify-self: end;
   font-size: 0.7rem;
   text-transform: uppercase;
-  letter-spacing: 0.05em;
-  padding: 1px 5px;
-  border-radius: 4px;
-  border: 1px solid var(--border-color);
-  color: var(--muted-color);
-  flex-shrink: 0;
+  letter-spacing: 0.1em;
+  color: var(--color-grey);
+  white-space: nowrap;
+}
+
+.ep-action-badge::before {
+  content: "[ ";
+}
+
+.ep-action-badge::after {
+  content: " ]";
 }
 
 .ep-action-detected .ep-action-badge {
-  color: var(--soc-color);
-  border-color: var(--soc-color);
+  color: var(--color-green);
 }
 
 .ep-action-recommended .ep-action-badge {
-  color: var(--accent-color);
-  border-color: var(--accent-color);
+  color: var(--color-teal);
 }
 
 .ep-action-advisory .ep-action-badge {
-  color: var(--solar-color);
-  border-color: var(--solar-color);
+  color: var(--color-orange);
 }
 
-.ep-action-advisory[data-advisory="engine_run"] .ep-action-badge {
-  color: var(--load-color);
-  border-color: var(--load-color);
+.ep-action-advisory[data-advisory="engine_run"] .ep-action-badge,
+.ep-action-advisory[data-advisory="genset_run"] .ep-action-badge {
+  color: var(--color-red);
 }
 
 .ep-action-advisory[data-advisory="surplus"] .ep-action-badge {
-  color: var(--solar-color);
-  border-color: var(--solar-color);
+  color: var(--color-orange);
 }
 
 .ep-action-advisory[data-advisory="stow_soon"] .ep-action-badge {
-  color: var(--wind-color);
-  border-color: var(--wind-color);
+  color: var(--color-teal);
 }
 
 /* A surplus/deficit advisory a newer forecast overtook (the crew acted on
@@ -279,17 +533,13 @@ ep-actions-list {
   opacity: 0.6;
 }
 
-.ep-action-text {
-  color: var(--text-color);
-}
-
 .ep-action-stale .ep-action-text {
   text-decoration: line-through;
 }
 
 .ep-action-reason {
-  color: var(--muted-color);
-  font-size: 0.8rem;
-  width: 100%;
+  grid-column: 1 / -1;
+  color: var(--text-muted);
+  font-size: 0.75rem;
   padding-left: 0;
 }

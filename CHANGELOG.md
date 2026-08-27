@@ -5,6 +5,34 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **Webapp restyled to the Lille Ø tactical console theme.** The
+  custom rounded-panel styling is replaced by the Signal K UI spec:
+  flat geometry (zero border-radius), 2px corner brackets and faint
+  themed borders on cards, uppercase tracked labels over massive
+  monospace `tabular-nums` data values, hardware-style buttons and
+  inputs (48px touch targets), and the events list rebuilt as a
+  three-column pseudo-console (timestamp | message | bracketed status).
+  The chart's series palette is extended beyond the spec's semantic
+  colors (hydro blue, gust violet) with matching day/night variants so
+  every series stays readable in both modes.
+
+### Added
+- **Day/night theme reactivity in the webapp.** The Signal K stream now
+  also subscribes to `environment.mode` (throttled with `minPeriod`) and
+  applies `data-mode` to the document root, shifting the whole UI
+  between day (high visibility) and night (dimmed, rhodopsin-friendly)
+  intensity without a reload.
+- **Connection resilience and offline indicator.** The stream reconnects
+  with exponential backoff (1s doubling to a 30s cap, reset after a
+  successful connect) and the header shows a `[ LIVE ]` / `[ OFFLINE ]`
+  status chip.
+- Headline figures gained SI-prefix formatting for watts (kW) and
+  megawatt-hours, and now surface the SoC range and mean prediction
+  error as primary values.
+
 ## [0.5.0] - 2026-08-25
 
 ### Added

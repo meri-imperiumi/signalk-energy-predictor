@@ -20,6 +20,14 @@ class EpApp extends HTMLElement {
   }
 
   connectedCallback() {
+    // Day/night theme reactivity: the host (Signal K shell) normally
+    // applies data-mode to the document root from the environment.mode
+    // delta; default to day until a delta lands so the UI never renders
+    // without a theme.
+    if (!document.documentElement.dataset.mode) {
+      document.documentElement.dataset.mode = "day";
+    }
+
     const shadow = this.shadowRoot;
     const link = document.createElement("link");
     link.rel = "stylesheet";
@@ -30,9 +38,15 @@ class EpApp extends HTMLElement {
     header.className = "ep-header";
     const h1 = document.createElement("h1");
     h1.textContent = "Energy Predictor";
+    const conn = document.createElement("span");
+    conn.className = "ep-conn-chip theme-offline";
+    conn.textContent = "[ OFFLINE ]";
+    const titleWrap = document.createElement("div");
+    titleWrap.className = "ep-title";
+    titleWrap.append(h1, conn);
     const error = document.createElement("div");
     error.className = "ep-error";
-    header.append(h1, error);
+    header.append(titleWrap, error);
 
     // Reserved for the future status panel (current forecast, weather
     // tier, live advisories — work doc #8 v1 non-goal)
@@ -42,10 +56,14 @@ class EpApp extends HTMLElement {
     const selector = document.createElement("ep-window-selector");
     const figures = document.createElement("ep-headline-figures");
     const chart = document.createElement("ep-timeline-chart");
+    chart.className = "sk-card theme-teal";
     const actions = document.createElement("ep-actions-list");
+    actions.className = "sk-card theme-teal";
 
     shadow.append(header, statusPanel, selector, figures, chart, actions);
 
+    /** @type {HTMLElement} */
+    this.connEl = conn;
     /** @type {ShadowRoot} */
     this.errorEl = error;
     /** @type {HTMLElement} */
@@ -63,11 +81,17 @@ class EpApp extends HTMLElement {
       this.onWindowChange(e.detail);
     });
 
-    // Auto-refresh when a new prediction cycle is published
-    this.stream = new SignalKStream(() => {
-      if (this.lastSpec) {
-        this.refresh(this.lastSpec);
-      }
+    // Auto-refresh when a new prediction cycle is published; the same
+    // stream drives day/night theme reactivity (environment.mode) and the
+    // header's connection indicator
+    this.stream = new SignalKStream({
+      onCycle: () => {
+        if (this.lastSpec) {
+          this.refresh(this.lastSpec);
+        }
+      },
+      onMode: (mode) => this.applyEnvironmentMode(mode),
+      onStatus: (online) => this.applyConnectionStatus(online),
     });
     this.stream.connect();
 
@@ -97,6 +121,26 @@ class EpApp extends HTMLElement {
 
   disconnectedCallback() {
     this.stream?.close();
+  }
+
+  /**
+   * Applies the Signal K environment.mode ("day" | "night") to the
+   * document root so the CSS variables shift intensity. Anything other
+   * than "night" falls back to day visibility.
+   * @param {string} mode
+   */
+  applyEnvironmentMode(mode) {
+    document.documentElement.dataset.mode = mode === "night" ? "night" : "day";
+  }
+
+  /**
+   * Flips the header's connection chip between [ LIVE ] and [ OFFLINE ].
+   * @param {boolean} online
+   */
+  applyConnectionStatus(online) {
+    if (!this.connEl) return;
+    this.connEl.className = `ep-conn-chip ${online ? "theme-green" : "theme-offline"}`;
+    this.connEl.textContent = online ? "[ LIVE ]" : "[ OFFLINE ]";
   }
 
   /**

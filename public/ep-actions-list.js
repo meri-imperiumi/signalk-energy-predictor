@@ -141,6 +141,10 @@ class EpActionsList extends HTMLElement {
         time.getTime(),
         this.solarOffsetMinutes,
       );
+      // Pseudo-console row: timestamp | message | status bracket
+      const timeEl = document.createElement("span");
+      timeEl.className = "ep-action-time";
+      timeEl.textContent = timeStr;
       const badge = document.createElement("span");
       badge.className = "ep-action-badge";
       const text = document.createElement("span");
@@ -148,17 +152,17 @@ class EpActionsList extends HTMLElement {
       if (ev.kind === "detected") {
         badge.textContent = "detected";
         const verb = ev.state === "deployed" ? "was deployed" : "was stowed";
-        text.textContent = `At ${timeStr} ${deviceLabel(ev.id)} ${verb}`;
+        text.textContent = `${deviceLabel(ev.id)} ${verb}`;
       } else if (ev.kind === "recommended") {
         badge.textContent = "recommend";
         const verb = ev.state === "deployed" ? "deploy" : "stow";
-        text.textContent = `At ${timeStr} Recommendation: ${verb} ${deviceLabel(ev.id)}`;
+        text.textContent = `Recommendation: ${verb} ${deviceLabel(ev.id)}`;
       } else {
         // Advisory: surplus ("surplus") or engine-run deficit ("engine_run").
         // The message already carries the full human-readable text, so we
         // render it verbatim with a short kind badge.
         badge.textContent = advisoryBadge(ev.type);
-        text.textContent = `At ${timeStr} ${ev.message}`;
+        text.textContent = ev.message;
         li.dataset.advisory = ev.type;
         // A newer forecast overtook this advisory (the crew acted on the
         // surplus, the weather changed, …) but we keep it as a record.
@@ -168,20 +172,22 @@ class EpActionsList extends HTMLElement {
           li.classList.add("ep-action-stale");
           badge.textContent = `stale ${advisoryBadge(ev.type)}`;
         }
-        if (ev.forecastAt) {
-          const fa = formatShortDateTime(
-            new Date(ev.forecastAt).getTime(),
-            this.solarOffsetMinutes,
-          );
-          const note = document.createElement("span");
-          note.className = "ep-action-reason";
-          note.textContent = `forecast at ${fa}${
-            ev.stale ? " — overtaken by a newer forecast" : ""
-          }`;
-          li.append(note);
-        }
       }
-      li.append(badge, text);
+      li.append(timeEl, text, badge);
+      if (ev.kind === "advisory" && ev.forecastAt) {
+        // When the forecast was made, so an overtaken advisory doesn't
+        // read as a live current opportunity
+        const fa = formatShortDateTime(
+          new Date(ev.forecastAt).getTime(),
+          this.solarOffsetMinutes,
+        );
+        const note = document.createElement("span");
+        note.className = "ep-action-reason";
+        note.textContent = `forecast at ${fa}${
+          ev.stale ? " — overtaken by a newer forecast" : ""
+        }`;
+        li.append(note);
+      }
       if (ev.reason) {
         const reason = document.createElement("span");
         reason.className = "ep-action-reason";

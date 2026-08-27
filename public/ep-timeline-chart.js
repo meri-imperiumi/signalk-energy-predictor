@@ -28,14 +28,18 @@ const WIDTH = 1000;
 const HEIGHT = 420;
 const MARGIN = { top: 14, right: 54, bottom: 28, left: 54 };
 
-/** Series colors shared with styles.css custom properties */
+/**
+ * Series colors as CSS custom properties (defined in styles.css with
+ * day/night variants); SVG strokes/fills are applied via inline style
+ * because presentation attributes cannot resolve var().
+ */
 const COLORS = {
-  solar: "#f5b942",
-  wind: "#26c6aa",
-  hydro: "#4fc3f7",
-  load: "#ef5b7b",
-  soc: "#9ccc65",
-  windKn: "#b39ddb",
+  solar: "var(--series-solar)",
+  wind: "var(--series-wind)",
+  hydro: "var(--series-hydro)",
+  load: "var(--series-load)",
+  soc: "var(--series-soc)",
+  windKn: "var(--series-gust)",
 };
 
 const PREFS_KEY = "ep:series";
@@ -735,16 +739,15 @@ class EpTimelineChart extends HTMLElement {
     for (let i = 0; i <= 4; i++) {
       const v = (leftMax / 4) * i;
       const y = yLeft(v);
-      svg.appendChild(
-        this.svgEl("line", {
-          x1: x0,
-          x2: x1,
-          y1: y,
-          y2: y,
-          stroke: "#2a2f42",
-          "stroke-width": 0.5,
-        }),
-      );
+      const grid = this.svgEl("line", {
+        x1: x0,
+        x2: x1,
+        y1: y,
+        y2: y,
+        "stroke-width": 0.5,
+      });
+      grid.style.stroke = "var(--chart-grid)";
+      svg.appendChild(grid);
       const label = this.svgEl("text", {
         x: x0 - 6,
         y: y + 4,
@@ -783,16 +786,15 @@ class EpTimelineChart extends HTMLElement {
       : Math.max(1, Math.round(model.bars.length / 8)) * 24 * 3600000;
     for (let t = model.from; t <= model.to; t += tickStep) {
       const x = xScale(t);
-      svg.appendChild(
-        this.svgEl("line", {
-          x1: x,
-          x2: x,
-          y1: MARGIN.top,
-          y2: MARGIN.top + this.plotHeight,
-          stroke: "#232739",
-          "stroke-width": 0.5,
-        }),
-      );
+      const tick = this.svgEl("line", {
+        x1: x,
+        x2: x,
+        y1: MARGIN.top,
+        y2: MARGIN.top + this.plotHeight,
+        "stroke-width": 0.5,
+      });
+      tick.style.stroke = "var(--chart-grid)";
+      svg.appendChild(tick);
       const label = this.svgEl("text", {
         x,
         y: HEIGHT - 8,
@@ -827,10 +829,10 @@ class EpTimelineChart extends HTMLElement {
       x2: 0,
       y1: MARGIN.top,
       y2: MARGIN.top + this.plotHeight,
-      stroke: "#8a90a3",
       "stroke-width": 0.75,
       visibility: "hidden",
     });
+    rule.style.stroke = "var(--text-muted)";
     svg.appendChild(rule);
     svg.addEventListener("mousemove", (e) => this.onHover(e, xScale, rule));
     svg.addEventListener("mouseleave", () => {
@@ -894,16 +896,15 @@ class EpTimelineChart extends HTMLElement {
             `${i === 0 ? "M" : "L"}${xScale(p.t).toFixed(1)},${y(p.v).toFixed(1)}`,
         )
         .join("");
-      svg.appendChild(
-        this.svgEl("path", {
-          d: path,
-          fill: "none",
-          stroke: d.color,
-          "stroke-width": d.predicted ? 1.5 : 2,
-          "stroke-dasharray": d.predicted ? "5 4" : undefined,
-          opacity: d.predicted ? 0.75 : 1,
-        }),
-      );
+      const line = this.svgEl("path", {
+        d: path,
+        fill: "none",
+        "stroke-width": d.predicted ? 1.5 : 2,
+        "stroke-dasharray": d.predicted ? "5 4" : undefined,
+        opacity: d.predicted ? "var(--predicted-opacity)" : 1,
+      });
+      line.style.stroke = d.color;
+      svg.appendChild(line);
     }
   }
 
@@ -927,16 +928,15 @@ class EpTimelineChart extends HTMLElement {
         const v = b[id] || 0;
         const y = yLeft(v);
         const def = this.seriesDefs.find((d) => d.id === id);
-        svg.appendChild(
-          this.svgEl("rect", {
-            x: dayX + j * barWidth,
-            y,
-            width: barWidth - 1,
-            height: Math.max(0, MARGIN.top + this.plotHeight - y),
-            fill: def?.color || "#fff",
-            opacity: def?.predicted ? 0.45 : 0.9,
-          }),
-        );
+        const rect = this.svgEl("rect", {
+          x: dayX + j * barWidth,
+          y,
+          width: barWidth - 1,
+          height: Math.max(0, MARGIN.top + this.plotHeight - y),
+          opacity: def?.predicted ? 0.45 : 0.9,
+        });
+        rect.style.fill = def?.color || "var(--text-main)";
+        svg.appendChild(rect);
       });
     });
   }
@@ -957,16 +957,15 @@ class EpTimelineChart extends HTMLElement {
             `${i === 0 ? "M" : "L"}${xScale(p.t).toFixed(1)},${y(p.v).toFixed(1)}`,
         )
         .join("");
-      svg.appendChild(
-        this.svgEl("path", {
-          d: path,
-          fill: "none",
-          stroke: def.color,
-          "stroke-width": def.predicted ? 1.5 : 2,
-          "stroke-dasharray": def.predicted ? "5 4" : undefined,
-          opacity: def.predicted ? 0.75 : 1,
-        }),
-      );
+      const line = this.svgEl("path", {
+        d: path,
+        fill: "none",
+        "stroke-width": def.predicted ? 1.5 : 2,
+        "stroke-dasharray": def.predicted ? "5 4" : undefined,
+        opacity: def.predicted ? "var(--predicted-opacity)" : 1,
+      });
+      line.style.stroke = def.color;
+      svg.appendChild(line);
     }
   }
 
