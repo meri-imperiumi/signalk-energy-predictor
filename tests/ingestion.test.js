@@ -754,14 +754,140 @@ test.describe("Offline forecast restore + staleness + uplink cadence", () => {
   test("metered internet counts as online for fetch eligibility", () => {
     const fsm = makeFSM();
     assert.strictEqual(fsm.uplinkOnline, false);
+    assert.strictEqual(fsm.uplinkMetered, false);
     // `metered` means the internet is available (just billed by volume),
     // so a forecast fetch is still eligible.
     const became = fsm.setUplinkStatus({ internet: "metered" });
     assert.strictEqual(became, true);
     assert.strictEqual(fsm.uplinkOnline, true);
-    // Going back to offline clears it.
+    assert.strictEqual(fsm.uplinkMetered, true);
+    // A plain online link is unmetered.
+    fsm.setUplinkStatus({ internet: "online" });
+    assert.strictEqual(fsm.uplinkOnline, true);
+    assert.strictEqual(fsm.uplinkMetered, false);
+    // Going back to offline clears both.
     fsm.setUplinkStatus({ internet: "offline" });
     assert.strictEqual(fsm.uplinkOnline, false);
+    assert.strictEqual(fsm.uplinkMetered, false);
+    // Metered → online edge is not an offline→online edge (still counts
+    // as a state update, no immediate-fetch trigger needed).
+    fsm.setUplinkStatus({ internet: "metered" });
+    const became2 = fsm.setUplinkStatus({ internet: "online" });
+    assert.strictEqual(became2, false);
+  });
+
+  test("metered uplink skips Open-Meteo and uses the Signal K Weather provider", async () => {
+    const fsm = makeFSM();
+    fsm.setUplinkStatus({ internet: "metered" });
+    const origFetch = globalThis.fetch;
+    const wanUrls = [];
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u.includes("open-meteo")) {
+        wanUrls.push(u);
+        throw new Error("Open-Meteo must not be called on a metered link");
+      }
+      if (u.includes("/signalk/v2/api/weather")) {
+        return {
+          ok: true,
+          json: async () => [
+            {
+              date: new Date(Date.now() + 3600000).toISOString(),
+              outside: { cloudCover: 0.25 },
+              wind: { speedTrue: 6, directionTrue: Math.PI / 2, gust: 9 },
+            },
+          ],
+        };
+      }
+      throw new Error(`unexpected fetch: ${u}`);
+    };
+
+    try {
+      const forecast = await fsm.fetchForecast();
+      assert.strictEqual(
+        wanUrls.length,
+        0,
+        "no WAN request may be issued while the uplink is metered",
+      );
+      assert.strictEqual(fsm.currentTier, Tier.SIGNAL_K_WEATHER);
+      assert.strictEqual(forecast.length, 1);
+      assert.strictEqual(forecast[0].windSpeedMs, 6);
+      assert.strictEqual(forecast[0].gustSpeedMs, 9);
+      // Cloud cover synthesized into GHI by post-processing
+      assert.ok(forecast[0].ghi != null);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  test("metered uplink with no Weather provider falls to the offline ladder, still no WAN download", async () => {
+    const fsm = makeFSM();
+    fsm.setUplinkStatus({ internet: "metered" });
+    const origFetch = globalThis.fetch;
+    const wanUrls = [];
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u.includes("open-meteo")) {
+        wanUrls.push(u);
+      }
+      // Same-server Weather API and logbook both unreachable
+      throw new Error("connection refused");
+    };
+
+    try {
+      const forecast = await fsm.fetchForecast();
+      assert.strictEqual(
+        wanUrls.length,
+        0,
+        "a missing Weather provider must not trigger a metered Open-Meteo download",
+      );
+      // Offline ladder floor: Clear Sky, no wind
+      assert.strictEqual(fsm.currentTier, Tier.CLEAR_SKY);
+      assert.ok(forecast.length > 0);
+      assert.ok(forecast.every((p) => p.windSpeedMs == null));
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  test("unmetered online uplink still fetches Open-Meteo first", async () => {
+    const fsm = makeFSM();
+    fsm.setUplinkStatus({ internet: "online" });
+    assert.strictEqual(fsm.uplinkMetered, false);
+    const origFetch = globalThis.fetch;
+    let openMeteoCalled = false;
+    const times = Array.from({ length: 6 }, (_, i) =>
+      new Date(Date.now() + i * 3600000)
+        .toISOString()
+        .slice(0, 13)
+        .concat(":00"),
+    );
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u.includes("open-meteo")) {
+        openMeteoCalled = true;
+        return {
+          ok: true,
+          json: async () => ({
+            hourly: {
+              time: times,
+              shortwave_radiation: times.map(() => 100),
+              wind_speed_10m: times.map(() => 14.4),
+            },
+          }),
+        };
+      }
+      throw new Error(`unexpected fetch: ${u}`);
+    };
+
+    try {
+      const forecast = await fsm.fetchForecast();
+      assert.strictEqual(openMeteoCalled, true);
+      assert.strictEqual(fsm.currentTier, Tier.OPEN_METEO);
+      assert.ok(forecast.length > 0);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
   });
 
   test("uplink online caps refetch attempts to ~1h even if the forecast is stale", async () => {

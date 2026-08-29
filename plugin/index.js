@@ -1760,7 +1760,9 @@ module.exports = (app) => {
             // Mirror uplink status into the ingestion FSM and trigger a
             // forecast fetch on the offline→online edge (work doc #15
             // update #1). Internet online = `network.internet.state` is
-            // `online` or `metered`.
+            // `online` or `metered`; `metered` additionally skips the
+            // Open-Meteo download in favor of the Signal K Weather
+            // provider (work doc #19).
             if (ingestionFSM && v.path === "network.internet.state") {
               const becameOnline = ingestionFSM.setUplinkStatus({
                 internet:

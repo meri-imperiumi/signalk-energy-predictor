@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **Metered uplinks no longer download their own forecast** (work doc #19).
+  When `network.internet.state` is `metered` (volume-billed link: satellite,
+  roaming LTE), the ingestion FSM skips the tier-1 Open-Meteo fetch and reads
+  tier 2 — the same-server Signal K Weather provider — instead, reusing
+  forecasts a weather provider plugin has already downloaded under its own
+  data budget. If no provider answers on a metered link, the FSM uses the
+  offline ladder (on-disk restore, stale hybrid, Clear Sky) rather than
+  buying a WAN download. Unmetered `online` behavior is unchanged.
+
 ## [0.6.0] - 2026-08-27
 
 ### Changed

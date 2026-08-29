@@ -7,6 +7,10 @@
  * 3. Logbook Persistence - cloudCover (oktas 0-8)
  * 4. Clear Sky Baseline - theoretical max from sun position
  *
+ * On a metered uplink (`network.internet.state` = `metered`) tier 1 is
+ * skipped in favor of tier 2: a same-server localhost read instead of a
+ * volume-billed WAN download (work doc #19).
+ *
  * @file ingestion.js
  */
 
@@ -643,6 +647,16 @@ class IngestionFSM {
      */
     this.uplinkOnline = false;
     /**
+     * True when the current uplink is `metered` (volume-billed: satellite,
+     * roaming LTE). On a metered link the FSM skips the tier-1 Open-Meteo
+     * download and reads tier 2 (Signal K Weather provider) — a same-server
+     * localhost request — instead, reusing forecasts a provider plugin has
+     * already fetched under its own data budget. Never downloads to WAN on
+     * our own initiative while set. Reset together with `uplinkOnline`
+     * (work doc #19).
+     */
+    this.uplinkMetered = false;
+    /**
      * Timestamp (ms) of the last fetch attempt made *while uplink was online*.
      * Used to cap online refetches to ~1 h even if the staleness window would
      * allow a fetch sooner.
@@ -680,8 +694,11 @@ class IngestionFSM {
    * Mirrors uplink status from deltas (work doc #15 update #1).
    *
    * Online if internet is available (`network.internet.state` is `online`
-   * or `metered`). Returns true if the offline→online edge happened on this
-   * call so the caller can trigger an immediate fetch.
+   * or `metered`). A `metered` link additionally sets `uplinkMetered`, which
+   * suppresses the tier-1 Open-Meteo download in favor of the same-server
+   * Signal K Weather provider (work doc #19). Returns true if the
+   * offline→online edge happened on this call so the caller can trigger an
+   * immediate fetch.
    *
    * @param {object} status
    * @param {unknown} [status.internet] - `network.internet.state`
@@ -694,8 +711,12 @@ class IngestionFSM {
     const online = internetOnline;
     const becameOnline = online && !this.uplinkOnline;
     this.uplinkOnline = online;
+    this.uplinkMetered =
+      online && typeof internet === "string" && internet.trim() === "metered";
     if (becameOnline) {
-      this.app.debug("Uplink came online — fetch eligible immediately");
+      this.app.debug(
+        `Uplink came online (${this.uplinkMetered ? "metered" : "unmetered"}) — fetch eligible immediately`,
+      );
       // Reset the online-cadence cap so the transition triggers a fetch now.
       this.lastOnlineFetchAttempt = 0;
     }
@@ -970,6 +991,18 @@ class IngestionFSM {
     //     a restored real (stale) forecast, which is strictly better.
     // Both are reached only via the restore/hybrid/clear-sky fallback below.
     for (let tier = Tier.OPEN_METEO; tier < Tier.LOGBOOK; tier++) {
+      // On a metered (volume-billed) uplink, skip the tier-1 Open-Meteo
+      // download and read tier 2 instead: the Signal K Weather API is a
+      // same-server localhost request serving forecasts a provider plugin
+      // has already fetched under its own data budget (work doc #19). If
+      // tier 2 yields nothing, fall through to the offline ladder below —
+      // do not buy a WAN download the user did not opt into.
+      if (tier === Tier.OPEN_METEO && this.uplinkMetered) {
+        this.app.debug(
+          "Uplink is metered — skipping Open-Meteo download, reading Signal K Weather provider",
+        );
+        continue;
+      }
       this.app.debug(`Trying tier ${tier}: ${this.getTierName(tier)}`);
       let forecast;
       try {
