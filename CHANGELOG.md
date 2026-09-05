@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.0] - 2026-09-05
+
 ### Fixed
 - **WPF no longer learns from measured wind posing as forecast, and strong
   protection claims now require proof.** At an anchorage visited without a
