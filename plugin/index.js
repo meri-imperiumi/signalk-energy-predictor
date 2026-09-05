@@ -2922,6 +2922,13 @@ module.exports = (app) => {
         getConfig: () => pluginConfig,
         dataDir: app.getDataDirPath(),
         getWindProtection: () => windProtection,
+        // Uplink state for the retro-weather background warm: archive
+        // weather is only fetched on our own initiative while online and
+        // unmetered (same rule as the forecast tiers, work doc #19)
+        getUplinkStatus: () => ({
+          online: Boolean(ingestionFSM?.uplinkOnline),
+          metered: Boolean(ingestionFSM?.uplinkMetered),
+        }),
       });
       app.debug("REST API routes registered");
     },

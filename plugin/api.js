@@ -757,13 +757,66 @@ async function loadRecords(readRecordings, from, to, type) {
  * @param {() => object|null} params.getConfig - Returns current plugin
  *   configuration (for device→source typing)
  * @param {string} params.dataDir - Plugin data directory with recordings
+ * @param {() => ({online: boolean, metered: boolean})} [params.getUplinkStatus]
+ *   Returns the current uplink state (from the ingestion FSM, mirrored
+ *   from `network.internet.state`). Defaults to offline: an unknown
+ *   uplink never authorizes the background archive weather warm.
  */
 function registerApiRoutes(
   router,
-  { app, getConfig, dataDir, getWindProtection },
+  { app, getConfig, dataDir, getWindProtection, getUplinkStatus },
 ) {
   const readRecordings = (from, to, type) =>
     require("./recorder.js").getRecordings(dataDir, from, to, type);
+
+  /**
+   * Background warm of the retro overlay's archive weather cache.
+   *
+   * `/api/retro-predicted` serves cache-only weather so a cold cache can
+   * never stall the HTTP response behind WAN round-trips and retry backoff
+   * (a blackholed uplink used to hang the endpoint — and with it the whole
+   * webapp — on "Loading…" forever, since the client awaits all endpoints
+   * together). This fire-and-forget warm fills the cache for the requested
+   * window so later loads get the retro overlay. It follows the same rule
+   * as the forecast tiers (work doc #19): archive weather is only fetched
+   * on our own initiative while the uplink is online and unmetered — an
+   * offline or volume-billed link never buys the download. One warm at a
+   * time; concurrent loads skip it (the track fetch is cache-first, so a
+   * running warm already covers what they would ask for).
+   *
+   * @param {object[]} samples - Recorded samples for the window
+   * @param {Date} from - Window start
+   * @param {Date} to - Window end
+   * @returns {void}
+   */
+  let retroWarmRunning = false;
+  function warmRetroWeatherCache(samples, from, to) {
+    const uplink = getUplinkStatus?.() ?? { online: false, metered: false };
+    if (!uplink.online || uplink.metered || retroWarmRunning) {
+      return;
+    }
+    const backfill = require("./history-backfill.js");
+    const dailyPositions = backfill.dailyPositionsFromSamples(
+      samples,
+      from,
+      to,
+    );
+    if (dailyPositions.length === 0) {
+      return;
+    }
+    retroWarmRunning = true;
+    app.debug?.(
+      `Warming retro weather cache for ${dailyPositions.length} day(s) in the background`,
+    );
+    backfill
+      .fetchHistoricalWeatherTrack({ dailyPositions, dataDir, app })
+      .catch((error) =>
+        app.debug?.(`Retro weather cache warm failed: ${error.message}`),
+      )
+      .finally(() => {
+        retroWarmRunning = false;
+      });
+  }
 
   /**
    * Shared handler wrapper: window parsing, record loading, response.
@@ -831,10 +884,15 @@ function registerApiRoutes(
   router.get("/api/retro-predicted", (req, res) => {
     const { from, to } = parseTimeWindow(req.query);
     const config = getConfig();
-    loadRecords(readRecordings, from, to, "sample")
-      .then((samples) =>
-        buildRetroPredicted(samples, config, dataDir, from, to, app),
-      )
+    return loadRecords(readRecordings, from, to, "sample")
+      .then((samples) => {
+        // Response weather is cache-only (never blocks on the WAN); the
+        // warm fills the cache for later loads when the uplink allows it
+        warmRetroWeatherCache(samples, from, to);
+        return buildRetroPredicted(samples, config, dataDir, from, to, app, {
+          allowNetwork: false,
+        });
+      })
       .then((body) => res.json(body))
       .catch((error) => handleError(error, res));
   });
@@ -917,14 +975,29 @@ function registerApiRoutes(
  * computes yield retroactively from the backfilled matrices + generator
  * curves, so the webapp can overlay predicted-vs-actual for the past.
  *
+ * Weather comes from the on-disk archive cache; `allowNetwork: false` (the
+ * API route) never fetches, so the response cannot stall behind the WAN.
+ * The background warm (see `warmRetroWeatherCache`) fills the cache.
+ *
  * @param {object[]} samples - Recorded samples within the window (for state)
  * @param {object} config - Plugin configuration
  * @param {string} dataDir - Plugin data directory (for matrices)
  * @param {Date} from - Window start
  * @param {Date} to - Window end
+ * @param {object} [opts]
+ * @param {boolean} [opts.allowNetwork=true] - Whether uncached weather days
+ *        may be fetched from the Open-Meteo archive
  * @returns {Promise<object>} Response body
  */
-async function buildRetroPredicted(samples, config, dataDir, from, to, app) {
+async function buildRetroPredicted(
+  samples,
+  config,
+  dataDir,
+  from,
+  to,
+  app,
+  { allowNetwork = true } = {},
+) {
   const backfill = require("./history-backfill.js");
   const { SolarMatrix, theoreticalPower } = require("./learning.js");
   const { sunPosition, irradianceFromCloudCover } = require("./solar.js");
@@ -965,27 +1038,9 @@ async function buildRetroPredicted(samples, config, dataDir, from, to, app) {
     matrices.set(array.id, found ? SolarMatrix.fromJSON(found) : null);
   }
 
-  // Build per-day positions from samples for the weather track
-  const byDate = new Map();
-  for (const s of samples) {
-    const time = new Date(s.timestamp);
-    if (time < from || time > to) continue;
-    const pos = s.position;
-    if (!pos || pos.latitude == null || pos.longitude == null) continue;
-    const date = time.toISOString().split("T")[0];
-    const noonDist = Math.abs((time.getTime() % 86400000) - 12 * 3600000);
-    const existing = byDate.get(date);
-    if (!existing || noonDist < existing.noonDist) {
-      byDate.set(date, { noonDist, position: pos });
-    }
-  }
-  const dailyPositions = [...byDate.entries()]
-    .map(([date, { position }]) => ({
-      date,
-      latitude: position.latitude,
-      longitude: position.longitude,
-    }))
-    .sort((a, b) => (a.date < b.date ? -1 : 1));
+  // Per-day positions for the weather track (noon-nearest sample per UTC
+  // date), shared with the background cache warm
+  const dailyPositions = backfill.dailyPositionsFromSamples(samples, from, to);
 
   const weather =
     dailyPositions.length > 0
@@ -993,6 +1048,7 @@ async function buildRetroPredicted(samples, config, dataDir, from, to, app) {
           dailyPositions,
           dataDir,
           app,
+          allowNetwork,
         })
       : [];
 

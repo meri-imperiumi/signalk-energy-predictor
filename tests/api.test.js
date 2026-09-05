@@ -599,6 +599,107 @@ test.describe("route registration", () => {
       assert.strictEqual(res.body.solarOffsetMinutes, null);
     });
   });
+
+  test("GET /api/retro-predicted responds cache-only: no network on the request path", async () => {
+    await withFixtures(async (dataDir) => {
+      // Blackholed uplink: a fetch would never settle. Before the fix a
+      // cold weather cache made this endpoint hang (and with it the whole
+      // webapp, which awaits all endpoints together) behind retries.
+      const realFetch = globalThis.fetch;
+      let fetchCalls = 0;
+      globalThis.fetch = () => {
+        fetchCalls++;
+        return new Promise(() => {});
+      };
+      try {
+        const router = makeRouter();
+        registerApiRoutes(router, {
+          app: makeApp(),
+          getConfig: () => CONFIG,
+          dataDir,
+          // No getUplinkStatus: unknown uplink defaults to offline, so no
+          // background warm either
+        });
+        const res = makeRes();
+        await router.routes.get("/api/retro-predicted")(
+          {
+            query: { from: "2026-08-22T00:00:00Z", to: "2026-08-22T02:00:00Z" },
+          },
+          res,
+        );
+        assert.strictEqual(res.statusCode, null);
+        // Window covers hours 00–02 → 3 hourly points, computed from local
+        // records with empty (uncached) weather — served instantly
+        assert.strictEqual(res.body.points.length, 3);
+        assert.strictEqual(fetchCalls, 0);
+      } finally {
+        globalThis.fetch = realFetch;
+      }
+    });
+  });
+
+  test("GET /api/retro-predicted warms the weather cache only on an unmetered online uplink", async () => {
+    await withFixtures(async (dataDir) => {
+      const realFetch = globalThis.fetch;
+      let warmFetches = 0;
+      let warmStarted;
+      const started = new Promise((resolve) => {
+        warmStarted = resolve;
+      });
+      globalThis.fetch = async () => {
+        warmFetches++;
+        warmStarted();
+        return { ok: true, json: async () => ({ hourly: { time: [] } }) };
+      };
+      try {
+        const router = makeRouter();
+        registerApiRoutes(router, {
+          app: makeApp(),
+          getConfig: () => CONFIG,
+          dataDir,
+          getUplinkStatus: () => ({ online: true, metered: false }),
+        });
+        const res = makeRes();
+        await router.routes.get("/api/retro-predicted")(
+          {
+            query: { from: "2026-08-22T00:00:00Z", to: "2026-08-22T02:00:00Z" },
+          },
+          res,
+        );
+        // The response itself is cache-only and did not wait for the warm
+        assert.strictEqual(res.statusCode, null);
+        assert.strictEqual(res.body.points.length, 3);
+        await started;
+        assert.strictEqual(warmFetches, 1);
+
+        // A metered (volume-billed) uplink must never buy the download —
+        // same rule as the forecast tiers
+        let meteredFetches = 0;
+        globalThis.fetch = async () => {
+          meteredFetches++;
+          return new Promise(() => {});
+        };
+        const meteredRouter = makeRouter();
+        registerApiRoutes(meteredRouter, {
+          app: makeApp(),
+          getConfig: () => CONFIG,
+          dataDir,
+          getUplinkStatus: () => ({ online: true, metered: true }),
+        });
+        const meteredRes = makeRes();
+        await meteredRouter.routes.get("/api/retro-predicted")(
+          {
+            query: { from: "2026-08-22T00:00:00Z", to: "2026-08-22T02:00:00Z" },
+          },
+          meteredRes,
+        );
+        assert.strictEqual(meteredRes.statusCode, null);
+        assert.strictEqual(meteredFetches, 0);
+      } finally {
+        globalThis.fetch = realFetch;
+      }
+    });
+  });
 });
 
 test.describe("OpenAPI spec", () => {

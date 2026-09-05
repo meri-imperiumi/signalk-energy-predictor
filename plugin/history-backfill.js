@@ -284,6 +284,15 @@ function sleep(ms) {
 const WEATHER_MAX_RETRIES = 4;
 
 /**
+ * Per-attempt timeout for a single Open-Meteo archive request. Without
+ * it a blackholed uplink (satellite link that accepts the TCP connection
+ * but never answers) hangs on the HTTP client's own multi-minute timeout,
+ * and with retries a single day can stall a call for tens of minutes.
+ * @type {number}
+ */
+const WEATHER_FETCH_TIMEOUT_MS = 10000;
+
+/**
  * Base backoff (ms) for exponential retry: 2s, 4s, 8s, 16s.
  */
 const WEATHER_BACKOFF_BASE_MS = 2000;
@@ -337,6 +346,8 @@ function retryAfterMs(response) {
  * @param {Date} params.from - Start date
  * @param {Date} params.to - End date
  * @param {typeof fetch} [params.fetchImpl] - Fetch implementation (tests)
+ * @param {number} [params.timeoutMs=WEATHER_FETCH_TIMEOUT_MS] - Per-attempt
+ *        timeout; 0 disables (used by stubs that ignore request options)
  * @returns {Promise<Array<{time: Date, ghi: number|null, cloudCover: number|null}>>}
  */
 async function fetchHistoricalWeather({
@@ -345,6 +356,7 @@ async function fetchHistoricalWeather({
   from,
   to,
   fetchImpl = fetch,
+  timeoutMs = WEATHER_FETCH_TIMEOUT_MS,
 }) {
   const url = new URL("https://archive-api.open-meteo.com/v1/archive");
   url.searchParams.set("latitude", String(latitude));
@@ -361,7 +373,9 @@ async function fetchHistoricalWeather({
   for (let attempt = 0; attempt <= WEATHER_MAX_RETRIES; attempt++) {
     let response;
     try {
-      response = await fetchImpl(url);
+      response = await fetchImpl(url, {
+        signal: timeoutMs > 0 ? AbortSignal.timeout(timeoutMs) : undefined,
+      });
     } catch (error) {
       // Network-level failure: retry (offline is handled by the cache layer)
       lastError = error;
@@ -418,6 +432,12 @@ async function fetchHistoricalWeather({
  * this function catches it and returns whatever cached days exist for the
  * window (even a partial track) instead of failing the whole call.
  *
+ * `allowNetwork: false` serves cache-only: no fetches, no retry backoff,
+ * no request-gap sleeps — the call settles as fast as the disk reads.
+ * Interactive callers (the webapp's `/api/retro-predicted`) use this so a
+ * cold cache can never stall the HTTP response behind WAN round-trips and
+ * retry backoff, and warm the cache separately in the background.
+ *
  * @param {object} params
  * @param {Array<{date: string, latitude: number, longitude: number}>} params.dailyPositions - UTC date → position
  * @param {typeof fetch} [params.fetchImpl] - Fetch implementation (tests)
@@ -425,6 +445,8 @@ async function fetchHistoricalWeather({
  *        on-disk cache is used. Without it the function is pure fetch (no
  *        cache), preserving the behavior the backtest CLI and tests rely on.
  * @param {object} [params.app] - Signal K server API for debug logging
+ * @param {boolean} [params.allowNetwork=true] - When false, uncached days
+ *        contribute no weather instead of being fetched.
  * @returns {Promise<Array<{time: Date, ghi: number|null, cloudCover: number|null, windSpeedKnots: number|null, gustSpeedKnots: number|null, windDirectionDeg: number|null}>>}
  */
 async function fetchHistoricalWeatherTrack({
@@ -432,6 +454,7 @@ async function fetchHistoricalWeatherTrack({
   fetchImpl = fetch,
   dataDir,
   app,
+  allowNetwork = true,
 }) {
   const useCache = Boolean(dataDir);
   const all = [];
@@ -445,6 +468,10 @@ async function fetchHistoricalWeatherTrack({
         all.push(...cached);
         continue;
       }
+    }
+
+    if (!allowNetwork) {
+      continue;
     }
 
     if (requestsThisRun >= WEATHER_MAX_REQUESTS_PER_RUN) {
@@ -496,6 +523,40 @@ async function fetchHistoricalWeatherTrack({
     }
   }
   return all.sort((a, b) => a.time - b.time);
+}
+
+/**
+ * Builds a per-UTC-date position list from recorded samples, using the
+ * position closest to each date's noon. The recorded-sample counterpart of
+ * `dailyPositionsFromHistory`: `/api/retro-predicted` derives its weather
+ * track from the recordings store instead of the History API.
+ *
+ * @param {object[]} samples - Recorded sample records (with `position`)
+ * @param {Date} from - Window start
+ * @param {Date} to - Window end
+ * @returns {Array<{date: string, latitude: number, longitude: number}>}
+ */
+function dailyPositionsFromSamples(samples, from, to) {
+  const byDate = new Map();
+  for (const s of samples) {
+    const time = new Date(s.timestamp);
+    if (time < from || time > to) continue;
+    const pos = s.position;
+    if (!pos || pos.latitude == null || pos.longitude == null) continue;
+    const date = time.toISOString().split("T")[0];
+    const noonDist = Math.abs((time.getTime() % 86400000) - 12 * 3600000);
+    const existing = byDate.get(date);
+    if (!existing || noonDist < existing.noonDist) {
+      byDate.set(date, { noonDist, position: pos });
+    }
+  }
+  return [...byDate.entries()]
+    .map(([date, { position }]) => ({
+      date,
+      latitude: position.latitude,
+      longitude: position.longitude,
+    }))
+    .sort((a, b) => (a.date < b.date ? -1 : 1));
 }
 
 /**
@@ -2292,6 +2353,7 @@ module.exports = {
   queryHistory,
   fetchHistoricalWeather,
   fetchHistoricalWeatherTrack,
+  dailyPositionsFromSamples,
   dailyPositionsFromHistory,
   interpolateWeather,
   buildCarriedState,

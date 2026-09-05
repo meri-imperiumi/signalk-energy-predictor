@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The webapp no longer hangs on "Loading…" when the weather cache is
+  cold.** `/api/retro-predicted` fetched Open-Meteo archive weather on the
+  request path: with an unreachable uplink each uncached day burned the
+  full retry backoff (~30 s/day), and with a blackholed uplink the fetch
+  never settled at all — the endpoint never responded and the webapp (which
+  awaits all endpoints together) sat on "Loading…" indefinitely. The
+  response now serves cache-only weather and never touches the network;
+  when the uplink is online and unmetered a background warm fills the cache
+  for later loads (same "never buy bytes the user did not opt into" rule as
+  the forecast tiers, work doc #19). Archive fetches also gained a 10 s
+  per-attempt timeout, so a stalled (accepting connections but never
+  answering) uplink can no longer hold a backfill or the warm on the
+  transport's multi-minute timeout.
+
 ### Changed
 - **`windProtection.correctedSpeed`/`correctedGust` now publish a measured
   nowcast when the active forecast tier carries no wind.** Tiers 3/4

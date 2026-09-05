@@ -1601,6 +1601,88 @@ test("fetchHistoricalWeatherTrack is cache-first: cached days make zero requests
   }
 });
 
+test("fetchHistoricalWeatherTrack with allowNetwork:false is cache-only (zero requests)", async () => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "backfill-cache-"));
+  try {
+    // Pre-seed one cached day so cache-only still serves what it has
+    await writeWeatherCache(
+      dataDir,
+      "2026-08-20",
+      { latitude: 60.17, longitude: 21.39 },
+      [
+        {
+          time: new Date("2026-08-20T12:00:00Z"),
+          ghi: 800,
+          cloudCover: 0,
+          windSpeedKnots: 5,
+          gustSpeedKnots: 8,
+          windDirectionDeg: 90,
+          tier: 1,
+        },
+      ],
+      1,
+    );
+    const urls = [];
+    const fetchImpl = async (url) => {
+      urls.push(String(url));
+      return { ok: true, json: async () => ({ hourly: { time: [] } }) };
+    };
+    const started = Date.now();
+    const out = await fetchHistoricalWeatherTrack({
+      dailyPositions: [
+        { date: "2026-08-20", latitude: 60.174, longitude: 21.386 },
+        { date: "2026-08-21", latitude: 60.174, longitude: 21.386 },
+      ],
+      fetchImpl,
+      dataDir,
+      allowNetwork: false,
+    });
+    // Cached day served, uncached day skipped: no fetch, no backoff sleeps
+    assert.strictEqual(urls.length, 0);
+    assert.strictEqual(out.length, 1);
+    assert.ok(Date.now() - started < 1000, "cache-only must not back off");
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("fetchHistoricalWeather aborts a stalled request via the per-attempt timeout", async () => {
+  let abortedAt = null;
+  let abortObserved;
+  const observed = new Promise((resolve) => {
+    abortObserved = resolve;
+  });
+  // Behaves like real fetch: hangs until the request's abort signal fires
+  const fetchImpl = (_url, opts) => {
+    assert.ok(opts?.signal, "expected an AbortSignal on the request");
+    return new Promise((_resolve, reject) => {
+      opts.signal.addEventListener("abort", () => {
+        abortedAt = Date.now();
+        abortObserved();
+        reject(new Error("This operation was aborted"));
+      });
+    });
+  };
+  const started = Date.now();
+  // Don't await the full call: the retry chain backs off for ~30s; what
+  // matters here is that the stalled attempt itself is aborted at the
+  // timeout instead of hanging on the transport's own minutes-long one
+  const pending = fetchHistoricalWeather({
+    latitude: 60.17,
+    longitude: 21.39,
+    from: new Date("2026-08-20T00:00:00Z"),
+    to: new Date("2026-08-20T23:59:59Z"),
+    fetchImpl,
+    timeoutMs: 50,
+  });
+  pending.catch(() => {});
+  await observed;
+  assert.ok(
+    abortedAt - started < 5000,
+    `abort fired after ${abortedAt - started}ms, expected ~50ms`,
+  );
+});
+
 test("fetchHistoricalWeatherTrack persists-as-you-go (resumable after rate-limit)", async () => {
   const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "backfill-cache-"));
   try {
