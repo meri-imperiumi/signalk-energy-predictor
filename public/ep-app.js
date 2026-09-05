@@ -11,6 +11,21 @@ import { SignalKStream } from "./ep-signalk-stream.js";
 
 const API_BASE = "/plugins/signalk-energy-predictor";
 
+/**
+ * Timeout for window-data API fetches. The server-side handlers are
+ * local/bounded, but a response can still never land (wedged connection,
+ * event loop starved by a heavy cycle): without a client-side deadline
+ * `Promise.all` in `refresh()` awaits forever and the chart stays on
+ * "Loading…" with no error. On timeout the banner names the endpoint so
+ * the culprit is visible, and the stream-driven refresh retries on the
+ * next prediction cycle. Generous enough for month windows (92 days of
+ * recordings) on a slow single-board computer.
+ */
+const API_TIMEOUT_MS = 30000;
+
+/** Timeout for the /api/vessel meta fetch (a tiny response). */
+const VESSEL_TIMEOUT_MS = 10000;
+
 class EpApp extends HTMLElement {
   constructor() {
     super();
@@ -105,7 +120,9 @@ class EpApp extends HTMLElement {
     this.mode = spec.mode;
     this.lastSpec = spec;
     this.refresh(spec);
-    fetch(`${API_BASE}/api/vessel`)
+    fetch(`${API_BASE}/api/vessel`, {
+      signal: AbortSignal.timeout(VESSEL_TIMEOUT_MS),
+    })
       .then((r) => (r.ok ? r.json() : null))
       .then((v) => {
         const off =
@@ -177,7 +194,20 @@ class EpApp extends HTMLElement {
    */
   async fetchApi(path, from, to) {
     const url = `${API_BASE}${path}?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`;
-    const response = await fetch(url);
+    let response;
+    try {
+      response = await fetch(url, {
+        signal: AbortSignal.timeout(API_TIMEOUT_MS),
+      });
+    } catch (error) {
+      // AbortSignal.timeout rejects with a TimeoutError DOMException;
+      // surface it as a readable, endpoint-named message instead of the
+      // bare "The operation was aborted" so the banner says what hung
+      if (error?.name === "TimeoutError" || error?.name === "AbortError") {
+        throw new Error(`${path} timed out after ${API_TIMEOUT_MS / 1000}s`);
+      }
+      throw error;
+    }
     if (!response.ok) {
       const body = await response.json().catch(() => ({}));
       throw new Error(body.message || `${path} returned ${response.status}`);

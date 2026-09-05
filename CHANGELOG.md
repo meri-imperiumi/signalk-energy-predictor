@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Webapp API fetches now carry a client-side timeout, so a response
+  that never lands can no longer stick the app on "Loading…" forever.**
+  The previous fix made `/api/retro-predicted` cache-only (the response
+  can no longer stall behind WAN round-trips), but the client still
+  awaited all endpoints with no deadline: any request whose response
+  never arrives (wedged connection, server event loop starved by a heavy
+  cycle) left `refresh()`'s `Promise.all` pending indefinitely with the
+  chart on "Loading…" and no error shown. Every fetch (window endpoints
+  and `/api/vessel`) now uses `AbortSignal.timeout` (30 s / 10 s), and a
+  timeout surfaces as a readable banner naming the endpoint that hung —
+  which doubles as a diagnostic for the next occurrence. The stream-
+  driven refresh keeps retrying on the next prediction cycle, so a
+  transient hang recovers on its own.
+
 ## [0.8.0] - 2026-09-05
 
 ### Fixed

@@ -93,6 +93,33 @@ test("chart fetches against the plugin API base used by ep-app", () => {
   assert.match(source, /\/api\/retro-predicted/);
 });
 
+test("app bounds every API fetch with a timeout so a hung request can't stick on Loading", () => {
+  const source = readFileSync(path.join(PUBLIC_DIR, "ep-app.js"), "utf8");
+  // Window-data fetches (fetchApi) and the vessel meta fetch carry an
+  // AbortSignal.timeout: a response that never lands (wedged connection,
+  // starved server) rejects instead of leaving refresh()'s Promise.all
+  // pending forever with the chart on "Loading…". Server-side handlers
+  // already bound their own outbound fetches (WEATHER_FETCH_TIMEOUT_MS,
+  // FETCH_TIMEOUT) — this is the client half of the contract.
+  assert.match(source, /API_TIMEOUT_MS = \d+/);
+  assert.match(source, /VESSEL_TIMEOUT_MS = \d+/);
+  assert.match(source, /signal: AbortSignal\.timeout\(API_TIMEOUT_MS\)/);
+  assert.match(source, /signal: AbortSignal\.timeout\(VESSEL_TIMEOUT_MS\)/);
+  // Timeouts surface as a readable, endpoint-named error in the banner
+  // (TimeoutError is the DOMException AbortSignal.timeout rejects with)
+  assert.match(source, /"TimeoutError"/);
+  assert.match(source, /timed out/);
+  // Every fetch call site in the app must pass a signal — no unbounded
+  // fetches left behind
+  const fetchCalls = source.match(/fetch\(/g) || [];
+  const signaled = source.match(/AbortSignal\.timeout\(/g) || [];
+  assert.strictEqual(
+    fetchCalls.length,
+    signaled.length,
+    `every fetch() must carry an AbortSignal.timeout (found ${signaled.length}/${fetchCalls.length})`,
+  );
+});
+
 test("app clears the chart and events list together on window change", () => {
   // Normalize CRLF so the test is robust on Windows checkouts where the
   // working tree may carry \r\n line endings despite .gitattributes.
