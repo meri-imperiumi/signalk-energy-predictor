@@ -180,6 +180,33 @@ const MERGE_FIELDS = [
   "windDirectionDeg",
 ];
 
+/** m/s per knot — conversion for knots-shaped writer input. */
+const MS_PER_KNOT = 1 / 1.94384;
+
+/**
+ * Normalizes incoming hours to the cache's canonical m/s shape. Callers
+ * arrive in two shapes: live forecasts (m/s, from the ingestion FSM) and
+ * Open-Meteo archive fetches (knots, from `fetchHistoricalWeather`).
+ * `serializeHours` only persists the m/s fields, so knots-shaped input
+ * used to be silently written as null wind — every cached archive day
+ * lost its wind, which starved the WPF history replay (it compares
+ * recorded wind against cached forecast wind). Accept both shapes here,
+ * mirroring the legacy-file conversion in `deserializeHours`.
+ * @param {WeatherPoint[]} hours
+ * @returns {WeatherPoint[]}
+ */
+function normalizeHours(hours) {
+  return (hours || []).map((h) => ({
+    ...h,
+    windSpeedMs:
+      h.windSpeedMs ??
+      (h.windSpeedKnots != null ? h.windSpeedKnots * MS_PER_KNOT : null),
+    gustSpeedMs:
+      h.gustSpeedMs ??
+      (h.gustSpeedKnots != null ? h.gustSpeedKnots * MS_PER_KNOT : null),
+  }));
+}
+
 /**
  * Hour key for merge dedup: ISO string of the UTC hour. Two points for the
  * same hour merge regardless of tier.
@@ -297,7 +324,7 @@ async function writeWeatherCache(dataDir, dateKey, bucket, hours, tier) {
       existing = null;
     }
   }
-  const merged = mergeHours(existing, hours, tier);
+  const merged = mergeHours(existing, normalizeHours(hours), tier);
   await fs.writeFile(filePath, JSON.stringify(serializeHours(merged)), "utf-8");
 }
 

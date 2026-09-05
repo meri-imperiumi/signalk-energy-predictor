@@ -15,6 +15,13 @@
  *   day/night bin). Katabatic gusts can push this above 1.0 at night even
  *   where the mean speed factor is well below 1.0.
  *
+ * Evidence policy for strong claims: a single observation can never claim
+ * more than 90% shelter (the observed ratio is floored), and a *resolved*
+ * factor below 0.5 (protection above 50%) is only applied once its bin has
+ * accumulated `STRONG_CLAIM_SAMPLES` accepted observations. "100%
+ * protection" is unreachable by construction — a near-zero measured wind
+ * is at least as likely an instrument fault as a wind-free anchorage.
+ *
  * Heights are normalized before learning and before application: the
  * anemometer (masthead) reading is translated to the 10 m forecast
  * reference using a logarithmic wind profile, and after WPF scaling the
@@ -286,6 +293,31 @@ const SPEED_FACTOR_MAX = 2.5;
 const GUST_FACTOR_MIN = 0;
 const GUST_FACTOR_MAX = 4;
 
+/**
+ * Floor on the per-observation measured/forecast ratio. A single
+ * observation can never claim more than 90% shelter: a near-zero measured
+ * wind against a real forecast is at least as likely an instrument fault
+ * (stuck/frozen anemometer, signal dropout) as a magical wind-free
+ * anchorage, so the learnable ratio is floored. Combined with the EMA
+ * (which starts at the no-protection default 1.0), a learned factor can
+ * never reach 0 — "100% protection" is unreachable by construction.
+ */
+const MIN_OBSERVED_RATIO = 0.1;
+
+/**
+ * Resolved (applied) factors below this are *strong claims* — protection
+ * above 50% — and require accumulated evidence before they are applied.
+ */
+const STRONG_CLAIM_FACTOR = 0.5;
+
+/**
+ * Accepted samples a bin (or the donors behind a fallback) must have
+ * before its resolved factor may drop below `STRONG_CLAIM_FACTOR`. At the
+ * 5-minute learning cadence this is under an hour of consistent
+ * observations; the history replay can earn it in one honest pass.
+ */
+const STRONG_CLAIM_SAMPLES = 10;
+
 function clampSpeedFactor(v) {
   return Math.max(SPEED_FACTOR_MIN, Math.min(SPEED_FACTOR_MAX, v));
 }
@@ -368,6 +400,17 @@ class WindProtectionStore {
     this.learnedSpeedKeys = new Set();
     /** @type {Set<string>} */
     this.learnedGustKeys = new Set();
+
+    /**
+     * Accepted-sample counts per bin — the evidence behind each learned
+     * factor. Strong protection claims (factor < STRONG_CLAIM_FACTOR) are
+     * only *applied* once a bin accumulates STRONG_CLAIM_SAMPLES samples.
+     * @type {Map<string, number>}
+     */
+    this.speedCounts = new Map();
+
+    /** @type {Map<string, number>} */
+    this.gustCounts = new Map();
 
     /** LRU of place keys (most-recently-used at the end) */
     /** @type {string[]} */
@@ -510,12 +553,15 @@ class WindProtectionStore {
     ) {
       return false;
     }
-    const observed = clampSpeedFactor(measuredSpeed / forecastSpeed);
+    const observed = clampSpeedFactor(
+      Math.max(measuredSpeed / forecastSpeed, MIN_OBSERVED_RATIO),
+    );
     const key = placeSectorKey(placeKey, sector);
     const existing = this.speedFactors.get(key) ?? DEFAULT_FACTOR;
     const updated = this.alpha * observed + (1 - this.alpha) * existing;
     this.speedFactors.set(key, clampSpeedFactor(updated));
     this.learnedSpeedKeys.add(key);
+    this.speedCounts.set(key, (this.speedCounts.get(key) ?? 0) + 1);
     return true;
   }
 
@@ -523,12 +569,15 @@ class WindProtectionStore {
    * @private
    */
   _learnGust(placeKey, sector, night, measuredGust, forecastGust) {
-    const observed = clampGustFactor(measuredGust / forecastGust);
+    const observed = clampGustFactor(
+      Math.max(measuredGust / forecastGust, MIN_OBSERVED_RATIO),
+    );
     const key = placeSectorNightKey(placeKey, sector, night);
     const existing = this.gustFactors.get(key) ?? DEFAULT_FACTOR;
     const updated = this.alpha * observed + (1 - this.alpha) * existing;
     this.gustFactors.set(key, clampGustFactor(updated));
     this.learnedGustKeys.add(key);
+    this.gustCounts.set(key, (this.gustCounts.get(key) ?? 0) + 1);
     return true;
   }
 
@@ -566,7 +615,36 @@ class WindProtectionStore {
     for (const k of [...this.learnedGustKeys]) {
       if (k.startsWith(prefix)) this.learnedGustKeys.delete(k);
     }
+    for (const k of [...this.speedCounts.keys()]) {
+      if (k.startsWith(prefix)) this.speedCounts.delete(k);
+    }
+    for (const k of [...this.gustCounts.keys()]) {
+      if (k.startsWith(prefix)) this.gustCounts.delete(k);
+    }
     this.anchorages.delete(placeKey);
+  }
+
+  /**
+   * Evidence gate for strong protection claims. Factors at or above
+   * `STRONG_CLAIM_FACTOR` pass through unchanged; a lower (more
+   * protective) factor is only applied once its bin has accumulated
+   * `STRONG_CLAIM_SAMPLES` accepted samples. Until then the resolved
+   * value is held at the threshold — an extraordinary shelter claim
+   * ("this anchorage cuts more than half the wind", and especially
+   * "almost all of it") needs repeated consistent observations, not a
+   * single sample that may be an instrument fault or a poisoned basis.
+   *
+   * The learned EMA itself is never rewritten by this gate; only what is
+   * *applied* (predictions, published factors, fallback donors).
+   *
+   * @private
+   * @param {number} factor - Learned (or fallback-resolved) factor
+   * @param {number} [count] - Accepted samples behind that factor
+   * @returns {number}
+   */
+  _gateStrongClaim(factor, count) {
+    if (factor == null || factor >= STRONG_CLAIM_FACTOR) return factor;
+    return (count ?? 0) >= STRONG_CLAIM_SAMPLES ? factor : STRONG_CLAIM_FACTOR;
   }
 
   /**
@@ -666,13 +744,17 @@ class WindProtectionStore {
    */
   getFactorsWithFallback(key, sector, night, opts = {}) {
     const learned = this.getFactors(key, sector, night);
+    const sKey = placeSectorKey(key, sector);
+    const gKey = placeSectorNightKey(key, sector, night);
     const speedSource =
       learned.speedSource === SOURCE_LEARNED
         ? SOURCE_LEARNED
         : this._fallbackSpeedSource(key, sector);
     const speed =
       speedSource === SOURCE_LEARNED
-        ? learned.speed
+        ? // Strong protection claims are only applied once the bin has
+          // the samples to prove them (see _gateStrongClaim)
+          this._gateStrongClaim(learned.speed, this.speedCounts.get(sKey))
         : this._fallbackSpeed(key, sector, speedSource);
 
     const gustSource =
@@ -681,7 +763,7 @@ class WindProtectionStore {
         : this._fallbackGustSource(key, sector, night, opts);
     const gust =
       gustSource === SOURCE_LEARNED
-        ? learned.gust
+        ? this._gateStrongClaim(learned.gust, this.gustCounts.get(gKey))
         : this._fallbackGust(key, sector, night, gustSource, opts);
 
     return { speed, gust, speedSource, gustSource };
@@ -709,20 +791,35 @@ class WindProtectionStore {
   }
 
   /**
+   * Gated read of a learned speed factor: the value a fallback (or the
+   * application path) may borrow, with strong claims held at the evidence
+   * threshold until the bin has proven them.
+   * @private
+   */
+  _gatedSpeed(sKey) {
+    const f = this.speedFactors.get(sKey);
+    if (f == null) return DEFAULT_FACTOR;
+    return this._gateStrongClaim(f, this.speedCounts.get(sKey));
+  }
+
+  /**
+   * Gated read of a learned gust factor. @private
+   */
+  _gatedGust(gKey) {
+    const f = this.gustFactors.get(gKey);
+    if (f == null) return DEFAULT_FACTOR;
+    return this._gateStrongClaim(f, this.gustCounts.get(gKey));
+  }
+
+  /**
    * @private
    */
   _fallbackSpeed(key, sector, source) {
     if (source === SOURCE_ADJACENT) {
-      return this._meanAdjacent(
-        key,
-        sector,
-        this.speedFactors,
-        this.learnedSpeedKeys,
-        placeSectorKey,
-      );
+      return this._meanAdjacent(key, sector);
     }
     if (source === SOURCE_PLACE_AVERAGE) {
-      return this._placeAverage(key, this.speedFactors, this.learnedSpeedKeys);
+      return this._placeAverage(key);
     }
     return DEFAULT_FACTOR;
   }
@@ -757,10 +854,10 @@ class WindProtectionStore {
     if (source === SOURCE_CROSS_BIN) {
       // Borrowed across the day/night bin only ever *reduces* a forecast
       // gust, never inflates one (katabatic risk lives in the night bin).
-      const borrowed = this.gustFactors.get(
+      const borrowed = this._gatedGust(
         placeSectorNightKey(key, sector, !night),
       );
-      return Math.min(borrowed ?? DEFAULT_FACTOR, DEFAULT_FACTOR);
+      return Math.min(borrowed, DEFAULT_FACTOR);
     }
     if (source === SOURCE_ADJACENT) {
       return this._meanAdjacentNight(key, sector, night);
@@ -809,22 +906,25 @@ class WindProtectionStore {
   }
 
   /**
-   * Mean of the learned adjacent-sector factors. Averages both neighbors
-   * when both are learned, uses the single learned one otherwise. Only
-   * genuinely learned neighbors contribute (non-cascading).
+   * Mean of the learned adjacent-sector factors, read through the
+   * evidence gate so an unproven strong claim never leaks into a
+   * neighboring sector's fallback. Averages both neighbors when both are
+   * learned, uses the single learned one otherwise. Only genuinely
+   * learned neighbors contribute (non-cascading).
    *
    * @private
    * @param {string} key - Place cell key
    * @param {number} sector - 0–7
-   * @param {Map<string, number>} factors - Factor map (speed or gust)
-   * @param {Set<string>} learned - Learned key set for this family
-   * @param {(key: string, sector: number) => string} keyFn - sector key fn
    * @returns {number}
    */
-  _meanAdjacent(key, sector, factors, learned, keyFn) {
-    const neighbors = this._adjacentLearnedSectors(key, sector, learned);
+  _meanAdjacent(key, sector) {
+    const neighbors = this._adjacentLearnedSectors(
+      key,
+      sector,
+      this.learnedSpeedKeys,
+    );
     let sum = 0;
-    for (const s of neighbors) sum += factors.get(keyFn(key, s));
+    for (const s of neighbors) sum += this._gatedSpeed(placeSectorKey(key, s));
     return neighbors.length ? sum / neighbors.length : DEFAULT_FACTOR;
   }
 
@@ -833,7 +933,7 @@ class WindProtectionStore {
     const neighbors = this._adjacentLearnedSectorsNight(key, sector, night);
     let sum = 0;
     for (const s of neighbors)
-      sum += this.gustFactors.get(placeSectorNightKey(key, s, night));
+      sum += this._gatedGust(placeSectorNightKey(key, s, night));
     return neighbors.length ? sum / neighbors.length : DEFAULT_FACTOR;
   }
 
@@ -862,16 +962,18 @@ class WindProtectionStore {
   }
 
   /**
-   * Mean of all *learned* speed factors for a place (across sectors).
+   * Mean of all *learned* speed factors for a place (across sectors),
+   * read through the evidence gate so the average inherits only proven
+   * strong claims.
    * @private
    */
-  _placeAverage(key, factors, learned) {
+  _placeAverage(key) {
     const prefix = `${key}_`;
     let sum = 0;
     let n = 0;
-    for (const [k, v] of factors) {
-      if (k.startsWith(prefix) && learned.has(k)) {
-        sum += v;
+    for (const k of this.learnedSpeedKeys) {
+      if (k.startsWith(prefix)) {
+        sum += this._gatedSpeed(k);
         n++;
       }
     }
@@ -879,7 +981,9 @@ class WindProtectionStore {
   }
 
   /**
-   * Mean of all *learned* gust factors for a place in the given night bin.
+   * Mean of all *learned* gust factors for a place in the given night
+   * bin, read through the evidence gate so the average inherits only
+   * proven strong claims.
    * @private
    */
   _placeAverageGust(key, night) {
@@ -887,13 +991,9 @@ class WindProtectionStore {
     const suffix = night ? "_n" : "_d";
     let sum = 0;
     let n = 0;
-    for (const [k, v] of this.gustFactors) {
-      if (
-        k.startsWith(prefix) &&
-        k.endsWith(suffix) &&
-        this.learnedGustKeys.has(k)
-      ) {
-        sum += v;
+    for (const k of this.learnedGustKeys) {
+      if (k.startsWith(prefix) && k.endsWith(suffix)) {
+        sum += this._gatedGust(k);
         n++;
       }
     }
@@ -937,6 +1037,8 @@ class WindProtectionStore {
       gustFactors: Object.fromEntries(this.gustFactors),
       learnedSpeedKeys: [...this.learnedSpeedKeys],
       learnedGustKeys: [...this.learnedGustKeys],
+      speedCounts: Object.fromEntries(this.speedCounts),
+      gustCounts: Object.fromEntries(this.gustCounts),
       placeLru: this.placeLru,
       anchorages: Object.fromEntries(this.anchorages),
     };
@@ -974,6 +1076,16 @@ class WindProtectionStore {
     } else if (data?.gustFactors) {
       store.learnedGustKeys = new Set(Object.keys(data.gustFactors));
     }
+    // Evidence counts. Stores persisted before the strong-claim gate have
+    // none: their learned factors start unproven (count 0), so any extreme
+    // claim they carry is held at the evidence threshold until fresh
+    // samples re-prove the bin — the conservative reading of legacy data.
+    if (data?.speedCounts) {
+      store.speedCounts = new Map(Object.entries(data.speedCounts));
+    }
+    if (data?.gustCounts) {
+      store.gustCounts = new Map(Object.entries(data.gustCounts));
+    }
     if (Array.isArray(data?.placeLru)) {
       store.placeLru = [...data.placeLru];
     }
@@ -998,6 +1110,9 @@ module.exports = {
   SECTORS,
   DEFAULT_EMA_ALPHA,
   DEFAULT_FACTOR,
+  MIN_OBSERVED_RATIO,
+  STRONG_CLAIM_FACTOR,
+  STRONG_CLAIM_SAMPLES,
   DEFAULT_MIN_FORECAST_WIND_KNOTS,
   DEFAULT_ANEMOMETER_HEIGHT_M,
   DEFAULT_DEVICE_HEIGHT_M,

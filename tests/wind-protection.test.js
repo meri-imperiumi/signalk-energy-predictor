@@ -21,6 +21,9 @@ const {
   toDeviceHeight,
   DEFAULT_FACTOR,
   DEFAULT_ANEMOMETER_HEIGHT_M,
+  MIN_OBSERVED_RATIO,
+  STRONG_CLAIM_FACTOR,
+  STRONG_CLAIM_SAMPLES,
 } = require("../plugin/wind-protection.js");
 
 test.describe("sectorFromDeg", () => {
@@ -612,5 +615,120 @@ test.describe("anchorage persistence", () => {
     const r = 80 / 111320;
     const k = restored.resolvePlace(c.lat + r, c.lon + r, 500);
     assert.strictEqual(k, drop, "restored anchorage still matches a swing");
+  });
+});
+
+test.describe("evidence policy for strong protection claims", () => {
+  test("a single observation can never claim more than 90% shelter", () => {
+    // Stuck anemometer: measured 0 against a real 15 kn forecast. The raw
+    // ratio would be 0 ("100% protection"); the learnable ratio is floored
+    // so a learned factor can never reach 0.
+    const store = new WindProtectionStore({ alpha: 1, maxPlaces: 10 });
+    store.learn({
+      placeKey: "p",
+      sector: 2,
+      night: false,
+      measuredSpeed: 0,
+      forecastSpeed: 15,
+      measuredGust: 0,
+      forecastGust: 20,
+    });
+    const { speed, gust } = store.getFactors("p", 2, false);
+    assert.ok(Math.abs(speed - MIN_OBSERVED_RATIO) < 1e-9);
+    assert.ok(Math.abs(gust - MIN_OBSERVED_RATIO) < 1e-9);
+  });
+
+  test("a strong claim is held at the threshold until the bin is proven", () => {
+    const store = new WindProtectionStore({ alpha: 1, maxPlaces: 10 });
+    // One sample claiming factor 0.2 (80% protection)
+    store.learn({
+      placeKey: "p",
+      sector: 2,
+      night: false,
+      measuredSpeed: 2,
+      forecastSpeed: 10,
+    });
+    let r = store.getFactorsWithFallback("p", 2, false);
+    assert.strictEqual(r.speedSource, "learned");
+    assert.ok(
+      Math.abs(r.speed - STRONG_CLAIM_FACTOR) < 1e-9,
+      `unproven claim held at ${STRONG_CLAIM_FACTOR}, got ${r.speed}`,
+    );
+
+    // Moderate claims (≤ 50% protection) apply immediately
+    const moderate = new WindProtectionStore({ alpha: 1, maxPlaces: 10 });
+    moderate.learn({
+      placeKey: "q",
+      sector: 2,
+      night: false,
+      measuredSpeed: 7,
+      forecastSpeed: 10,
+    });
+    r = moderate.getFactorsWithFallback("q", 2, false);
+    assert.ok(Math.abs(r.speed - 0.7) < 1e-9);
+
+    // Accumulate proof: the same observation repeated STRONG_CLAIM_SAMPLES
+    // times unlocks the strong claim
+    for (let i = 1; i < STRONG_CLAIM_SAMPLES; i++) {
+      store.learn({
+        placeKey: "p",
+        sector: 2,
+        night: false,
+        measuredSpeed: 2,
+        forecastSpeed: 10,
+      });
+    }
+    r = store.getFactorsWithFallback("p", 2, false);
+    assert.ok(
+      Math.abs(r.speed - 0.2) < 1e-9,
+      `proven claim applies its factor, got ${r.speed}`,
+    );
+  });
+
+  test("fallback donors are gated: an unproven neighbor lends at most the threshold", () => {
+    const store = new WindProtectionStore({ alpha: 1, maxPlaces: 10 });
+    // Neighbor sector 1 learned once at ratio 0.2 (unproven); sector 2
+    // borrows it — but only at the evidence threshold.
+    store.learn({
+      placeKey: "p",
+      sector: 1,
+      night: false,
+      measuredSpeed: 2,
+      forecastSpeed: 10,
+    });
+    const r = store.getFactorsWithFallback("p", 2, false);
+    assert.strictEqual(r.speedSource, "adjacent-sector");
+    assert.ok(Math.abs(r.speed - STRONG_CLAIM_FACTOR) < 1e-9);
+  });
+
+  test("evidence counts persist; legacy stores without counts are re-gated", () => {
+    const store = new WindProtectionStore({ alpha: 1, maxPlaces: 10 });
+    for (let i = 0; i < STRONG_CLAIM_SAMPLES; i++) {
+      store.learn({
+        placeKey: "p",
+        sector: 2,
+        night: false,
+        measuredSpeed: 2,
+        forecastSpeed: 10,
+      });
+    }
+    const restored = WindProtectionStore.fromJSON(store.toJSON());
+    let r = restored.getFactorsWithFallback("p", 2, false);
+    assert.ok(Math.abs(r.speed - 0.2) < 1e-9, "proof survives persistence");
+
+    // A pre-evidence-gate store carries the factor but no counts: its
+    // extreme claim is held at the threshold until fresh samples re-prove
+    // the bin (the conservative reading of legacy data).
+    const legacy = WindProtectionStore.fromJSON({
+      alpha: 1,
+      speedFactors: { [`${placeKey(60.1, 21.8, 500)}_2`]: 0.1 },
+      gustFactors: {},
+    });
+    const key = [...legacy.speedFactors.keys()][0].slice(0, -2);
+    r = legacy.getFactorsWithFallback(key, 2, false);
+    assert.ok(
+      Math.abs(r.speed - STRONG_CLAIM_FACTOR) < 1e-9,
+      `legacy unproven claim gated, got ${r.speed}`,
+    );
   });
 });

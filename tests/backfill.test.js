@@ -1384,6 +1384,73 @@ test.describe("replayWindProtection", () => {
       `expected samples at the slip, got ${stats.samples}`,
     );
   });
+
+  test("never learns from tier-3/4 weather (measured nowcast as forecast)", () => {
+    // The live fallback tiers (3 = logbook hybrid, 4 = clear sky) cache the
+    // latest-known *measured* wind as their "forecast" wind. Comparing
+    // measured wind against itself yields ratio ≈ 1 by construction and
+    // cements factor 1.0 ("WPF 100%") at anchorages visited without a real
+    // forecast. The replay must refuse such hours; tier-1/2 and untagged
+    // hours stay learnable.
+    const historyData = {
+      values: [
+        { path: "navigation.state", method: "last" },
+        { path: "navigation.speedThroughWater" },
+        { path: "environment.wind.speedTrue" },
+        { path: "navigation.position" },
+      ],
+      data: [],
+    };
+    for (const m of [0, 5, 10, 15, 20, 25]) {
+      historyData.data.push([
+        new Date(NOON + m * 60000).toISOString(),
+        "anchored",
+        0,
+        4,
+        [LON, LAT],
+      ]);
+    }
+
+    const { WindProtectionStore } = require("../plugin/wind-protection.js");
+    const nowcastWeather = makeWeather(NOON).map((p) => ({
+      ...p,
+      // Hybrid wind = the boat's own measured wind (~7.8 kn), not a forecast
+      windSpeedKnots: 7.8,
+      gustSpeedKnots: 7.8,
+      tier: 3,
+    }));
+    const gated = new WindProtectionStore({ alpha: 0.5, maxPlaces: 10 });
+    const stats = replayWindProtection({
+      store: gated,
+      config: { windProtection: { enabled: true, dwellMinutes: 15 } },
+      historyData,
+      weather: nowcastWeather,
+      resolution: 300,
+    });
+    assert.strictEqual(
+      stats.samples,
+      0,
+      "must not learn from self-referential nowcast wind",
+    );
+    assert.ok(
+      stats.skippedNowcast >= 1,
+      `expected nowcast skips, got ${stats.skippedNowcast}`,
+    );
+    assert.strictEqual(gated.sizeSpeed, 0);
+
+    // Same hours tagged tier 1 (real forecast) do learn
+    const realWeather = makeWeather(NOON).map((p) => ({ ...p, tier: 1 }));
+    const learning = new WindProtectionStore({ alpha: 0.5, maxPlaces: 10 });
+    const stats2 = replayWindProtection({
+      store: learning,
+      config: { windProtection: { enabled: true, dwellMinutes: 15 } },
+      historyData,
+      weather: realWeather,
+      resolution: 300,
+    });
+    assert.ok(stats2.samples >= 1, "tier-1 hours stay learnable");
+    assert.ok(learning.sizeSpeed >= 1);
+  });
 });
 
 test.describe("populateFromHistory: wind protection", () => {
@@ -1596,6 +1663,153 @@ test("fetchHistoricalWeatherTrack is cache-first: cached days make zero requests
     assert.match(urls[0], /2026-08-21/);
     // The cached day's hour is returned alongside the fetched day's.
     assert.ok(out.some((p) => p.time.getUTCHours() === 12));
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("fetchHistoricalWeatherTrack surfaces cached days in knots with their tier", async () => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "backfill-cache-"));
+  try {
+    // Seed the cache in its m/s canonical shape (what readWeatherCache
+    // returns). The track's shape is knots — cached days must be converted
+    // so replay/sample consumers see the same fields as freshly fetched
+    // days, with `tier` preserved so the WPF replay can gate on it.
+    await writeWeatherCache(
+      dataDir,
+      "2026-08-20",
+      { latitude: 60.17, longitude: 21.39 },
+      [
+        {
+          time: new Date("2026-08-20T12:00:00Z"),
+          ghi: 800,
+          cloudCover: 0,
+          windSpeedMs: 10,
+          gustSpeedMs: 15,
+          windDirectionDeg: 90,
+          tier: 3,
+        },
+      ],
+    );
+    const out = await fetchHistoricalWeatherTrack({
+      dailyPositions: [
+        { date: "2026-08-20", latitude: 60.174, longitude: 21.386 },
+      ],
+      fetchImpl: async () => {
+        throw new Error("network must not be touched");
+      },
+      dataDir,
+    });
+    assert.strictEqual(out.length, 1);
+    // 10 m/s ≈ 19.44 kn, 15 m/s ≈ 29.16 kn
+    assert.ok(Math.abs(out[0].windSpeedKnots - 10 * 1.94384) < 1e-9);
+    assert.ok(Math.abs(out[0].gustSpeedKnots - 15 * 1.94384) < 1e-9);
+    assert.strictEqual(out[0].tier, 3);
+    // interpolateWeather exposes the tier for consumer-side gating
+    const wx = interpolateWeather(out, new Date("2026-08-20T12:00:00Z"));
+    assert.strictEqual(wx.tier, 3);
+    assert.ok(Math.abs(wx.windSpeedKnots - 10 * 1.94384) < 1e-9);
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("fetchHistoricalWeatherTrack re-fetches a windless tier-1 cached day (old writer lost the wind)", async () => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "backfill-cache-"));
+  try {
+    // Days written by the wind-dropping bug: real-forecast tier but every
+    // hour null-wind. Cache-first would keep them forever, permanently
+    // blocking the archive wind for those days — treat as a miss.
+    await writeWeatherCache(
+      dataDir,
+      "2026-08-20",
+      { latitude: 60.17, longitude: 21.39 },
+      [
+        {
+          time: new Date("2026-08-20T12:00:00Z"),
+          ghi: 800,
+          cloudCover: 0,
+          windSpeedMs: null,
+          gustSpeedMs: null,
+          windDirectionDeg: null,
+          tier: 1,
+        },
+      ],
+    );
+    const urls = [];
+    const out = await fetchHistoricalWeatherTrack({
+      dailyPositions: [
+        { date: "2026-08-20", latitude: 60.174, longitude: 21.386 },
+      ],
+      fetchImpl: async (url) => {
+        urls.push(String(url));
+        return {
+          ok: true,
+          json: async () => ({
+            hourly: {
+              time: ["2026-08-20T12:00"],
+              shortwave_radiation: [800],
+              cloud_cover: [0],
+              wind_speed_10m: [10],
+              wind_gusts_10m: [15],
+              wind_direction_10m: [90],
+            },
+          }),
+        };
+      },
+      dataDir,
+    });
+    assert.strictEqual(
+      urls.length,
+      1,
+      "windless tier-1 day must be re-fetched",
+    );
+    assert.ok(out.some((p) => p.windSpeedKnots != null));
+    // And the re-fetch repairs the cache (now with wind)
+    const repaired = await readWeatherCache(dataDir, "2026-08-20", {
+      latitude: 60.17,
+      longitude: 21.39,
+    });
+    assert.ok(repaired?.some((p) => p.windSpeedMs != null));
+  } finally {
+    await fs.rm(dataDir, { recursive: true, force: true });
+  }
+});
+
+test("fetchHistoricalWeatherTrack keeps a windless tier-4 cached day cached (legitimately windless)", async () => {
+  const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "backfill-cache-"));
+  try {
+    // Clear-sky writes carry no wind by design; they are not corruption
+    // and must not trigger a network re-fetch.
+    await writeWeatherCache(
+      dataDir,
+      "2026-08-20",
+      { latitude: 60.17, longitude: 21.39 },
+      [
+        {
+          time: new Date("2026-08-20T12:00:00Z"),
+          ghi: 800,
+          cloudCover: 0,
+          windSpeedMs: null,
+          gustSpeedMs: null,
+          windDirectionDeg: null,
+          tier: 4,
+        },
+      ],
+    );
+    let calls = 0;
+    const out = await fetchHistoricalWeatherTrack({
+      dailyPositions: [
+        { date: "2026-08-20", latitude: 60.174, longitude: 21.386 },
+      ],
+      fetchImpl: async () => {
+        calls++;
+        return { ok: true, json: async () => ({ hourly: { time: [] } }) };
+      },
+      dataDir,
+    });
+    assert.strictEqual(calls, 0, "windless tier-4 day stays cached");
+    assert.ok(out.some((p) => p.ghi === 800));
   } finally {
     await fs.rm(dataDir, { recursive: true, force: true });
   }

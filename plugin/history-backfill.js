@@ -447,7 +447,11 @@ async function fetchHistoricalWeather({
  * @param {object} [params.app] - Signal K server API for debug logging
  * @param {boolean} [params.allowNetwork=true] - When false, uncached days
  *        contribute no weather instead of being fetched.
- * @returns {Promise<Array<{time: Date, ghi: number|null, cloudCover: number|null, windSpeedKnots: number|null, gustSpeedKnots: number|null, windDirectionDeg: number|null}>>}
+ * @returns {Promise<Array<{time: Date, ghi: number|null, cloudCover: number|null, windSpeedKnots: number|null, gustSpeedKnots: number|null, windDirectionDeg: number|null, tier: number|null}>>}
+ *          `tier` records which forecast tier produced each hour (1/2 =
+ *          real forecast or archive, 3/4 = logbook/clear-sky hybrid whose
+ *          wind, if any, is a measured nowcast), so consumers like the WPF
+ *          replay can refuse to learn from self-referential wind.
  */
 async function fetchHistoricalWeatherTrack({
   dailyPositions,
@@ -465,8 +469,45 @@ async function fetchHistoricalWeatherTrack({
     if (useCache) {
       const cached = await weatherCache.readWeatherCache(dataDir, date, bucket);
       if (cached) {
-        all.push(...cached);
-        continue;
+        // Cached hours are in the cache's m/s shape; the track's shape is
+        // knots (what `fetchHistoricalWeather` returns and what
+        // `interpolateWeather` and the sample/generator replays read), so
+        // convert — keeping `tier` so consumers can tell a real forecast
+        // (tier 1/2) from a hybrid/Clear Sky point (tier 3/4).
+        // A cached day from a real-forecast tier whose hours carry no wind
+        // at all is corrupted by the old wind-dropping writer (knots-shaped
+        // input serialized as nulls): treat it as a miss so it is re-fetched
+        // instead of permanently blocking the archive wind for that day.
+        // Windless tier 3/4 days are legitimate (Clear Sky/logbook writes
+        // carry no wind) and stay cached.
+        const bestTier = cached.reduce(
+          (best, p) => (p.tier != null && p.tier < best ? p.tier : best),
+          Number.POSITIVE_INFINITY,
+        );
+        const hasWind = cached.some(
+          (p) => p.windSpeedMs != null || p.windSpeedKnots != null,
+        );
+        if (hasWind || bestTier >= 3 || bestTier === Number.POSITIVE_INFINITY) {
+          for (const p of cached) {
+            all.push({
+              time: p.time,
+              ghi: p.ghi ?? null,
+              cloudCover: p.cloudCover ?? null,
+              windSpeedKnots:
+                p.windSpeedKnots ??
+                (p.windSpeedMs != null ? p.windSpeedMs * 1.94384 : null),
+              gustSpeedKnots:
+                p.gustSpeedKnots ??
+                (p.gustSpeedMs != null ? p.gustSpeedMs * 1.94384 : null),
+              windDirectionDeg: p.windDirectionDeg ?? null,
+              tier: p.tier ?? null,
+            });
+          }
+          continue;
+        }
+        app?.debug?.(
+          `Weather cache: ${date} at ${bucket.latitude},${bucket.longitude} has no wind (corrupted by the old writer) — refetching`,
+        );
       }
     }
 
@@ -644,6 +685,7 @@ function interpolateWeather(weather, time) {
       windSpeedKnots: null,
       gustSpeedKnots: null,
       windDirectionDeg: null,
+      tier: null,
     };
   }
 
@@ -653,6 +695,9 @@ function interpolateWeather(weather, time) {
     windSpeedKnots: closest.windSpeedKnots ?? null,
     gustSpeedKnots: closest.gustSpeedKnots ?? null,
     windDirectionDeg: closest.windDirectionDeg ?? null,
+    // Which forecast tier produced this hour (1/2 = real forecast,
+    // 3/4 = logbook/clear-sky hybrid). Null on legacy/test points.
+    tier: closest.tier ?? null,
   };
 }
 
@@ -2179,7 +2224,7 @@ function replayLoadProfile({
  *        fetchHistoricalWeatherTrack)
  * @param {number} [params.resolution=DEFAULT_RESOLUTION] - Bucket seconds
  * @returns {{dataPoints: number, samples: number, skippedUnderway: number,
- *          skippedDwell: number, places: number}}
+ *          skippedDwell: number, skippedNowcast: number, places: number}}
  */
 function replayWindProtection({
   store,
@@ -2214,6 +2259,7 @@ function replayWindProtection({
   let samples = 0;
   let skippedUnderway = 0;
   let skippedDwell = 0;
+  let skippedNowcast = 0;
   let lastExplicitNavState = null;
 
   /** Pinned place key for the current at-rest session. */
@@ -2294,6 +2340,18 @@ function replayWindProtection({
 
     // Forecast for this bucket
     const wx = interpolateWeather(weather, time);
+    // Never learn from weather whose wind is itself measured wind: the
+    // live fallback tiers (3 = logbook hybrid, 4 = clear sky) cache the
+    // latest-known *measured* wind as their "forecast" wind. Comparing
+    // measured wind against itself yields a ratio of ~1 by construction
+    // and cements factor 1.0 ("no protection") at exactly the anchorages
+    // visited without a real forecast. Tier 1/2 hours (real forecast or
+    // Open-Meteo archive) and untagged hours (legacy/test fixtures) stay
+    // learnable.
+    if (wx.tier != null && wx.tier >= 3) {
+      skippedNowcast++;
+      continue;
+    }
     const forecastSpeed = wx.windSpeedKnots;
     const forecastGust = wx.gustSpeedKnots;
     // Forecast direction is degrees; fall back to the measured SK
@@ -2341,6 +2399,7 @@ function replayWindProtection({
     samples,
     skippedUnderway,
     skippedDwell,
+    skippedNowcast,
     places: store.sizePlaces,
   };
 }

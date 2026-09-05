@@ -261,6 +261,24 @@ test.describe("WPF fallback publish: factorSource paths", () => {
       `correctedSpeed should be ~${expectedCorrected.toFixed(3)} m/s (single application), got ${published[`${base}.correctedSpeed`]}`,
     );
 
+    // Human-facing protection percentages derive from the (gated) factor:
+    // the 0.66 adjacent fallback → 34% of the forecast wind taken out.
+    // The factor rendered as a percentage would read "66%" — inverted
+    // from a human's point of view (66% of the wind gets THROUGH).
+    assert.ok(
+      `${base}.speedProtection` in published,
+      "speedProtection path published",
+    );
+    assert.ok(
+      Math.abs(published[`${base}.speedProtection`] - 34) < 0.05,
+      `speedProtection should be ~34, got ${published[`${base}.speedProtection`]}`,
+    );
+    // Gust unlearned (source none, factor 1.0) → 0% protection
+    assert.ok(
+      Math.abs(published[`${base}.gustProtection`] - 0) < 1e-9,
+      `gustProtection should be 0, got ${published[`${base}.gustProtection`]}`,
+    );
+
     await plugin.stop();
   });
 });
@@ -634,6 +652,85 @@ test.describe("Bad-cycle protection: degenerate forecast keeps last good cycle",
       );
     } finally {
       fsm.getForecast = origGetForecast;
+      await plugin.stop();
+    }
+  });
+});
+
+test.describe("WPF learning basis: never learn from a measured nowcast", () => {
+  test("skips learning while the FSM serves the stale hybrid; learns from a real forecast", async () => {
+    const app = new FakeSignalKApp();
+    const lat = 60.1;
+    const lon = 21.8;
+    app.setSelfPath("navigation.position", { latitude: lat, longitude: lon });
+    app.setSelfPath("navigation.state", { value: "anchored" });
+    // Measured wind 4 m/s (~7.8 kn) from the east. The offline hybrid
+    // echoes latest-known measured wind back as its "forecast" wind —
+    // measured/measured must not be learnable (it cements factor ~1.0,
+    // shown as "WPF 100%", at anchorages visited without a forecast).
+    app.setSelfPath("environment.wind.speedTrue", { value: 4 });
+    app.setSelfPath("environment.wind.directionTrue", { value: Math.PI / 2 });
+
+    app.dataPath = await mkdtemp(join(tempDir, "t-"));
+    const plugin = makePlugin(app);
+    await plugin.start(baseConfig(), () => {});
+    const {
+      windProtection,
+      ingestionFSM,
+      runWindProtectionLearning,
+      wpfState,
+    } = plugin.__getInternals();
+    windProtection.alpha = 1;
+
+    try {
+      // Reproduce the arrival state: metered/offline uplink, no real
+      // forecast, no on-disk restore — the FSM builds the stale hybrid.
+      await ingestionFSM.buildStaleHybridForecast();
+      assert.ok(
+        ingestionFSM.currentTier >= 3,
+        `hybrid must serve at tier 3/4, got ${ingestionFSM.currentTier}`,
+      );
+      const hybridWind = ingestionFSM.lastForecast[0].windSpeedMs;
+      assert.ok(
+        hybridWind != null,
+        "hybrid carries latest-known (measured) wind",
+      );
+
+      // Bypass the dwell window and the 5-minute throttle
+      wpfState.placeKey = windProtection.resolvePlace(lat, lon, 500);
+      wpfState.arrivedAt = Date.now() - 20 * 60000;
+      wpfState.lastLearn = 0;
+
+      await runWindProtectionLearning();
+      assert.strictEqual(
+        windProtection.sizeSpeed,
+        0,
+        "must not learn from measured-as-forecast wind",
+      );
+
+      // The same tick with a real (tier 1) forecast carrying wind learns
+      ingestionFSM.lastForecast = [
+        {
+          time: new Date(),
+          ghi: 0,
+          cloudCover: null,
+          windSpeedMs: 10,
+          gustSpeedMs: null,
+          windDirectionDeg: 90,
+        },
+      ];
+      ingestionFSM.currentTier = 1; // Tier.OPEN_METEO
+      ingestionFSM.lastFetchTime = new Date();
+      await runWindProtectionLearning();
+      assert.ok(
+        windProtection.sizeSpeed >= 1,
+        "learns from a real forecast wind",
+      );
+      // 4 m/s measured at 13 m ≈ 7.59 kn at the 10 m reference vs
+      // 10 m/s ≈ 19.4 kn forecast → factor ≈ 0.39
+      const factors = windProtection.getFactors(wpfState.placeKey, 2, false);
+      assert.ok(factors.speed > 0.3 && factors.speed < 0.5);
+    } finally {
       await plugin.stop();
     }
   });

@@ -87,6 +87,40 @@ test("write then read round-trips with Date objects and tier preserved", async (
   assert.strictEqual(got[0].tier, 1);
 });
 
+test("writeWeatherCache accepts knots-shaped hours (archive fetches) without losing wind", async () => {
+  // `fetchHistoricalWeather` returns wind in knots under
+  // `windSpeedKnots`/`gustSpeedKnots`. The cache persists only the m/s
+  // fields, so knots-shaped input used to be written as null wind — every
+  // cached archive day lost its wind (starving the WPF history replay).
+  // The writer must normalize both shapes.
+  const dir = await mkTmpDir();
+  const bucket = { latitude: 60.17, longitude: 21.39 };
+  await writeWeatherCache(
+    dir,
+    DATE,
+    bucket,
+    [
+      {
+        time: new Date(NOON_ISO),
+        ghi: 800,
+        cloudCover: 0,
+        windSpeedKnots: 20,
+        gustSpeedKnots: 30,
+        windDirectionDeg: 90,
+      },
+    ],
+    1,
+  );
+  const got = await readWeatherCache(dir, DATE, bucket);
+  assert.ok(got);
+  // 20 kn ≈ 10.289 m/s, 30 kn ≈ 15.433 m/s
+  assert.ok(Math.abs(got[0].windSpeedMs - 20 / 1.94384) < 1e-9);
+  assert.ok(Math.abs(got[0].gustSpeedMs - 30 / 1.94384) < 1e-9);
+  assert.strictEqual(got[0].tier, 1);
+  // The knots keys must not leak into the canonical shape
+  assert.strictEqual("windSpeedKnots" in got[0], false);
+});
+
 test("readWeatherCache converts legacy *Knots wind fields to m/s", async () => {
   // Pre-m/s caches stored wind in knots under `windSpeedKnots`/
   // `gustSpeedKnots`. New reads must convert those to m/s so old on-disk

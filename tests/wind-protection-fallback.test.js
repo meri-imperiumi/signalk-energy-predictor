@@ -27,12 +27,25 @@ const {
   SOURCE_PLACE_AVERAGE,
   SOURCE_CROSS_BIN,
   SOURCE_NONE,
+  STRONG_CLAIM_SAMPLES,
 } = require("../plugin/wind-protection.js");
 
-/** Pins a speed factor for a bin by learning with alpha=1. */
+/**
+ * Learns a bin enough times to prove even a strong protection claim, so
+ * pinned factors resolve ungated (the fallback machinery under test here
+ * is orthogonal to the evidence gate).
+ * @param {WindProtectionStore} store
+ * @param {object} sample - One learn() sample, replayed to proof
+ */
+function learnToProof(store, sample) {
+  for (let i = 0; i < STRONG_CLAIM_SAMPLES; i++) {
+    store.learn(sample);
+  }
+}
+
 function pinSpeed(store, placeKey, sector, ratio) {
   const forecast = 10;
-  store.learn({
+  learnToProof(store, {
     placeKey,
     sector,
     night: false,
@@ -46,7 +59,7 @@ function pinGust(store, placeKey, sector, night, ratio) {
   // Speed must pass its gate too (forecastSpeed >= minForecastWindKnots);
   // pin a harmless speed factor alongside.
   const forecast = 10;
-  store.learn({
+  learnToProof(store, {
     placeKey,
     sector,
     night,
@@ -66,7 +79,9 @@ function pinGust(store, placeKey, sector, night, ratio) {
  */
 function pinGustOnly(store, placeKey, sector, night, ratio) {
   const forecast = 10;
-  store._learnGust(placeKey, sector, night, forecast * ratio, forecast);
+  for (let i = 0; i < STRONG_CLAIM_SAMPLES; i++) {
+    store._learnGust(placeKey, sector, night, forecast * ratio, forecast);
+  }
 }
 
 test.describe("getFactors reports the source", () => {

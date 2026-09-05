@@ -8,6 +8,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **WPF no longer learns from measured wind posing as forecast, and strong
+  protection claims now require proof.** At an anchorage visited without a
+  real forecast (metered uplink: tier 1 skipped by design, no tier-2
+  provider, on-disk restore past its staleness window) the ingestion FSM
+  serves the stale-boundary hybrid, whose wind is the latest-known
+  *measured* wind. The WPF learning tick compared that against the live
+  measured wind — a self-comparison whose ratio is ~1 by construction —
+  and cemented factor ≈ 1.0 ("WPF 100%", no protection) at exactly the
+  places where shelter learning matters most. Learning now waits for a
+  real forecast tier (live fetch or on-disk restore), and the history
+  replay likewise refuses weather hours tagged tier 3/4 (their wind, if
+  any, is a measured nowcast cached by the live fallback). On top of that,
+  strong claims are evidence-gated: a single observation can never claim
+  more than 90% shelter (the learnable ratio is floored at 0.1, so 100%
+  protection is unreachable by construction — a near-zero measured wind
+  is at least as likely a stuck anemometer as a wind-free anchorage), and
+  a resolved factor below 0.5 (protection above 50%) is only applied once
+  its bin has accumulated ten accepted samples — including via fallback
+  donors, whose borrowed values are gated at the same threshold. Learned
+  factors from stores persisted before the gate start unproven and
+  re-prove themselves as fresh samples arrive.
+- **The weather cache no longer silently drops wind.** Archive fetches
+  return wind in knots while the cache persists only the m/s fields, so
+  every cached archive day was written with null wind — starving the WPF
+  history replay (and the retro overlay's wind-based numbers) of forecast
+  wind for any day served from cache. The writer now normalizes both
+  shapes; cached days surface on the track in knots with their tier, and
+  a cached real-tier day whose hours carry no wind at all (corrupted by
+  the old writer) is treated as a cache miss and re-fetched instead of
+  permanently blocking the archive wind for that day.
 - **The webapp no longer hangs on "Loading…" when the weather cache is
   cold.** `/api/retro-predicted` fetched Open-Meteo archive weather on the
   request path: with an unreachable uplink each uncached day burned the

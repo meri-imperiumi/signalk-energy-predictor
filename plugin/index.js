@@ -783,6 +783,15 @@ module.exports = (app) => {
    * `forecastGust` stay forecast-only — null when the tier has no wind —
    * so consumers can tell a real forecast from a measured nowcast.
    *
+   * `speedProtection`/`gustProtection` are the human-facing percentages:
+   * how much of the wind the anchorage takes out, (1 − factor) × 100.
+   * The factor is a multiplier and reads inverted as a percentage
+   * (factor 1.0 — measured equals forecast, NO protection — renders as
+   * "100%"), so panels should prefer these: measured == forecast → 0,
+   * sheltered to 40% of forecast → 60. The evidence policy bounds them:
+   * an unproven strong claim holds at 50 and the learnable-ratio floor
+   * caps them at 90.
+   *
    * @returns {void}
    */
   function publishWindProtection() {
@@ -813,6 +822,8 @@ module.exports = (app) => {
       [`${base}.gustFactor`]: null,
       [`${base}.speedFactorSource`]: null,
       [`${base}.gustFactorSource`]: null,
+      [`${base}.speedProtection`]: null,
+      [`${base}.gustProtection`]: null,
       [`${base}.forecastSpeed`]: null,
       [`${base}.forecastGust`]: null,
       [`${base}.correctedSpeed`]: null,
@@ -853,6 +864,24 @@ module.exports = (app) => {
           updates[`${base}.gustFactorSource`] = ctx.gustSource;
           updates[`${base}.forecastSpeed`] = current.windSpeedMs ?? null;
           updates[`${base}.forecastGust`] = current.gustSpeedMs ?? null;
+          // Human-facing protection percentages: how much of the wind the
+          // anchorage takes out, derived from the (evidence-gated) factor.
+          // The factor itself is a multiplier and reads inverted when
+          // rendered as a percentage (factor 1.0 — measured equals
+          // forecast, i.e. NO protection — displays as "100%"), which is
+          // exactly how a self-comparison-poisoned bin showed "WPF 100%"
+          // at an anchorage with real wind. These paths say it directly:
+          // measured == forecast → 0; sheltered to 40% of forecast → 60.
+          // Bounded by the evidence policy: an unproven strong claim is
+          // held at 50, and the floor on learnable ratios caps this at 90.
+          const protectionFromFactor = (f) =>
+            f == null ? null : Math.round((1 - f) * 1000) / 10;
+          updates[`${base}.speedProtection`] = protectionFromFactor(
+            ctx.speedFactor,
+          );
+          updates[`${base}.gustProtection`] = protectionFromFactor(
+            ctx.gustFactor,
+          );
         }
         // The corrected values are meaningful even without a learned
         // factor (identity passthrough at sea) and even without a forecast
@@ -2268,6 +2297,25 @@ module.exports = (app) => {
     );
     if (!current) return;
 
+    // Never learn from a "forecast" whose wind is itself measured wind.
+    // Without a real forecast (metered uplink: tier 1 is skipped by design;
+    // no tier-2 weather provider; the on-disk restore older than its
+    // staleness window) the FSM serves the stale-boundary hybrid (tier 3)
+    // or Clear Sky (tier 4), whose `windSpeedMs` is the latest-known
+    // *measured* wind. Comparing measured wind against itself yields a
+    // ratio of ~1 by construction and cements factor 1.0 ("no protection",
+    // shown as WPF 100%) at exactly the anchorages visited without a real
+    // forecast — when local shelter learning would matter most. Tiers 3/4
+    // never carry real forecast wind, so gate on the FSM's current tier
+    // and wait for a real forecast (live fetch or on-disk restore).
+    const forecastTier = ingestionFSM.currentTier ?? 0;
+    if (forecastTier >= Tier.LOGBOOK) {
+      app.debug(
+        `WPF: forecast is tier ${forecastTier} (no real forecast wind) — skipping learning`,
+      );
+      return;
+    }
+
     // The ingestion forecast is in m/s (engine canonical unit); the
     // learning pipeline works in knots (recorder on-disk format,
     // minForecastWindKnots threshold), so convert at this boundary.
@@ -2954,6 +3002,10 @@ module.exports = (app) => {
     recordSample,
     resolveWindProtectionContext,
     publishWindProtection,
+    runWindProtectionLearning,
+    get wpfState() {
+      return wpfState;
+    },
     buildCycleAdvisories,
     getActiveEngines,
     getActiveGensets,
