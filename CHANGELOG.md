@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.1] - 2026-09-05
+
 ### Fixed
 - **Webapp API fetches now carry a client-side timeout, so a response
   that never lands can no longer stick the app on "Loading…" forever.**
