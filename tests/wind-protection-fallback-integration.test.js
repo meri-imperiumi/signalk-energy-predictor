@@ -326,6 +326,118 @@ test.describe("WPF identity passthrough: no learned data at all", () => {
   });
 });
 
+test.describe("WPF corrected paths without forecast wind (tiers 3/4)", () => {
+  const base = "electrical.energy.prediction.windProtection";
+
+  async function startWithWindlessForecast(app) {
+    const plugin = makePlugin(app);
+    app.dataPath = await mkdtemp(join(tempDir, "t-"));
+    await plugin.start(baseConfig(), () => {});
+    // Tier-3/4 style current hour: solar geometry only, no wind at all.
+    const engine = plugin.__getInternals().predictionEngine;
+    engine.lastRawForecast = [
+      {
+        time: new Date(),
+        windSpeedMs: null,
+        gustSpeedMs: null,
+        windDirectionDeg: null,
+        ghi: 400,
+        cloudCover: 0.5,
+      },
+    ];
+    engine.lastForecast = engine.lastRawForecast;
+
+    const pub = plugin.__getInternals().advisoryPublisher;
+    let published = null;
+    const orig = pub.publishDelta.bind(pub);
+    pub.publishDelta = (u) => {
+      published = u;
+      orig(u);
+    };
+    plugin.__getInternals().publishWindProtection();
+    assert.ok(published, "a windProtection delta was published");
+    return { plugin, published };
+  }
+
+  test("at anchor: corrected deltas carry the measured wind, forecast paths stay null", async () => {
+    const app = new FakeSignalKApp();
+    app.setSelfPath("navigation.position", {
+      latitude: 60.1,
+      longitude: 21.8,
+    });
+    app.setSelfPath("navigation.state", "anchored");
+    // Measured wind: 6 m/s from the east (π/2 rad). No gust history →
+    // no gust estimate (currentWindGustMs needs ≥2 samples).
+    app.setSelfPath("environment.wind.speedTrue", 6);
+    app.setSelfPath("environment.wind.directionTrue", Math.PI / 2);
+
+    const { plugin, published } = await startWithWindlessForecast(app);
+
+    // Honest provenance: the tier carries no wind, so the forecast paths
+    // must not fabricate one.
+    assert.strictEqual(published[`${base}.forecastSpeed`], null);
+    assert.strictEqual(published[`${base}.forecastGust`], null);
+    // The corrected paths nowcast from the measured wind. Nothing is
+    // learned here, so the WPF is identity: corrected == measured.
+    assert.strictEqual(
+      published[`${base}.correctedSpeed`],
+      6,
+      `correctedSpeed should carry the measured 6 m/s, got ${published[`${base}.correctedSpeed`]}`,
+    );
+    assert.strictEqual(published[`${base}.correctedGust`], null);
+    // Place resolved (at rest): factor fields publish with honest sources.
+    assert.ok(published[`${base}.placeKey`] != null);
+    assert.strictEqual(published[`${base}.speedFactorSource`], "none");
+
+    await plugin.stop();
+  });
+
+  test("under way (offshore passage case): measured nowcast still publishes", async () => {
+    const app = new FakeSignalKApp();
+    app.setSelfPath("navigation.position", {
+      latitude: -19.19,
+      longitude: -169.77,
+    });
+    app.setSelfPath("navigation.state", "sailing");
+    app.setSelfPath("environment.wind.speedTrue", 7.5);
+    app.setSelfPath("environment.wind.directionTrue", Math.PI);
+
+    const { plugin, published } = await startWithWindlessForecast(app);
+
+    // Under way the WPF is identity and the place fields stay cleared —
+    // but the corrected paths must still carry the measured nowcast
+    // (during a forecast-degraded passage these used to go null).
+    assert.strictEqual(published[`${base}.placeKey`], null);
+    assert.strictEqual(published[`${base}.speedFactor`], null);
+    assert.strictEqual(
+      published[`${base}.correctedSpeed`],
+      7.5,
+      `correctedSpeed should carry the measured 7.5 m/s, got ${published[`${base}.correctedSpeed`]}`,
+    );
+    assert.strictEqual(published[`${base}.correctedGust`], null);
+
+    await plugin.stop();
+  });
+
+  test("no wind anywhere: corrected paths stay null, not calm", async () => {
+    const app = new FakeSignalKApp();
+    app.setSelfPath("navigation.position", {
+      latitude: 60.1,
+      longitude: 21.8,
+    });
+    app.setSelfPath("navigation.state", "anchored");
+    // No forecast wind, no instruments: nothing to publish
+
+    const { plugin, published } = await startWithWindlessForecast(app);
+
+    assert.strictEqual(published[`${base}.correctedSpeed`], null);
+    assert.strictEqual(published[`${base}.correctedGust`], null);
+    assert.strictEqual(published[`${base}.forecastSpeed`], null);
+
+    await plugin.stop();
+  });
+});
+
 test.describe("WPF fallback non-cascading at the application path", () => {
   test("sector 3 does not inherit sector 2's borrowed value (falls to place average)", async () => {
     const app = new FakeSignalKApp();

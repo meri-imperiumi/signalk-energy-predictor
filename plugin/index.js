@@ -559,6 +559,44 @@ module.exports = (app) => {
   }
 
   /**
+   * Current measured wind as a nowcast basis for the wind-protection
+   * deltas when the active forecast tier carries no wind (tiers 3/4:
+   * logbook oktas, clear sky).
+   *
+   * Speed prefers true wind, then over-ground, then apparent (the same
+   * chain the WPF learning uses); gust reuses currentWindGustMs() (recent
+   * max — no dedicated gust sensor on board); direction is true wind
+   * direction, converted to the degrees the WPF sector lookup expects.
+   *
+   * @returns {{speedMs: number|null, gustMs: number|null, directionDeg: number|null}}
+   *          Values in m/s / degrees, or null when not measurable
+   */
+  function liveWindNow() {
+    const speedMs =
+      toNumber(
+        deltaState.get("environment.wind.speedTrue") ||
+          app.getSelfPath("environment.wind.speedTrue"),
+      ) ??
+      toNumber(
+        deltaState.get("environment.wind.speedOverGround") ||
+          app.getSelfPath("environment.wind.speedOverGround"),
+      ) ??
+      toNumber(
+        deltaState.get("environment.wind.speedApparent") ||
+          app.getSelfPath("environment.wind.speedApparent"),
+      );
+    const dirRad = toNumber(
+      deltaState.get("environment.wind.directionTrue") ||
+        app.getSelfPath("environment.wind.directionTrue"),
+    );
+    return {
+      speedMs,
+      gustMs: currentWindGustMs(),
+      directionDeg: dirRad != null ? (dirRad * 180) / Math.PI : null,
+    };
+  }
+
+  /**
    * Resolves the full Wind Protection Factor context for the vessel's
    * current place and a forecast wind direction.
    *
@@ -733,9 +771,17 @@ module.exports = (app) => {
    * `electrical.energy.prediction.windProtection.*` so other consumers and
    * the instrument panel can see the learned correction for this place.
    *
-   * Only meaningful at rest with a learned place; under way or with no
-   * learned factor the paths are cleared (values set to null) so stale
-   * numbers don't linger.
+   * The factor/place fields are only meaningful at rest with a resolved
+   * place; under way or with no learned factor they are cleared (null) so
+   * stale anchorage numbers don't linger.
+   *
+   * `correctedSpeed`/`correctedGust` publish the **effective wind now**:
+   * the current forecast hour's wind when the active tier carries one,
+   * otherwise the current measured wind as a nowcast (tiers 3/4 carry no
+   * wind at all), in both cases adjusted by the WPF (learned factor at a
+   * protected anchorage, identity under way / at sea). `forecastSpeed`/
+   * `forecastGust` stay forecast-only — null when the tier has no wind —
+   * so consumers can tell a real forecast from a measured nowcast.
    *
    * @returns {void}
    */
@@ -777,28 +823,48 @@ module.exports = (app) => {
     if (current && pos) {
       const { sunPosition } = require("./solar.js");
       const sunPos = sunPosition(now, pos.latitude, pos.longitude);
-      // The engine's corrected forecast is in m/s; publish m/s deltas.
-      const ctx = resolveWindProtectionContext(
-        current.windSpeedMs ?? 0,
-        current.gustSpeedMs ?? null,
-        current.windDirectionDeg ?? 0,
-        sunPos.altitude,
-      );
-      if (ctx.placeKey != null) {
-        updates[`${base}.placeKey`] = ctx.placeKey;
-        updates[`${base}.sector`] = ctx.sector >= 0 ? ctx.sector : null;
-        updates[`${base}.night`] = ctx.night;
-        updates[`${base}.speedFactor`] = ctx.speedFactor;
-        updates[`${base}.gustFactor`] = ctx.gustFactor;
-        updates[`${base}.speedFactorSource`] = ctx.speedSource;
-        updates[`${base}.gustFactorSource`] = ctx.gustSource;
-        updates[`${base}.forecastSpeed`] = current.windSpeedMs ?? null;
-        updates[`${base}.forecastGust`] = current.gustSpeedMs ?? null;
+      // Wind basis for the corrected paths: the current forecast hour's
+      // wind when the active tier carries one; otherwise the current
+      // MEASURED wind as a nowcast. Tiers 3/4 (logbook oktas, clear sky)
+      // carry no wind, which used to leave correctedSpeed/correctedGust
+      // null — the instrument panel lost wind entirely on forecast-
+      // degraded days. The measured basis flows through the same WPF
+      // correction a forecast would (identity when none applies).
+      const live = liveWindNow();
+      const basisSpeed = current.windSpeedMs ?? live.speedMs;
+      const basisGust = current.gustSpeedMs ?? live.gustMs;
+      const basisDir = current.windDirectionDeg ?? live.directionDeg;
+
+      if (basisSpeed != null) {
+        // The engine's corrected forecast is in m/s; publish m/s deltas.
+        const ctx = resolveWindProtectionContext(
+          basisSpeed,
+          basisGust,
+          basisDir ?? 0,
+          sunPos.altitude,
+        );
+        if (ctx.placeKey != null) {
+          updates[`${base}.placeKey`] = ctx.placeKey;
+          updates[`${base}.sector`] = ctx.sector >= 0 ? ctx.sector : null;
+          updates[`${base}.night`] = ctx.night;
+          updates[`${base}.speedFactor`] = ctx.speedFactor;
+          updates[`${base}.gustFactor`] = ctx.gustFactor;
+          updates[`${base}.speedFactorSource`] = ctx.speedSource;
+          updates[`${base}.gustFactorSource`] = ctx.gustSource;
+          updates[`${base}.forecastSpeed`] = current.windSpeedMs ?? null;
+          updates[`${base}.forecastGust`] = current.gustSpeedMs ?? null;
+        }
         // The corrected values are meaningful even without a learned
-        // factor (identity passthrough at sea): the consumer sees the
-        // forecast itself plus "no correction applied".
+        // factor (identity passthrough at sea) and even without a forecast
+        // at all (measured nowcast): the consumer always sees an effective
+        // wind. Floor the gust at the speed — a gust is by definition a
+        // peak above the mean (resolveWindProtectionContext floors only
+        // its correction path, not the disabled passthrough).
         updates[`${base}.correctedSpeed`] = ctx.correctedSpeed;
-        updates[`${base}.correctedGust`] = ctx.correctedGust;
+        updates[`${base}.correctedGust`] =
+          ctx.correctedGust != null
+            ? Math.max(ctx.correctedGust, ctx.correctedSpeed)
+            : null;
       }
     }
 

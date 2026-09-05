@@ -8,6 +8,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **`windProtection.correctedSpeed`/`correctedGust` now publish a measured
+  nowcast when the active forecast tier carries no wind.** Tiers 3/4
+  (logbook oktas, clear sky) have no wind data, which left the corrected
+  wind paths null on forecast-degraded days (e.g. a whole offshore passage
+  on a metered uplink) — the instrument panel lost wind entirely. The
+  corrected paths now use the current forecast hour's wind when the tier
+  has one, otherwise the current measured wind (true → over-ground →
+  apparent; gust from the recent-max estimate), in both cases adjusted by
+  the wind protection factor like a forecast would be (identity under way
+  or with nothing learned). `forecastSpeed`/`forecastGust` stay
+  forecast-only — null when the tier has no wind — so a real forecast
+  remains distinguishable from a measured nowcast.
 - **Weather and logbook tiers now talk to the Signal K server the plugin
   runs inside, in-process — no more localhost HTTP reads** (work doc #17
   follow-up). Tier 2 calls `app.weatherApi.getForecasts()` directly — the
