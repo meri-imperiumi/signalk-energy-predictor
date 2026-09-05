@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.8.2] - 2026-09-05
+
 ### Fixed
 - **Week/month timeline views no longer time out on production-scale
   recordings.** Opening the week view on the boat served
