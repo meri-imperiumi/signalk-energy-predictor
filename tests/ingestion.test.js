@@ -22,6 +22,7 @@ const {
   writeWeatherCache,
   weatherPositionBucket,
 } = require("../plugin/weather-cache.js");
+const { stringify: stringifyYaml } = require("yaml");
 
 function makeApp() {
   return {
@@ -37,6 +38,48 @@ function makeFSM() {
   const fsm = new IngestionFSM(makeApp());
   fsm.position = { latitude: 60.17, longitude: 24.94 };
   return fsm;
+}
+
+/**
+ * App with an in-process Signal K Weather API answering `points` for point
+ * requests — the same getForecasts() the server's REST routes wrap.
+ */
+function makeAppWithWeather(points) {
+  return {
+    ...makeApp(),
+    weatherApi: {
+      getForecasts: async (_position, type) => (type === "point" ? points : []),
+    },
+  };
+}
+
+/**
+ * App whose server plugin data directory holds signalk-logbook YAML day
+ * files (the logbook's on-disk store), built from `{ day: entries }`.
+ */
+async function makeAppWithLogbook(days) {
+  const configPath = await fs.mkdtemp(path.join(os.tmpdir(), "ep-logbook-"));
+  const dir = path.join(configPath, "plugin-config-data", "signalk-logbook");
+  await fs.mkdir(dir, { recursive: true });
+  for (const [day, entries] of Object.entries(days)) {
+    await fs.writeFile(
+      path.join(dir, `${day}.yml`),
+      stringifyYaml(entries),
+      "utf-8",
+    );
+  }
+  return { ...makeApp(), config: { configPath } };
+}
+
+/** Writes one logbook day file directly (e.g. corrupt content). */
+async function writeLogbookDay(app, day, content) {
+  const dir = path.join(
+    app.config.configPath,
+    "plugin-config-data",
+    "signalk-logbook",
+  );
+  await fs.mkdir(dir, { recursive: true });
+  await fs.writeFile(path.join(dir, `${day}.yml`), content, "utf-8");
 }
 
 test.describe("Ingestion fallback chain", () => {
@@ -59,15 +102,15 @@ test.describe("Ingestion fallback chain", () => {
 
   test("empty forecast from a tier does not count as success", async () => {
     const fsm = makeFSM();
+    fsm.app.weatherApi = {
+      getForecasts: async () => [],
+    };
     const origFetch = globalThis.fetch;
-    // Open-Meteo times out (throws), Signal K Weather returns empty array
+    // Open-Meteo times out (throws), the Weather API returns an empty array
     // (previously a truthy [] "success" that zeroed all predictions)
     globalThis.fetch = async (url) => {
       if (String(url).includes("open-meteo")) {
         throw new Error("timeout");
-      }
-      if (String(url).includes("/signalk/v2/api/weather")) {
-        return { ok: true, json: async () => [] };
       }
       throw new Error("network down");
     };
@@ -83,28 +126,22 @@ test.describe("Ingestion fallback chain", () => {
   });
 
   test("logbook cloud observations generate a forecast with attenuated GHI", async () => {
-    const fsm = makeFSM();
-    const origFetch = globalThis.fetch;
     // Use today's date so the day is always within the 48h lookback window
     const today = new Date().toISOString().split("T")[0];
     // Open-Meteo down, logbook has one entry with 4 oktas (0.5) cloud cover
+    const app = await makeAppWithLogbook({
+      [today]: [
+        {
+          datetime: new Date(Date.now() - 3600000).toISOString(),
+          observations: { cloudCoverage: 4 },
+        },
+      ],
+    });
+    const fsm = new IngestionFSM(app);
+    fsm.position = { latitude: 60.17, longitude: 24.94 };
+    const origFetch = globalThis.fetch;
     globalThis.fetch = async (url) => {
-      const u = String(url);
-      if (u.includes("open-meteo")) throw new Error("network down");
-      if (u.includes("signalk-logbook")) {
-        if (new URL(u).pathname.endsWith("/logs")) {
-          return { ok: true, json: async () => [today] };
-        }
-        return {
-          ok: true,
-          json: async () => [
-            {
-              datetime: new Date(Date.now() - 3600000).toISOString(),
-              observations: { cloudCoverage: 4 },
-            },
-          ],
-        };
-      }
+      if (String(url).includes("open-meteo")) throw new Error("network down");
       throw new Error("network down");
     };
 
@@ -124,34 +161,30 @@ test.describe("Ingestion fallback chain", () => {
   });
 
   test("Signal K Weather API fields map to forecast points", async () => {
-    const fsm = makeFSM();
-    const origFetch = globalThis.fetch;
     // WeatherData uses wind.speedTrue (m/s), wind.gust, wind.directionTrue (rad)
+    const fsm = new IngestionFSM(
+      makeAppWithWeather([
+        {
+          date: new Date(Date.now() + 3600000).toISOString(),
+          type: "point",
+          wind: {
+            speedTrue: 10, // m/s
+            directionTrue: Math.PI, // 180 deg
+            gust: 15, // m/s
+          },
+          outside: { cloudCover: 0.5 },
+        },
+        {
+          date: new Date(Date.now() + 7200000).toISOString(),
+          type: "point",
+          wind: { speedTrue: 0 }, // calm must not become null
+        },
+      ]),
+    );
+    fsm.position = { latitude: 60.17, longitude: 24.94 };
+    const origFetch = globalThis.fetch;
     globalThis.fetch = async (url) => {
-      const u = String(url);
-      if (u.includes("open-meteo")) throw new Error("network down");
-      if (u.includes("/signalk/v2/api/weather")) {
-        return {
-          ok: true,
-          json: async () => [
-            {
-              date: new Date(Date.now() + 3600000).toISOString(),
-              type: "point",
-              wind: {
-                speedTrue: 10, // m/s
-                directionTrue: Math.PI, // 180 deg
-                gust: 15, // m/s
-              },
-              outside: { cloudCover: 0.5 },
-            },
-            {
-              date: new Date(Date.now() + 7200000).toISOString(),
-              type: "point",
-              wind: { speedTrue: 0 }, // calm must not become null
-            },
-          ],
-        };
-      }
+      if (String(url).includes("open-meteo")) throw new Error("network down");
       throw new Error("network down");
     };
 
@@ -177,18 +210,21 @@ test.describe("Ingestion fallback chain", () => {
   });
 
   test("logbook without observations falls through to Clear Sky", async () => {
-    const fsm = makeFSM();
-    const origFetch = globalThis.fetch;
     const today = new Date().toISOString().split("T")[0];
+    // Day file exists but carries no cloud observations
+    const app = await makeAppWithLogbook({
+      [today]: [
+        {
+          datetime: new Date(Date.now() - 3600000).toISOString(),
+          text: "No weather observed",
+        },
+      ],
+    });
+    const fsm = new IngestionFSM(app);
+    fsm.position = { latitude: 60.17, longitude: 24.94 };
+    const origFetch = globalThis.fetch;
     globalThis.fetch = async (url) => {
-      const u = String(url);
-      if (u.includes("open-meteo")) throw new Error("network down");
-      if (u.includes("signalk-logbook")) {
-        if (new URL(u).pathname.endsWith("/logs")) {
-          return { ok: true, json: async () => [today] };
-        }
-        return { ok: true, json: async () => [] }; // day with no entries
-      }
+      if (String(url).includes("open-meteo")) throw new Error("network down");
       throw new Error("network down");
     };
 
@@ -777,7 +813,17 @@ test.describe("Offline forecast restore + staleness + uplink cadence", () => {
   });
 
   test("metered uplink skips Open-Meteo and uses the Signal K Weather provider", async () => {
-    const fsm = makeFSM();
+    const fsm = new IngestionFSM(
+      makeAppWithWeather([
+        {
+          date: new Date(Date.now() + 3600000).toISOString(),
+          type: "point",
+          outside: { cloudCover: 0.25 },
+          wind: { speedTrue: 6, directionTrue: Math.PI / 2, gust: 9 },
+        },
+      ]),
+    );
+    fsm.position = { latitude: 60.17, longitude: 24.94 };
     fsm.setUplinkStatus({ internet: "metered" });
     const origFetch = globalThis.fetch;
     const wanUrls = [];
@@ -786,18 +832,6 @@ test.describe("Offline forecast restore + staleness + uplink cadence", () => {
       if (u.includes("open-meteo")) {
         wanUrls.push(u);
         throw new Error("Open-Meteo must not be called on a metered link");
-      }
-      if (u.includes("/signalk/v2/api/weather")) {
-        return {
-          ok: true,
-          json: async () => [
-            {
-              date: new Date(Date.now() + 3600000).toISOString(),
-              outside: { cloudCover: 0.25 },
-              wind: { speedTrue: 6, directionTrue: Math.PI / 2, gust: 9 },
-            },
-          ],
-        };
       }
       throw new Error(`unexpected fetch: ${u}`);
     };
@@ -920,32 +954,27 @@ test.describe("Offline forecast restore + staleness + uplink cadence", () => {
 
   test("stale-boundary hybrid: cache older than forecastCacheHours → logbook solar + latest-known wind", async () => {
     const dir = await mkDataDir();
-    // Live SK wind available for the nowcast.
-    const app = makeAppWith({
-      "environment.wind.speedTrue": 8, // m/s
-      "environment.wind.directionTrue": Math.PI, // 180°
+    // Open-Meteo down; logbook has one observation with 4 oktas.
+    const today = new Date().toISOString().split("T")[0];
+    const app = await makeAppWithLogbook({
+      [today]: [
+        {
+          datetime: new Date(Date.now() - 3600000).toISOString(),
+          observations: { cloudCoverage: 4 },
+        },
+      ],
     });
+    // Live SK wind available for the nowcast.
+    app.getSelfPath = (p) =>
+      p === "environment.wind.speedTrue"
+        ? 8 // m/s
+        : p === "environment.wind.directionTrue"
+          ? Math.PI // 180°
+          : null;
     const fsm = fsmWithCache(app, dir);
     const origFetch = globalThis.fetch;
-    // Open-Meteo down; logbook returns one observation with 4 oktas.
-    const today = new Date().toISOString().split("T")[0];
     globalThis.fetch = async (url) => {
-      const u = String(url);
-      if (u.includes("open-meteo")) throw new Error("network down");
-      if (u.includes("signalk-logbook")) {
-        if (new URL(u).pathname.endsWith("/logs")) {
-          return { ok: true, json: async () => [today] };
-        }
-        return {
-          ok: true,
-          json: async () => [
-            {
-              datetime: new Date(Date.now() - 3600000).toISOString(),
-              observations: { cloudCoverage: 4 },
-            },
-          ],
-        };
-      }
+      if (String(url).includes("open-meteo")) throw new Error("network down");
       throw new Error("network down");
     };
     try {
@@ -976,124 +1005,138 @@ test.describe("Offline forecast restore + staleness + uplink cadence", () => {
   });
 });
 
-test.describe("Same-server API auth and base URL (work doc #17)", () => {
+test.describe("In-process same-server reads", () => {
   const realFetch = globalThis.fetch;
   const today = new Date().toISOString().split("T")[0];
 
-  function mockLogbookFetch({
-    entries = [{ observations: { cloudCoverage: 4 } }],
-  } = {}) {
-    const requests = [];
-    globalThis.fetch = async (url, init = {}) => {
-      requests.push({
-        url: String(url),
-        headers: { ...(init.headers || {}) },
-      });
-      if (new URL(String(url)).pathname.endsWith("/logs")) {
-        return { ok: true, json: async () => [today] };
-      }
-      return {
-        ok: true,
-        json: async () =>
-          entries.map((e, i) => ({
-            datetime: new Date(Date.now() - (i + 1) * 3600000).toISOString(),
-            ...e,
-          })),
-      };
+  test("weather read goes through app.weatherApi without any HTTP", async () => {
+    // Offshore regression: the plugin must never loop back over HTTP to its
+    // own server. The old reader guessed a localhost port; on a server
+    // listening on port 80 with an unrelated service on 3000, every weather
+    // (GRIB) and logbook read 404'd against the wrong daemon and the FSM
+    // degraded to Clear Sky for a whole 6-day passage.
+    const fsm = makeFSM();
+    fsm.setUplinkStatus({ internet: "metered" });
+    const calls = [];
+    fsm.app.weatherApi = {
+      getForecasts: async (position, type, opts) => {
+        calls.push({ position, type, opts });
+        return [
+          {
+            date: new Date(Date.now() + 3600000).toISOString(),
+            type: "point",
+            outside: { cloudCover: 0.55 },
+            wind: { speedTrue: 7, gust: 9, directionTrue: 2.4 },
+          },
+        ];
+      },
     };
-    return requests;
-  }
-
-  test("logbook fetch sends dual auth headers on both requests when token configured", async () => {
-    const requests = mockLogbookFetch();
-    try {
-      const readings = await fetchLogbookCloudCover(makeApp(), 48, {
-        apiToken: "tok-123",
-      });
-      assert.ok(readings.length > 0);
-      assert.strictEqual(requests.length, 2); // day list + day entries
-      for (const r of requests) {
-        assert.strictEqual(r.headers.Authorization, "Bearer tok-123");
-        assert.strictEqual(r.headers.Cookie, "JAUTHENTICATION=tok-123");
-      }
-    } finally {
-      globalThis.fetch = realFetch;
-    }
-  });
-
-  test("logbook fetch sends no auth headers without a token", async () => {
-    const requests = mockLogbookFetch();
-    try {
-      await fetchLogbookCloudCover(makeApp(), 48);
-      assert.ok(requests.length > 0);
-      for (const r of requests) {
-        assert.strictEqual(r.headers.Authorization, undefined);
-        assert.strictEqual(r.headers.Cookie, undefined);
-      }
-    } finally {
-      globalThis.fetch = realFetch;
-    }
-  });
-
-  test("base URL defaults to same-instance localhost, honors app port and override", async () => {
-    const urls = [];
     globalThis.fetch = async (url) => {
-      urls.push(String(url));
-      if (new URL(String(url)).pathname.endsWith("/logs")) {
-        return { ok: true, json: async () => [] };
-      }
-      throw new Error("unexpected");
+      throw new Error(`no HTTP allowed, got: ${url}`);
     };
-    try {
-      await fetchLogbookCloudCover(makeApp(), 48);
-      assert.ok(urls[0].startsWith("http://localhost:3000/"));
 
-      urls.length = 0;
-      await fetchLogbookCloudCover(
-        { ...makeApp(), config: { port: 8080 } },
-        48,
+    try {
+      const forecast = await fsm.fetchForecast();
+      assert.strictEqual(
+        fsm.currentTier,
+        Tier.SIGNAL_K_WEATHER,
+        "the metered link must reuse the GRIB via the in-process weather API",
       );
-      assert.ok(urls[0].startsWith("http://localhost:8080/"));
-
-      urls.length = 0;
-      await fetchLogbookCloudCover(makeApp(), 48, {
-        apiBaseUrl: "http://192.168.2.105",
-      });
-      assert.ok(urls[0].startsWith("http://192.168.2.105/plugins/"));
+      assert.strictEqual(forecast.length, 1);
+      assert.strictEqual(forecast[0].windSpeedMs, 7);
+      assert.strictEqual(forecast[0].gustSpeedMs, 9);
+      assert.strictEqual(forecast[0].cloudCover, 0.55);
+      assert.ok(forecast[0].ghi != null, "cloud cover must synthesize a GHI");
+      // Asked the in-process API at the vessel position for the horizon.
+      assert.strictEqual(calls.length, 1);
+      assert.strictEqual(calls[0].type, "point");
+      assert.strictEqual(calls[0].position.latitude, 60.17);
+      assert.strictEqual(calls[0].position.longitude, 24.94);
+      assert.strictEqual(calls[0].opts.maxCount, fsm.forecastHours);
     } finally {
       globalThis.fetch = realFetch;
     }
   });
 
-  test("401 from server API is surfaced via app.error with a fix hint", async () => {
-    const errors = [];
-    const app = {
-      ...makeApp(),
-      error: (msg) => errors.push(msg),
-    };
-    const fsm = new IngestionFSM(app);
-    fsm.position = { latitude: 60.17, longitude: 24.94 };
-
-    globalThis.fetch = async (url) => {
-      const u = String(url);
-      if (u.includes("open-meteo")) throw new Error("network down");
-      if (u.includes("signalk")) return { ok: false, status: 401 };
-      throw new Error("unexpected");
+  test("servers without the Weather API fall through the FSM", async () => {
+    const fsm = makeFSM(); // no weatherApi on the app
+    globalThis.fetch = async () => {
+      throw new Error("network down");
     };
     try {
       const forecast = await fsm.fetchForecast();
-      // Falls through to Clear Sky, but the auth failure is visible.
       assert.strictEqual(fsm.currentTier, Tier.CLEAR_SKY);
       assert.ok(forecast.length > 0);
-      assert.strictEqual(errors.length, 1);
-      assert.match(errors[0], /401/);
-      assert.match(errors[0], /weather\.apiToken/);
-
-      // Logged once only — later fetches stay quiet until restart.
-      await fsm.fetchForecast();
-      assert.strictEqual(errors.length, 1);
     } finally {
       globalThis.fetch = realFetch;
     }
+  });
+
+  test("logbook day files are read from the server's plugin data directory", async () => {
+    const app = await makeAppWithLogbook({
+      "2020-01-01": [
+        // Outside the 48 h lookback window — ignored even though valid
+        {
+          datetime: "2020-01-01T12:00:00.000Z",
+          observations: { cloudCoverage: 2 },
+        },
+      ],
+      [today]: [
+        {
+          datetime: new Date(Date.now() - 3 * 3600000).toISOString(),
+          observations: { cloudCoverage: 4 }, // 0.5
+        },
+        {
+          datetime: new Date(Date.now() - 2 * 3600000).toISOString(),
+          text: "No weather observed",
+        },
+        {
+          datetime: new Date(Date.now() - 3600000).toISOString(),
+          observations: { cloudCoverage: 6 }, // 0.75
+        },
+      ],
+    });
+    const readings = await fetchLogbookCloudCover(app, 48);
+    assert.deepStrictEqual(
+      readings.map((r) => r.cloudCover),
+      [0.5, 0.75],
+    );
+    assert.ok(
+      readings.every((r) => r.time instanceof Date),
+      "reading times must be Dates",
+    );
+  });
+
+  test("corrupt logbook day file is skipped, healthy days still read", async () => {
+    const app = await makeAppWithLogbook({});
+    await writeLogbookDay(
+      app,
+      today,
+      "- datetime: 'not: a: valid: mapping\n  ::", // malformed YAML
+    );
+    const yesterday = new Date(Date.now() - 24 * 3600000)
+      .toISOString()
+      .split("T")[0];
+    await writeLogbookDay(
+      app,
+      yesterday,
+      stringifyYaml([
+        {
+          datetime: new Date(Date.now() - 23 * 3600000).toISOString(),
+          observations: { cloudCoverage: 1 },
+        },
+      ]),
+    );
+    const readings = await fetchLogbookCloudCover(app, 48);
+    assert.deepStrictEqual(
+      readings.map((r) => r.cloudCover),
+      [0.125],
+    );
+  });
+
+  test("missing logbook store rejects so the tier falls through", async () => {
+    const configPath = await fs.mkdtemp(path.join(os.tmpdir(), "ep-empty-"));
+    const app = { ...makeApp(), config: { configPath } };
+    await assert.rejects(() => fetchLogbookCloudCover(app, 48), /ENOENT/);
   });
 });

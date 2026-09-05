@@ -83,9 +83,9 @@ The plugin recalculates the forecast pipeline on a debounced schedule (e.g., eve
 
 | Tier | Source | Trigger Condition | Parameter Used | Math |
 | --- | --- | --- | --- | --- |
-| **1. Direct NWP** | Open-Meteo REST API | `network.wan.status == 'online'` | `shortwave_radiation` | 1:1 pass-through ($W/m^2$) |
-| **2. Signal K REST** | Signal K Weather API | Tier 1 fails / WAN offline | `cloudCover` (0.0 - 1.0) | Kasten-Czeplak attenuation |
-| **3. Logbook Persistence** | `signalk-logbook` DB | No future data in SK API | Oktas (0 - 8) | Kasten-Czeplak attenuation |
+| **1. Direct NWP** | Open-Meteo REST API | `network.internet.state` `online` (unmetered) | `shortwave_radiation` | 1:1 pass-through ($W/m^2$) |
+| **2. Signal K Weather API** | `app.weatherApi` in-process (e.g. GRIB provider) | Tier 1 fails / metered uplink | `cloudCover` (0.0 - 1.0) | Kasten-Czeplak attenuation |
+| **3. Logbook Persistence** | `signalk-logbook` YAML day files (in-process read) | No future data in SK API | Oktas (0 - 8) | Kasten-Czeplak attenuation |
 | **4. Clear Sky Baseline** | `suncalc` geometry | No recent logbook entries | Solar Altitude | Theoretical Max Irradiance |
 
 ### The Synthetic Irradiance Function (Tier 2 & 3)

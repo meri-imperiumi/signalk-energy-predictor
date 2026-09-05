@@ -29,22 +29,14 @@ At an early stage, but has been backtested against several months of real-world 
 
 Configure via Signal K Admin UI under the "Energy Predictor" plugin section:
 
-### Signal K Server Authentication
+### Signal K Weather Sources
 
-When server security is enabled, the plugin's reads of its **own server's**
-REST API — the Signal K Weather API and `signalk-logbook` entries used as
-the offline cloud-cover fallback — require an **Admin-level** token:
-
-1. Submit a Signal K Access Request from the device (or any client) and
-   approve it **as Admin** — a readonly approval still gets 401 on plugin
-   routes
-2. Paste the granted token into **Weather → Signal K API Access Token**
-
-Without it, those reads fail and the plugin falls back to lower weather
-tiers (a 401/403 is logged once with a hint). The **Signal K API Base URL
-Override** only needs setting when the server is behind a proxy or on
-another host; by default the plugin talks to `localhost` on the server's
-own port.
+The plugin always talks to the Signal K server it runs inside: tier 2 calls
+the server's Weather API (`app.weatherApi`) **in-process** — answering any
+registered weather provider such as a local GRIB download — and tier 3 reads
+`signalk-logbook` entries directly from the server's plugin data directory.
+No HTTP, ports, or access tokens are involved; there is nothing to
+configure for these tiers.
 
 ### Battery Configuration
 

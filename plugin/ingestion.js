@@ -3,12 +3,20 @@
  *
  * Tiers:
  * 1. Direct NWP (Open-Meteo REST API) - shortwave_radiation
- * 2. Signal K Weather API - cloudCover (0-1)
- * 3. Logbook Persistence - cloudCover (oktas 0-8)
+ * 2. Signal K Weather API (in-process) - cloudCover (0-1)
+ * 3. Logbook (on-disk YAML store) - cloudCover (oktas 0-8)
  * 4. Clear Sky Baseline - theoretical max from sun position
  *
+ * Tiers 2-3 always talk to the Signal K server the plugin runs inside:
+ * tier 2 calls `app.weatherApi.getForecasts()` directly (the same object
+ * the server's `/signalk/v2/api/weather` REST routes wrap) and tier 3 reads
+ * signalk-logbook's YAML day files from the server's plugin data directory.
+ * No loopback HTTP, ports, auth tokens or TLS involved (the previous
+ * localhost-HTTP reader guessed the listen port and failed silently against
+ * an unrelated service, degrading a whole offshore passage to Clear Sky).
+ *
  * On a metered uplink (`network.internet.state` = `metered`) tier 1 is
- * skipped in favor of tier 2: a same-server localhost read instead of a
+ * skipped in favor of tier 2: an in-process provider read instead of a
  * volume-billed WAN download (work doc #19).
  *
  * @file ingestion.js
@@ -21,6 +29,9 @@ const {
   oktasToFraction,
 } = require("./solar.js");
 const weatherCache = require("./weather-cache.js");
+const fs = require("node:fs/promises");
+const path = require("node:path");
+const { parse: parseYaml } = require("yaml");
 
 /**
  * Unwraps a Signal K path value to a number, handling both the bare number
@@ -63,9 +74,33 @@ function windDirectionDeg(v) {
 /** @typedef {import("@signalk/server-api").ServerAPI} ServerAPI */
 
 /**
- * Fetch timeout in milliseconds
+ * Fetch timeout in milliseconds. Applies to Open-Meteo fetches and, as a
+ * safety net, to in-process Weather API reads (a wedged provider must not
+ * stall the prediction cycle).
  */
 const FETCH_TIMEOUT = 10000;
+
+/**
+ * Races a promise against a timeout. Unlike an AbortController this cannot
+ * cancel the underlying work — in-process calls have no request to abort —
+ * but it keeps the FSM moving when one hangs.
+ *
+ * @template T
+ * @param {Promise<T>} promise
+ * @param {number} ms
+ * @param {string} label - Context for the rejection message
+ * @returns {Promise<T>}
+ */
+function withTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`${label} timed out after ${ms}ms`)),
+      ms,
+    );
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
 
 /**
  * Open-Meteo fetch attempts (initial try + retries) before giving up.
@@ -350,194 +385,112 @@ async function fetchOpenMeteo(
 }
 
 /**
- * Resolves the base URL of this Signal K server's own REST API (work doc
- * #17). The plugin normally runs on the same instance as the APIs it
- * reads (Signal K Weather, signalk-logbook), so same-instance localhost over
- * the server's own HTTP port is the default. An explicit override
- * (`weather.apiBaseUrl`) wins — useful behind a reverse proxy or when reading
- * another server. Note: signalk-server does not special-case loopback in its
- * security settings, and there is no in-process "internal request"
- * mechanism — reads go through the same auth-gated HTTP routes regardless.
- *
- * @param {ServerAPI} app
- * @param {string|undefined} override - Configured base URL override, if any
- * @returns {string} Base URL without a trailing slash
- */
-function resolveApiBaseUrl(app, override) {
-  if (override && override.trim() !== "") {
-    return override.trim().replace(/\/+$/, "");
-  }
-  // `app.config` (the server's own settings) is not part of the typed
-  // ServerAPI but is present on signalk-server; fall back to the default
-  // port when it is not.
-  const port = app.config?.port ?? 3000;
-  return `http://localhost:${port}`;
-}
-
-/**
- * Auth headers for this server's own REST API when security is enabled
- * (work doc #17). Plugin routes (e.g. signalk-logbook, Signal K Weather)
- * require an **Admin-level** token: granted via the device Access Request
- * flow and approved with Admin permission — a readonly approval still
- * yields 401. The server's auth gate reads the Authorization header; some
- * plugin code reads the JAUTHENTICATION cookie, so both are sent (same
- * pattern as signalk-dsc's logbook writer).
- *
- * @param {string|undefined} token - Admin-level device token, if configured
- * @returns {Record<string, string>} Headers to merge into the fetch call
- */
-function apiAuthHeaders(token) {
-  if (!token || token.trim() === "") return {};
-  return {
-    Authorization: `Bearer ${token}`,
-    Cookie: `JAUTHENTICATION=${token}`,
-  };
-}
-
-/**
- * Fetches forecast data from Signal K Weather API.
+ * Fetches forecast data from the Signal K Weather API **in-process** (work
+ * doc #17 follow-up). The plugin always talks to the Signal K server it
+ * runs inside: `app.weatherApi` is the same WeatherApi instance the
+ * server's `/signalk/v2/api/weather` REST routes wrap, so weather
+ * providers (e.g. a GRIB provider) registered by other plugins answer
+ * without HTTP, auth tokens or port guessing. On servers without the
+ * Weather API this throws and the FSM falls through to the next tier.
  *
  * @param {ServerAPI} app - Signal K server API
  * @param {number} latitude - Latitude in degrees
  * @param {number} longitude - Longitude in degrees
  * @param {object} [opts]
- * @param {string} [opts.apiBaseUrl] - Override for the same-server base URL
- * @param {string} [opts.apiToken] - Admin-level token for auth-gated routes
+ * @param {number} [opts.hours] - Forecast intervals to request
  * @returns {Promise<ForecastPoint[]>} Array of forecast points
  */
-async function fetchSignalKWeather(
-  app,
-  latitude,
-  longitude,
-  { apiBaseUrl, apiToken } = {},
-) {
-  const baseUrl = resolveApiBaseUrl(app, apiBaseUrl);
-  const url = new URL(`${baseUrl}/signalk/v2/api/weather/forecasts/point`);
-  url.searchParams.set("lat", latitude.toString());
-  url.searchParams.set("lon", longitude.toString());
-  url.searchParams.set("count", FORECAST_HOURS.toString());
-
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
-
-  try {
-    const response = await fetch(url.toString(), {
-      signal: controller.signal,
-      headers: apiAuthHeaders(apiToken),
-    });
-
-    if (!response.ok) {
-      const error = new Error(
-        `Signal K Weather API returned ${response.status}`,
-      );
-      error.status = response.status;
-      throw error;
-    }
-
-    const data = await response.json();
-
-    if (!Array.isArray(data)) {
-      throw new Error("Signal K Weather API response is not an array");
-    }
-
-    return data
-      .filter((point) => point.date != null)
-      .map((point) => ({
-        time: new Date(point.date),
-        ghi: null,
-        cloudCover: point.outside?.cloudCover ?? null,
-        gustSpeedMs: point.wind?.gust != null ? point.wind.gust : null,
-        windSpeedMs:
-          point.wind?.speedTrue != null ? point.wind.speedTrue : null,
-        windDirectionDeg:
-          point.wind?.directionTrue != null
-            ? (point.wind.directionTrue * 180) / Math.PI // radians to degrees
-            : null,
-      }));
-  } finally {
-    clearTimeout(timeoutId);
+async function fetchSignalKWeather(app, latitude, longitude, { hours } = {}) {
+  const weatherApi = app.weatherApi;
+  if (!weatherApi || typeof weatherApi.getForecasts !== "function") {
+    throw new Error("This Signal K server has no Weather API");
   }
+
+  const data = await withTimeout(
+    weatherApi.getForecasts({ latitude, longitude }, "point", {
+      maxCount: hours ?? FORECAST_HOURS,
+    }),
+    FETCH_TIMEOUT,
+    "Signal K Weather API",
+  );
+
+  if (!Array.isArray(data)) {
+    throw new Error("Signal K Weather API response is not an array");
+  }
+
+  return data
+    .filter((point) => point.date != null)
+    .map((point) => ({
+      time: new Date(point.date),
+      ghi: null,
+      cloudCover: point.outside?.cloudCover ?? null,
+      gustSpeedMs: point.wind?.gust != null ? point.wind.gust : null,
+      windSpeedMs: point.wind?.speedTrue != null ? point.wind.speedTrue : null,
+      windDirectionDeg:
+        point.wind?.directionTrue != null
+          ? (point.wind.directionTrue * 180) / Math.PI // radians to degrees
+          : null,
+    }));
 }
 
 /**
- * Fetches recent cloud coverage from Signal K Logbook API.
- * Note: Only entries with valid cloudCoverage observations are used.
+ * Reads recent cloud coverage from signalk-logbook's on-disk store,
+ * in-process. The logbook keeps one YAML file per UTC day at
+ * `<configPath>/plugin-config-data/signalk-logbook/<YYYY-MM-DD>.yml`
+ * (parsed with the same `yaml` package the logbook itself writes with), so
+ * this reads the very data the logbook's REST routes would serve — minus
+ * HTTP, auth tokens and port guessing. Only entries with valid
+ * cloudCoverage observations are used; a corrupt day file is skipped, not
+ * fatal. A missing store (logbook not installed) rejects so the caller can
+ * fall through the same way it did on a 404.
  *
  * @param {ServerAPI} app - Signal K server API
  * @param {number} hoursBack - Hours to look back for logbook entries
- * @param {object} [opts]
- * @param {string} [opts.apiBaseUrl] - Override for the same-server base URL
- * @param {string} [opts.apiToken] - Admin-level token for auth-gated routes
  * @returns {Promise<Array<{time: Date, cloudCover: number}>>} Cloud coverage readings
  */
-async function fetchLogbookCloudCover(
-  app,
-  hoursBack = 48,
-  { apiBaseUrl, apiToken } = {},
-) {
-  const baseUrl = resolveApiBaseUrl(app, apiBaseUrl);
-  const url = new URL(`${baseUrl}/plugins/signalk-logbook/logs`);
-
-  const controller = new AbortController();
-  const timeoutId = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
-
-  try {
-    // First, get list of days with entries
-    const response = await fetch(url.toString(), {
-      signal: controller.signal,
-      headers: apiAuthHeaders(apiToken),
-    });
-
-    if (!response.ok) {
-      const error = new Error(`Logbook API returned ${response.status}`);
-      error.status = response.status;
-      throw error;
-    }
-
-    const days = await response.json();
-    if (!Array.isArray(days)) {
-      return [];
-    }
-
-    const cutoff = new Date(Date.now() - hoursBack * 3600000);
-    const entries = [];
-
-    // Fetch each day's entries within the time window
-    for (const day of days) {
-      const dayDate = new Date(day);
-      if (dayDate < cutoff) {
-        continue;
-      }
-
-      const dayUrl = new URL(`${url}/${day}`);
-      const dayResponse = await fetch(dayUrl.toString(), {
-        signal: controller.signal,
-        headers: apiAuthHeaders(apiToken),
-      });
-
-      if (dayResponse.ok) {
-        const dayEntries = await dayResponse.json();
-        if (Array.isArray(dayEntries)) {
-          for (const entry of dayEntries) {
-            const entryTime = new Date(entry.datetime);
-            if (
-              entryTime >= cutoff &&
-              entry.observations?.cloudCoverage != null
-            ) {
-              entries.push({
-                time: entryTime,
-                cloudCover: oktasToFraction(entry.observations.cloudCoverage),
-              });
-            }
-          }
-        }
-      }
-    }
-
-    return entries.sort((a, b) => a.time - b.time);
-  } finally {
-    clearTimeout(timeoutId);
+async function fetchLogbookCloudCover(app, hoursBack = 48) {
+  const configPath = app.config?.configPath;
+  if (!configPath) {
+    throw new Error("Cannot locate the server's plugin data directory");
   }
+  const dir = path.join(configPath, "plugin-config-data", "signalk-logbook");
+
+  const days = await fs.readdir(dir); // ENOENT: logbook absent, tier fails
+  const dayRe = /^\d{4}-([0]\d|1[0-2])-([0-2]\d|3[01])\.yml$/;
+  const cutoff = new Date(Date.now() - hoursBack * 3600000);
+  const entries = [];
+
+  for (const file of days.filter((f) => dayRe.test(f)).sort()) {
+    const day = file.slice(0, 10);
+    const dayStart = new Date(`${day}T00:00:00.000Z`);
+    if (dayStart < cutoff) {
+      continue; // Day entirely before the lookback window
+    }
+
+    let dayEntries;
+    try {
+      const content = await fs.readFile(path.join(dir, file), "utf-8");
+      dayEntries = content ? parseYaml(content) : [];
+    } catch (error) {
+      app.debug?.(`Logbook: skipping unreadable day ${day}: ${error.message}`);
+      continue;
+    }
+    if (!Array.isArray(dayEntries)) {
+      continue;
+    }
+
+    for (const entry of dayEntries) {
+      const entryTime = new Date(entry.datetime);
+      if (entryTime >= cutoff && entry.observations?.cloudCoverage != null) {
+        entries.push({
+          time: entryTime,
+          cloudCover: oktasToFraction(entry.observations.cloudCoverage),
+        });
+      }
+    }
+  }
+
+  return entries.sort((a, b) => a.time - b.time);
 }
 
 /**
@@ -604,18 +557,8 @@ class IngestionFSM {
    *        them offline (same store/format as the historical backfill cache),
    *        and a cold-start/offline FSM can restore the last good forecast
    *        from it instead of falling straight to clear-sky (work doc #15).
-   * @param {string} [opts.apiBaseUrl] - Override for this server's own REST
-   *        API base URL (weather + logbook reads). Default: same-instance
-   *        `http://localhost:<server port>` (work doc #17).
-   * @param {string} [opts.apiToken] - Admin-level token used to authenticate
-   *        requests to this server's own auth-gated routes. Required when
-   *        server security is enabled; readonly approval is not enough
-   *        (work doc #17).
    */
-  constructor(
-    app,
-    { forecastHours, forecastCacheHours, dataDir, apiBaseUrl, apiToken } = {},
-  ) {
+  constructor(app, { forecastHours, forecastCacheHours, dataDir } = {}) {
     this.app = app;
     this.currentTier = Tier.OPEN_METEO;
     this.forecastHours = Math.min(
@@ -631,15 +574,6 @@ class IngestionFSM {
     this.position = { latitude: null, longitude: null };
     this.cachedCloudCover = []; // From logbook, used as fallback for future hours
     this.dataDir = dataDir || null;
-    this.apiBaseUrl = apiBaseUrl || "";
-    this.apiToken = apiToken || "";
-    /**
-     * Whether we've already logged the current API auth failure (401/403
-     * from the server's own routes). Logged once per FSM lifetime so the
-     * fallback chain's per-fetch catches don't spam; a config change
-     * (setting `weather.apiToken`) restarts the plugin and resets it.
-     */
-    this.announcedAuthFailure = false;
     /**
      * Uplink status driving fetch cadence (work doc #15 update #1). True if
      * internet is available (`network.internet.state` is `online` or
@@ -724,30 +658,6 @@ class IngestionFSM {
   }
 
   /**
-   * Surfaces API auth failures (401/403) visibly instead of letting them
-   * disappear into the debug stream (work doc #17). On a server with
-   * security enabled, every same-server read (Signal K Weather, logbook)
-   * fails this way unless `weather.apiToken` carries an Admin-level device
-   * token — the FSM would otherwise silently degrade to Clear Sky. Logged
-   * via `app.error` once per FSM lifetime; other errors are left to the
-   * caller's normal debug logging.
-   *
-   * @param {string} where - Context label for the log message
-   * @param {Error & {status?: number}} error
-   */
-  noteApiAuthFailure(where, error) {
-    if (error?.status !== 401 && error?.status !== 403) return;
-    if (!this.announcedAuthFailure) {
-      this.announcedAuthFailure = true;
-      this.app.error?.(
-        `${where} got ${error.status} from this server's own API: security is blocking the read. ` +
-          `Set an Admin-level token in weather.apiToken (Signal K Access Request approved as Admin), or disable server security. ` +
-          `Falling back to lower weather tiers until then.`,
-      );
-    }
-  }
-
-  /**
    * Returns the in-memory reuse window (ms) for the current tier.
    *
    * Tier 1/2 (real forecasts, incl. restored-from-disk) stay usable for
@@ -817,10 +727,9 @@ class IngestionFSM {
       }
 
       case Tier.SIGNAL_K_WEATHER: {
-        this.app.debug("Signal K Weather: checking for plugin");
+        this.app.debug("Signal K Weather: reading provider in-process");
         return await fetchSignalKWeather(this.app, latitude, longitude, {
-          apiBaseUrl: this.apiBaseUrl,
-          apiToken: this.apiToken,
+          hours: this.forecastHours,
         });
       }
 
@@ -828,10 +737,7 @@ class IngestionFSM {
         this.app.debug("Logbook: reading recent cloud cover");
         // Logbook has no forward-looking data - use recent observed cloud
         // cover as a proxy and combine with sun position for a forecast
-        const cloudReadings = await fetchLogbookCloudCover(this.app, 48, {
-          apiBaseUrl: this.apiBaseUrl,
-          apiToken: this.apiToken,
-        });
+        const cloudReadings = await fetchLogbookCloudCover(this.app, 48);
         this.cachedCloudCover = cloudReadings;
         this.app.debug(
           `Logbook: got ${cloudReadings.length} cloud cover readings`,
@@ -1010,7 +916,6 @@ class IngestionFSM {
       } catch (error) {
         // A failing tier (network error, timeout) must not abort the
         // fallback chain - try the next tier instead
-        this.noteApiAuthFailure(`Tier ${this.getTierName(tier)}`, error);
         this.app.debug(
           `Tier ${this.getTierName(tier)} failed: ${error.message}`,
         );
@@ -1217,10 +1122,7 @@ class IngestionFSM {
           this.cachedCloudCover[this.cachedCloudCover.length - 1].cloudCover;
         tier = Tier.LOGBOOK;
       } else {
-        const readings = await fetchLogbookCloudCover(this.app, 48, {
-          apiBaseUrl: this.apiBaseUrl,
-          apiToken: this.apiToken,
-        });
+        const readings = await fetchLogbookCloudCover(this.app, 48);
         this.cachedCloudCover = readings;
         if (readings.length > 0) {
           cloudCover = readings[readings.length - 1].cloudCover;
@@ -1228,7 +1130,6 @@ class IngestionFSM {
         }
       }
     } catch (error) {
-      this.noteApiAuthFailure("Stale hybrid: logbook", error);
       this.app.debug?.(`Stale hybrid: logbook unavailable: ${error.message}`);
     }
 

@@ -293,8 +293,6 @@ const DEFAULT_CONFIG = {
     useLogbook: true,
     forecastHours: 48,
     forecastCacheHours: 24,
-    apiBaseUrl: "",
-    apiToken: "",
   },
 };
 
@@ -2594,8 +2592,6 @@ module.exports = (app) => {
         forecastHours: config.weather?.forecastHours,
         forecastCacheHours: config.weather?.forecastCacheHours,
         dataDir: app.getDataDirPath(),
-        apiBaseUrl: config.weather?.apiBaseUrl,
-        apiToken: config.weather?.apiToken,
       });
       advisoryPublisher = new deps.AdvisoryPublisher(app, plugin.id);
       // Publish metadata (units, labels, descriptions) for the paths this

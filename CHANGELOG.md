@@ -5,6 +5,32 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- **Weather and logbook tiers now talk to the Signal K server the plugin
+  runs inside, in-process — no more localhost HTTP reads** (work doc #17
+  follow-up). Tier 2 calls `app.weatherApi.getForecasts()` directly — the
+  same object the server's `/signalk/v2/api/weather` REST routes wrap — so
+  a GRIB weather provider registered by another plugin answers without
+  HTTP, and tier 3 reads signalk-logbook's on-disk YAML day files from the
+  server's plugin data directory (parsed with the new `yaml` dependency,
+  the same parser the logbook writes with). The `weather.apiBaseUrl` and
+  `weather.apiToken` options and the HTTP loopback machinery (base-URL
+  resolution, auth headers, 401/403 surfacing) are removed: no ports to
+  guess, no admin-level device tokens, no self-signed-TLS rejections.
+
+### Fixed
+- Same-server weather and logbook reads no longer fail against whatever
+  else listens on `localhost:3000`. The removed HTTP reader took the
+  listen port from `app.config.port`, which does not exist — the real port
+  is `app.config.settings.port` — so on a server listening on port 80 every
+  weather (GRIB) and logbook request 404'd against an unrelated service.
+  Combined with the metered-uplink Open-Meteo skip (0.7.0), this left a
+  6-day offshore passage with no working weather tier below the WAN
+  download, and the FSM degraded to the Clear Sky fallback for the whole
+  trip.
+
 ## [0.7.0] - 2026-08-28
 
 ### Changed
