@@ -1664,23 +1664,39 @@ test("fetchHistoricalWeather aborts a stalled request via the per-attempt timeou
     });
   };
   const started = Date.now();
-  // Don't await the full call: the retry chain backs off for ~30s; what
-  // matters here is that the stalled attempt itself is aborted at the
-  // timeout instead of hanging on the transport's own minutes-long one
-  const pending = fetchHistoricalWeather({
-    latitude: 60.17,
-    longitude: 21.39,
-    from: new Date("2026-08-20T00:00:00Z"),
-    to: new Date("2026-08-20T23:59:59Z"),
-    fetchImpl,
-    timeoutMs: 50,
-  });
-  pending.catch(() => {});
-  await observed;
-  assert.ok(
-    abortedAt - started < 5000,
-    `abort fired after ${abortedAt - started}ms, expected ~50ms`,
-  );
+  // AbortSignal.timeout()'s timer does not keep the event loop alive on
+  // every Node version (Node 22 CI runners hit this deterministically).
+  // This test's only wake-up source is the abort signal, so without
+  // another pending handle the event loop drains first and the runner
+  // cancels the test with "Promise resolution is still pending but the
+  // event loop has already resolved". Hold a ref'd timer open until the
+  // abort is observed; if it ever fires, the assertion below fails with
+  // a clear message instead of hanging on the runner's cancel.
+  const keepAlive = setTimeout(() => {
+    abortedAt = Date.now();
+    abortObserved();
+  }, 5000);
+  try {
+    // Don't await the full call: the retry chain backs off for ~30s; what
+    // matters here is that the stalled attempt itself is aborted at the
+    // timeout instead of hanging on the transport's own minutes-long one
+    const pending = fetchHistoricalWeather({
+      latitude: 60.17,
+      longitude: 21.39,
+      from: new Date("2026-08-20T00:00:00Z"),
+      to: new Date("2026-08-20T23:59:59Z"),
+      fetchImpl,
+      timeoutMs: 50,
+    });
+    pending.catch(() => {});
+    await observed;
+    assert.ok(
+      abortedAt - started < 5000,
+      `abort fired after ${abortedAt - started}ms, expected ~50ms`,
+    );
+  } finally {
+    clearTimeout(keepAlive);
+  }
 });
 
 test("fetchHistoricalWeatherTrack persists-as-you-go (resumable after rate-limit)", async () => {
