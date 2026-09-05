@@ -388,15 +388,30 @@ function buildActuals(samples, sourceTypes, from, to) {
  * Collapses recorded cycles into per-hour predictions, keeping the freshest
  * cycle for each hour bucket (the prediction made closest to the hour).
  *
+ * Dates are parsed once per cycle and once per forecast point, and the
+ * stored entry is only allocated when it wins its bucket: over week-scale
+ * windows with long-horizon cycles this loop runs hundreds of thousands
+ * of times, and per-comparison Date parsing plus throwaway candidate
+ * objects dominated the response build on production-sized recordings.
+ * `cycleMs` is internal (tie-breaking / debugging) and never serialized.
+ *
  * @param {object[]} cycles - Recorded cycle records
- * @returns {Map<number, {hour: number, solarWh: number, windWh: number, loadWh: number, netWh: number, weatherTier: number, cycleTimestamp: string}>}
+ * @returns {Map<number, {hour: number, solarWh: number, windWh: number, loadWh: number, netWh: number, weatherTier: number, cycleTimestamp: string, cycleMs: number}>}
  */
 function hourlyPredictions(cycles) {
   const result = new Map();
   for (const cycle of cycles) {
+    const cycleMs = new Date(cycle.timestamp).getTime();
     for (const point of cycle.forecast || []) {
-      const bucket = hourBucket(point.time);
-      const candidate = {
+      const pointMs = new Date(point.time).getTime();
+      const bucket = Math.floor(pointMs / MS_PER_HOUR) * MS_PER_HOUR;
+      const existing = result.get(bucket);
+      // >= keeps the original tie-break: on equal cycle timestamps the
+      // later-iterated cycle (records load in timestamp order) wins
+      if (existing && existing.cycleMs > cycleMs) {
+        continue;
+      }
+      result.set(bucket, {
         hour: bucket,
         solarWh: point.idealSolarYieldWh || 0,
         windWh: point.idealWindYieldWh || 0,
@@ -406,15 +421,8 @@ function hourlyPredictions(cycles) {
         soc: point.idealSoC ?? null,
         weatherTier: cycle.weatherTier,
         cycleTimestamp: cycle.timestamp,
-      };
-      const existing = result.get(bucket);
-      if (
-        !existing ||
-        new Date(candidate.cycleTimestamp).getTime() >=
-          new Date(existing.cycleTimestamp).getTime()
-      ) {
-        result.set(bucket, candidate);
-      }
+        cycleMs,
+      });
     }
   }
   return result;
@@ -703,6 +711,9 @@ function buildSummary(cycles, samples, sourceTypes, from, to) {
 /** Default cycle lookback in hours when records carry no forecast */
 const DEFAULT_CYCLE_HORIZON_HOURS = 24;
 
+/** Maximum cycle lookback in hours (matches the forecastHours schema max) */
+const MAX_CYCLE_HORIZON_HOURS = 168;
+
 /**
  * A cycle's forecast horizon in milliseconds (from its own record).
  * @param {object} cycle
@@ -716,33 +727,50 @@ function cycleHorizonMs(cycle) {
 /**
  * Reads recordings for a window, filtered by type.
  *
- * Cycles get an adaptive lookback: start with the default 24h, and if the
- * loaded cycles carry longer horizons (configurable prediction horizon),
- * re-read with the largest horizon so cycles recorded further back — whose
- * forecasts still reach into the window — are included.
+ * Cycles get an adaptive lookback starting from the configured forecast
+ * horizon (weather.forecastHours): cycles recorded that far back still
+ * have forecasts reaching into the window. Reading with the configured
+ * horizon up front avoids the previous default-24h read followed by a
+ * full re-read with the real horizon — on production-sized day files
+ * (every cycle carries its complete forecast array) that double read
+ * doubled the load time of every cycle-serving endpoint. The adaptive
+ * re-read remains as a fallback for cycles carrying horizons longer
+ * than the current configuration (the horizon was reduced after they
+ * were recorded).
  *
  * @param {Function} readRecordings - `(from, to, type) => Promise<object[]>`
  * @param {Date} from - Window start
  * @param {Date} to - Window end
  * @param {string} type - Record type ("cycle" or "sample")
+ * @param {object} [opts]
+ * @param {number} [opts.initialHorizonHours] - Configured forecast
+ *        horizon to use as the initial cycle lookback
  * @returns {Promise<object[]>}
  */
-async function loadRecords(readRecordings, from, to, type) {
+async function loadRecords(
+  readRecordings,
+  from,
+  to,
+  type,
+  { initialHorizonHours = DEFAULT_CYCLE_HORIZON_HOURS } = {},
+) {
   // Samples are filtered to the window by the recorder itself
   if (type !== "cycle") {
     return readRecordings(from, to, type);
   }
 
-  const initialFrom = new Date(
-    from.getTime() - DEFAULT_CYCLE_HORIZON_HOURS * MS_PER_HOUR,
+  const lookbackHours = Math.min(
+    Math.max(initialHorizonHours, DEFAULT_CYCLE_HORIZON_HOURS),
+    MAX_CYCLE_HORIZON_HOURS,
   );
+  const initialFrom = new Date(from.getTime() - lookbackHours * MS_PER_HOUR);
   const initial = await readRecordings(initialFrom, to, type);
 
-  let maxHorizonMs = DEFAULT_CYCLE_HORIZON_HOURS * MS_PER_HOUR;
+  let maxHorizonMs = lookbackHours * MS_PER_HOUR;
   for (const cycle of initial) {
     maxHorizonMs = Math.max(maxHorizonMs, cycleHorizonMs(cycle));
   }
-  if (maxHorizonMs <= DEFAULT_CYCLE_HORIZON_HOURS * MS_PER_HOUR) {
+  if (maxHorizonMs <= lookbackHours * MS_PER_HOUR) {
     return initial;
   }
   return readRecordings(new Date(from.getTime() - maxHorizonMs), to, type);
@@ -766,8 +794,43 @@ function registerApiRoutes(
   router,
   { app, getConfig, dataDir, getWindProtection, getUplinkStatus },
 ) {
-  const readRecordings = (from, to, type) =>
-    require("./recorder.js").getRecordings(dataDir, from, to, type);
+  // Concurrent identical reads are shared: the webapp fires all window
+  // endpoints at once, and several of them ask for the same (window,
+  // type) — /api/predictions, /api/summary and /api/deploy-states all
+  // load the same cycles with the same lookback. Without sharing, each
+  // read its own copy of the same multi-megabyte day files in parallel,
+  // starving the server's single event loop and I/O budget (the week view
+  // timed out on production data for exactly this reason). The map holds
+  // only in-flight promises: once a read settles it is forgotten, so a
+  // later read always sees freshly appended records.
+  const inflightReads = new Map();
+  const readRecordings = (from, to, type) => {
+    const key = `${type}|${from.getTime()}|${to.getTime()}`;
+    const pending = inflightReads.get(key);
+    if (pending) {
+      return pending;
+    }
+    const read = require("./recorder.js")
+      .getRecordings(dataDir, from, to, type)
+      .finally(() => inflightReads.delete(key));
+    inflightReads.set(key, read);
+    return read;
+  };
+
+  /**
+   * The configured forecast horizon (weather.forecastHours), clamped to
+   * the loadRecords lookback bounds, used as the initial cycle lookback.
+   * @returns {number}
+   */
+  const configuredCycleHorizonHours = () => {
+    const hours = getConfig()?.weather?.forecastHours;
+    return Number.isFinite(hours)
+      ? Math.min(
+          Math.max(hours, DEFAULT_CYCLE_HORIZON_HOURS),
+          MAX_CYCLE_HORIZON_HOURS,
+        )
+      : DEFAULT_CYCLE_HORIZON_HOURS;
+  };
 
   /**
    * Background warm of the retro overlay's archive weather cache.
@@ -830,7 +893,9 @@ function registerApiRoutes(
    */
   async function handle(req, res, type, build) {
     const { from, to } = parseTimeWindow(req.query);
-    const records = await loadRecords(readRecordings, from, to, type);
+    const records = await loadRecords(readRecordings, from, to, type, {
+      initialHorizonHours: configuredCycleHorizonHours(),
+    });
     const config = getConfig();
     const sourceTypes = sourceTypesFromConfig(config);
     res.json(await build(records, sourceTypes, from, to));
@@ -897,14 +962,25 @@ function registerApiRoutes(
       .catch((error) => handleError(error, res));
   });
 
-  router.get("/api/summary", (req, res) =>
-    handle(req, res, "sample", (samples, sourceTypes, from, to) =>
-      // Summary also needs cycles for accuracy; load them here
-      loadRecords(readRecordings, from, to, "cycle").then((cycles) =>
-        buildSummary(cycles, samples, sourceTypes, from, to),
-      ),
-    ).catch((error) => handleError(error, res)),
-  );
+  router.get("/api/summary", (req, res) => {
+    const { from, to } = parseTimeWindow(req.query);
+    const config = getConfig();
+    const sourceTypes = sourceTypesFromConfig(config);
+    // Load samples and cycles in parallel (not sequentially inside the
+    // builder) so the cycle read starts at the same moment as the other
+    // endpoints' reads and joins the shared in-flight read instead of
+    // re-reading the same day files after those have settled
+    return Promise.all([
+      loadRecords(readRecordings, from, to, "sample"),
+      loadRecords(readRecordings, from, to, "cycle", {
+        initialHorizonHours: configuredCycleHorizonHours(),
+      }),
+    ])
+      .then(([samples, cycles]) =>
+        res.json(buildSummary(cycles, samples, sourceTypes, from, to)),
+      )
+      .catch((error) => handleError(error, res));
+  });
 
   // Deploy/stow state transitions (detected) and recommendations in window
   router.get("/api/deploy-states", (req, res) => {
@@ -914,9 +990,11 @@ function registerApiRoutes(
     // is established from earlier samples, and only transitions within
     // [from, to] are emitted.
     const lookbackFrom = new Date(from.getTime() - 7 * 24 * 3600000);
-    Promise.all([
+    return Promise.all([
       readRecordings(lookbackFrom, to, "sample"),
-      loadRecords(readRecordings, from, to, "cycle"),
+      loadRecords(readRecordings, from, to, "cycle", {
+        initialHorizonHours: configuredCycleHorizonHours(),
+      }),
     ])
       .then(([allSamples, cycles]) =>
         res.json(
@@ -1586,5 +1664,7 @@ module.exports = {
   buildDeployStates,
   registerApiRoutes,
   cycleHorizonMs,
+  loadRecords,
+  DEFAULT_CYCLE_HORIZON_HOURS,
   offsetMinutesFromSamples,
 };

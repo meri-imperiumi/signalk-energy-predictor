@@ -369,6 +369,71 @@ test.describe("recorder", () => {
       assert.strictEqual(records.length, 2);
     });
 
+    test("type filter ignores foreign records without parsing them, including nested type fields", async () => {
+      const recordingsDir = path.join(tempDir, "recordings");
+      await fs.mkdir(recordingsDir, { recursive: true });
+
+      const dayPath = path.join(recordingsDir, "2024-08-21.jsonl");
+      // A cycle record whose nested action carries a `type` field: the
+      // pre-parse filter must not mistake it for a sample record
+      await fs.writeFile(
+        dayPath,
+        JSON.stringify({
+          type: "cycle",
+          timestamp: "2024-08-21T10:00:00.000Z",
+          weatherTier: 2,
+          forecast: [],
+          actions: [{ type: "engine_run", message: "run the engine" }],
+        }) +
+          "\n" +
+          JSON.stringify({
+            type: "sample",
+            timestamp: "2024-08-21T10:05:00.000Z",
+            arrays: {},
+            generators: {},
+            soc: 0.7,
+          }) +
+          "\n",
+      );
+
+      const from = new Date("2024-08-21T00:00:00Z");
+      const to = new Date("2024-08-21T23:59:59Z");
+
+      // Sample-only read: the cycle (with its nested engine_run type)
+      // must be excluded
+      const samples = await getRecordings(tempDir, from, to, "sample");
+      assert.strictEqual(samples.length, 1);
+      assert.strictEqual(samples[0].type, "sample");
+
+      // Cycle-only read: the sample must be excluded
+      const cycles = await getRecordings(tempDir, from, to, "cycle");
+      assert.strictEqual(cycles.length, 1);
+      assert.strictEqual(cycles[0].type, "cycle");
+
+      // Unfiltered read returns both
+      const all = await getRecordings(tempDir, from, to);
+      assert.strictEqual(all.length, 2);
+    });
+
+    test("type filter tolerates whitespace-normalized JSON lines", async () => {
+      const recordingsDir = path.join(tempDir, "recordings");
+      await fs.mkdir(recordingsDir, { recursive: true });
+
+      const dayPath = path.join(recordingsDir, "2024-08-21.jsonl");
+      // Hand-normalized pretty-ish line: `"type": "cycle"` with spaces
+      await fs.writeFile(
+        dayPath,
+        '{ "type": "cycle", "timestamp": "2024-08-21T10:00:00.000Z", "weatherTier": 2, "forecast": [], "actions": [] }\n',
+      );
+
+      const from = new Date("2024-08-21T00:00:00Z");
+      const to = new Date("2024-08-21T23:59:59Z");
+
+      const cycles = await getRecordings(tempDir, from, to, "cycle");
+      assert.strictEqual(cycles.length, 1);
+      assert.strictEqual(cycles[0].weatherTier, 2);
+    });
+
     test("returns all records in date range", async () => {
       const recordingsDir = path.join(tempDir, "recordings");
       await fs.mkdir(recordingsDir, { recursive: true });

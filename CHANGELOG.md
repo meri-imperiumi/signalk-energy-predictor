@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Week/month timeline views no longer time out on production-scale
+  recordings.** Opening the week view on the boat served
+  `Failed to load data: /api/predictions timed out after 30s`: the webapp
+  fires all five window endpoints at once, and each independently
+  re-read and re-parsed the same multi-megabyte day files — every line of
+  every file was JSON-parsed even when the record type was discarded,
+  and every cycle-serving endpoint read its window twice (default 24h
+  lookback, then a full re-read with the real forecast horizon). Three
+  changes: `readRecords` now skips lines of foreign record types before
+  parsing them (day files are dominated by cycle records carrying the
+  complete forecast array, so sample reads were parsing megabytes of
+  cycle JSON just to discard it); the cycle lookback starts from the
+  configured forecast horizon (`weather.forecastHours`, clamped to
+  24–168h) so the adaptive re-read only happens when recorded cycles
+  carry a longer horizon than configured; and concurrent identical
+  window reads are shared in-flight between endpoints (once a read
+  settles it is forgotten, so freshly appended records always show).
+  `/api/summary` also loads its samples and cycles in parallel so it
+  joins the shared reads instead of re-reading after they settle. On a
+  benchmark with 30 days of realistic recordings (96 cycles/day,
+  168h forecasts — 7.4 MiB/day files) the full week-view fan-out went
+  from 36s (timeout) to ~6–10s; at the default 48h horizon from ~9s to
+  ~4s. `hourlyPredictions` additionally parses dates once per cycle and
+  per forecast point instead of per comparison (week windows run it over
+  hundreds of thousands of points).
+
 ## [0.8.1] - 2026-09-05
 
 ### Fixed

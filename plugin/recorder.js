@@ -374,6 +374,28 @@ function deepEqualPos(a, b) {
 }
 
 /**
+ * Cached line filters for readRecords' pre-parse type check. Keys are the
+ * recorder's fixed internal type strings (never user input), so plain
+ * interpolation into the pattern is safe.
+ *
+ * @type {Map<string, RegExp>}
+ */
+const typeFilters = new Map();
+
+/**
+ * @param {string} type - Record type to match at the top level of a line
+ * @returns {RegExp}
+ */
+function typeFilterFor(type) {
+  let filter = typeFilters.get(type);
+  if (!filter) {
+    filter = new RegExp(`"type"\\s*:\\s*"${type}"`);
+    typeFilters.set(type, filter);
+  }
+  return filter;
+}
+
+/**
  * Reads records from a file within a time window.
  *
  * @param {string} filePath - File path to read
@@ -384,12 +406,27 @@ function deepEqualPos(a, b) {
  */
 async function readRecords(filePath, from, to, type) {
   const records = [];
+  const typeFilter = type ? typeFilterFor(type) : null;
 
   try {
     const content = await fs.readFile(filePath, { encoding: "utf-8" });
     const lines = content.split("\n").filter((line) => line.trim());
 
     for (const line of lines) {
+      // Cheap pre-parse type filter: the recorder writes compact JSON with
+      // the record type as a top-level string, and no nested object in any
+      // record type carries a `type` field matching another record type
+      // (cycle actions/advisories use engine_run/surplus/stow_soon). Day
+      // files are dominated by cycle records — each carrying the full
+      // forecast array — so without this check a sample-only read parses
+      // megabytes of cycle JSON per file only to discard it, and vice
+      // versa. On production-sized recordings this filter alone removes
+      // the bulk of the parse work from every windowed API load. The
+      // whitespace-tolerant regex also accepts hand-normalized files.
+      if (type && !typeFilter.test(line)) {
+        continue;
+      }
+
       let record;
       try {
         record = JSON.parse(line);

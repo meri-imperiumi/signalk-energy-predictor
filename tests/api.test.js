@@ -25,6 +25,8 @@ const {
   buildSummary,
   buildDeployStates,
   registerApiRoutes,
+  cycleHorizonMs,
+  loadRecords,
   resolveNavState,
   MAX_WINDOW_DAYS,
   offsetMinutesFromSamples,
@@ -465,6 +467,93 @@ test.describe("builders over recorded fixtures", () => {
   });
 });
 
+test.describe("loadRecords adaptive lookback", () => {
+  const MS_PER_HOUR = 3600000;
+  const from = new Date("2026-08-22T00:00:00Z");
+  const to = new Date("2026-08-29T00:00:00Z");
+
+  test("configured horizon is the initial lookback (single read, no re-read)", async () => {
+    const reads = [];
+    const readRecordings = async (f, t, type) => {
+      reads.push({ fromMs: f.getTime(), type });
+      // Cycles carrying 24h forecasts: shorter than the configured 48h
+      // horizon, so no adaptive re-read is needed
+      return [
+        {
+          type: "cycle",
+          timestamp: new Date(from.getTime() + 3600000).toISOString(),
+          forecast: new Array(24),
+        },
+      ];
+    };
+
+    const records = await loadRecords(readRecordings, from, to, "cycle", {
+      initialHorizonHours: 48,
+    });
+
+    assert.strictEqual(records.length, 1);
+    assert.strictEqual(reads.length, 1, "expected a single read");
+    assert.strictEqual(
+      reads[0].fromMs,
+      from.getTime() - 48 * MS_PER_HOUR,
+      "lookback must start from the configured forecast horizon",
+    );
+  });
+
+  test("re-reads with the larger horizon only when a cycle exceeds the configured one", async () => {
+    const reads = [];
+    const readRecordings = async (f) => {
+      reads.push(f.getTime());
+      return [
+        {
+          type: "cycle",
+          timestamp: new Date(from.getTime() + 3600000).toISOString(),
+          // 96 forecast points → 96h horizon > configured 48h
+          forecast: new Array(96),
+        },
+      ];
+    };
+
+    await loadRecords(readRecordings, from, to, "cycle", {
+      initialHorizonHours: 48,
+    });
+
+    assert.strictEqual(reads.length, 2, "expected the adaptive re-read");
+    assert.strictEqual(reads[0], from.getTime() - 48 * MS_PER_HOUR);
+    assert.strictEqual(reads[1], from.getTime() - 96 * MS_PER_HOUR);
+  });
+
+  test("horizon is clamped to the schema maximum", async () => {
+    const reads = [];
+    const readRecordings = async (f) => {
+      reads.push(f.getTime());
+      return [];
+    };
+
+    await loadRecords(readRecordings, from, to, "cycle", {
+      initialHorizonHours: 10000,
+    });
+
+    assert.strictEqual(reads.length, 1);
+    assert.strictEqual(reads[0], from.getTime() - 168 * MS_PER_HOUR);
+  });
+
+  test("samples pass straight through without lookback", async () => {
+    const reads = [];
+    const readRecordings = async (f) => {
+      reads.push(f.getTime());
+      return [];
+    };
+
+    await loadRecords(readRecordings, from, to, "sample", {
+      initialHorizonHours: 48,
+    });
+
+    assert.strictEqual(reads.length, 1);
+    assert.strictEqual(reads[0], from.getTime());
+  });
+});
+
 test.describe("route registration", () => {
   function makeRouter() {
     const routes = new Map();
@@ -560,6 +649,77 @@ test.describe("route registration", () => {
       const summary = makeRes();
       await router.routes.get("/api/summary")({ query: { from, to } }, summary);
       assert.ok(summary.body.predictionAccuracy.hoursCompared >= 1);
+    });
+  });
+
+  test("concurrent identical window reads are shared between endpoints", async () => {
+    await withFixtures(async (dataDir) => {
+      // Count underlying reads by patching the recorder module (the API
+      // resolves it through require at call time, so the patch applies)
+      const recorder = require("../plugin/recorder.js");
+      const orig = recorder.getRecordings;
+      const calls = [];
+      recorder.getRecordings = async (dir, from, to, type) => {
+        calls.push(`${type}|${from.getTime()}|${to.getTime()}`);
+        return orig(dir, from, to, type);
+      };
+      try {
+        const router = makeRouter();
+        registerApiRoutes(router, {
+          app: makeApp(),
+          getConfig: () => ({ ...CONFIG, weather: { forecastHours: 48 } }),
+          dataDir,
+        });
+        const from = "2026-08-22T00:00:00Z";
+        const to = "2026-08-22T02:00:00Z";
+
+        // The webapp fires its window endpoints together: /api/predictions,
+        // /api/summary and /api/deploy-states all load the same cycles with
+        // the same lookback and must share a single underlying read
+        const [predictions, summary, deploy] = [
+          makeRes(),
+          makeRes(),
+          makeRes(),
+        ];
+        await Promise.all([
+          router.routes.get("/api/predictions")(
+            { query: { from, to } },
+            predictions,
+          ),
+          router.routes.get("/api/summary")({ query: { from, to } }, summary),
+          router.routes.get("/api/deploy-states")(
+            { query: { from, to } },
+            deploy,
+          ),
+        ]);
+        assert.strictEqual(predictions.statusCode, null);
+        assert.strictEqual(summary.statusCode, null);
+        assert.strictEqual(deploy.statusCode, null);
+        const cycleCalls = calls.filter((c) => c.startsWith("cycle|"));
+        assert.strictEqual(
+          cycleCalls.length,
+          1,
+          `expected one shared cycle read, got: ${calls.join(", ")}`,
+        );
+
+        // After the reads settle the in-flight map is clean: a later
+        // identical request performs a fresh read (freshly appended
+        // records must be visible, no result caching)
+        calls.length = 0;
+        const again = makeRes();
+        await router.routes.get("/api/predictions")(
+          { query: { from, to } },
+          again,
+        );
+        assert.strictEqual(again.statusCode, null);
+        assert.strictEqual(
+          calls.filter((c) => c.startsWith("cycle|")).length,
+          1,
+          "sequential request must re-read",
+        );
+      } finally {
+        recorder.getRecordings = orig;
+      }
     });
   });
 
