@@ -372,14 +372,75 @@ function detectEngineCharging({
 }
 
 /**
+ * Charging modes that mean an alternator/DC-DC charger is OFF (engine
+ * stopped, or the charger disabled). Anything else non-empty — bulk,
+ * absorption, float, storage, equalization, … — means it is actively
+ * charging and thus the engine is running. A DC-DC charger tapers to a
+ * trickle in absorption/float while the engine still runs hard, so the
+ * MODE is the truthful running signal; power alone would go blind late
+ * in the charge.
+ * @type {Set<string>}
+ */
+const CHARGER_OFF_MODES = new Set([
+  "",
+  "off",
+  "not charging",
+  "standby",
+  "low power",
+  "fault",
+  "faulted",
+  "disabled",
+]);
+
+/**
+ * Detects whether an engine's alternator/DC-DC charger shows the engine
+ * running, from the optional per-engine power and charging-mode paths.
+ *
+ * Precedence: the charging mode is authoritative (an active mode — bulk,
+ * absorption, float, … — means the charger is on; an explicit off mode
+ * means it is not). Without a mode path (or an unreadable one), positive
+ * measured output above a small threshold means running. Both absent →
+ * null (no evidence either way).
+ *
+ * @param {object} engine - Engine config (alternatorModePath,
+ *        alternatorPowerPath)
+ * @param {(path: string) => unknown} getSelfPath - Signal K read function
+ * @returns {boolean|null}
+ */
+function detectAlternatorChargerActive(engine, getSelfPath) {
+  if (engine.alternatorModePath) {
+    const raw = getSelfPath(engine.alternatorModePath);
+    if (raw != null) {
+      const v =
+        typeof raw === "object" && raw != null && "value" in raw
+          ? raw.value
+          : raw;
+      if (v != null && String(v).trim() !== "") {
+        return !CHARGER_OFF_MODES.has(String(v).toLowerCase().trim());
+      }
+    }
+  }
+  if (engine.alternatorPowerPath) {
+    const w = toNumber(getSelfPath(engine.alternatorPowerPath));
+    if (w != null) return w > 20;
+  }
+  return null;
+}
+
+/**
  * Detects whether a propulsion engine is currently running, from its
- * Signal K propulsion instance (e.g. "main", "port", "starboard").
+ * Signal K propulsion instance (e.g. "main", "port", "starboard") and
+ * the optional alternator charger paths (see
+ * {@link detectAlternatorChargerActive}).
  *
  * `propulsion.<id>.state` === "started" or revolutions > 0 means running;
- * definite signals that say neither mean stopped; no signals at all mean
- * unknown (null). Engines are propulsion first — this only detects, it
- * never recommends running an engine whose `alternatorWatts` is 0
- * (electric drives are consumers, not generators).
+ * an active alternator charging mode or positive charger output also
+ * means running (Victron-only boats have no `propulsion.*` paths but do
+ * expose `electrical.chargers.<id>.*`); definite signals that say neither
+ * mean stopped; no signals at all mean unknown (null). Engines are
+ * propulsion first — this only detects, it never recommends running an
+ * engine whose `alternatorWatts` is 0 (electric drives are consumers,
+ * not generators).
  *
  * @param {object} engine - Engine config (id / propulsionId)
  * @param {(path: string) => unknown} getSelfPath - Signal K read function
@@ -387,22 +448,30 @@ function detectEngineCharging({
  */
 function detectEngineRunning(engine, getSelfPath) {
   const inst = engine.propulsionId || engine.id;
-  if (!inst) return null;
   let anySignal = false;
-  const rawState = getSelfPath(`propulsion.${inst}.state`);
-  if (rawState != null) {
-    anySignal = true;
-    const v =
-      typeof rawState === "object" && "value" in rawState
-        ? rawState.value
-        : rawState;
-    if (v === "started") return true;
+  if (inst) {
+    const rawState = getSelfPath(`propulsion.${inst}.state`);
+    if (rawState != null) {
+      anySignal = true;
+      const v =
+        typeof rawState === "object" && "value" in rawState
+          ? rawState.value
+          : rawState;
+      if (v === "started") return true;
+    }
+    const rpm = toNumber(getSelfPath(`propulsion.${inst}.revolutions`));
+    if (rpm != null) {
+      anySignal = true;
+      if (rpm > 0) return true;
+    }
   }
-  const rpm = toNumber(getSelfPath(`propulsion.${inst}.revolutions`));
-  if (rpm != null) {
-    anySignal = true;
-    if (rpm > 0) return true;
-  }
+  // Alternator/DC-DC charger evidence: an active charging mode or
+  // positive output means the engine runs even without propulsion
+  // instrumentation (Victron-only boats). An explicit off mode is a
+  // definite "not running" when nothing contradicts it.
+  const charger = detectAlternatorChargerActive(engine, getSelfPath);
+  if (charger === true) return true;
+  if (charger === false) return false;
   return anySignal ? false : null;
 }
 
@@ -481,6 +550,7 @@ module.exports = {
   updateCombustionRuns,
   resolveGensetRunning,
   detectEngineRunning,
+  detectAlternatorChargerActive,
   detectEngineCharging,
   flipCooldownHoursFor,
   Reluctance,

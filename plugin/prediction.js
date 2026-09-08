@@ -3093,17 +3093,31 @@ class PredictionEngine {
       let alternatorWh = 0;
       if (underway && engineRunning === true) {
         for (const engine of this.engines) {
-          if (engine.alternatorWatts <= 0) continue;
+          // Configured watts model the sustained bulk output; when unset,
+          // the measured alternator/DC-DC charger output stands in (a bulk
+          // reading is about right; an absorption-tapered reading
+          // underestimates — still better than modeling nothing).
+          const measured =
+            engine.alternatorPowerPath && !engine.alternatorWatts
+              ? toNumber(this.getSelfPath(engine.alternatorPowerPath))
+              : null;
+          const watts =
+            engine.alternatorWatts > 0
+              ? engine.alternatorWatts
+              : measured != null && measured > 0
+                ? measured
+                : 0;
+          if (watts <= 0) continue;
           const running = detectEngineRunning(engine, this.getSelfPath);
           // Per-engine instrumentation wins. When it is unknown (null —
           // no propulsion paths, e.g. a Victron-only boat) but the
-          // aggregate detector says an engine runs (shunt charging
-          // signature), count this engine: on an uninstrumented boat the
-          // configured engine IS the one charging. Multi-engine
-          // uninstrumented boats over-count here — acceptable rarity,
-          // noted in the aggregate detector's doc.
+          // aggregate detector says an engine runs (charger paths or
+          // shunt charging signature), count this engine: on an
+          // uninstrumented boat the configured engine IS the one charging.
+          // Multi-engine uninstrumented boats over-count here —
+          // acceptable rarity, noted in the aggregate detector's doc.
           if (running === true || running == null) {
-            alternatorWh += engine.alternatorWatts;
+            alternatorWh += watts;
           }
         }
       }

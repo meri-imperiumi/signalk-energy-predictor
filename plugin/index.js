@@ -46,7 +46,10 @@ const {
   getDisplayName,
   validateConfig,
 } = require("./schema.js");
-const { detectEngineCharging } = require("./combustion.js");
+const {
+  detectEngineCharging,
+  detectAlternatorChargerActive,
+} = require("./combustion.js");
 const { sunPosition } = require("./solar.js");
 const { formatWh } = require("./format.js");
 const { Recorder } = require("./recorder.js");
@@ -86,9 +89,15 @@ const PROPULSION_REVOLUTIONS_RE = /^propulsion\.([A-Za-z0-9]+)\.revolutions$/;
  * @param {Array<string>} [renewablePowerPaths] - Configured wind/hydro
  *        power paths (their output flows through the shunt and must be
  *        subtracted; solar is already added back by Venus into dcPower)
+ * @param {Array<object>} [engines] - Configured engines (for the
+ *        alternator charger mode/power paths)
  * @returns {boolean|null} true if any engine runs, false if all stopped, null if unknown
  */
-function detectEngineRunning(pathValues, renewablePowerPaths = []) {
+function detectEngineRunning(
+  pathValues,
+  renewablePowerPaths = [],
+  engines = [],
+) {
   let anyRunning = false;
   let anySignal = false;
 
@@ -117,6 +126,19 @@ function detectEngineRunning(pathValues, renewablePowerPaths = []) {
   }
 
   if (anyRunning) return true;
+
+  // Alternator/DC-DC charger evidence from the configured engines: an
+  // active charging mode (bulk/absorption/float — the mode stays truthful
+  // when a DC-DC charger tapers late in the charge) or positive output
+  // marks the engine as running. Checked before the shunt signature —
+  // a direct measurement beats an inference.
+  for (const engine of engines) {
+    const charger = detectAlternatorChargerActive(engine, (p) =>
+      pathValues.get(p),
+    );
+    if (charger === true) return true;
+    if (charger === false) return false;
+  }
 
   // Shunt signature: the alternator out-producing the house load. Only
   // consulted when the propulsion scan found nothing — a definite
@@ -619,6 +641,28 @@ module.exports = (app) => {
       return airHeight;
     }
     return DEFAULT_ANEMOMETER_HEIGHT_M;
+  }
+
+  /**
+   * Window-averaged power (W) for a tracked power path — the same
+   * 5-minute running average the solar learning uses. Deploy-state
+   * inference reads this instead of the instantaneous value: a
+   * hydrogenerator producing 0↔20 W flicker at its cut-in speed must not
+   * flap its detected state between deployed and stowed on every sample
+   * (78 flips over one passage in the wild). Null when no history exists
+   * (fresh start), so callers fall back to the instantaneous reading.
+   *
+   * @param {string} path - Configured power path
+   * @returns {number|null} Average watts over the window, or null
+   */
+  function averagedPowerW(path) {
+    const samples = solarPowerHistory.get(path) || [];
+    const now = Date.now();
+    const recent = samples.filter(
+      (s) => s.time >= now - DEFAULT_POWER_AVERAGE_WINDOW_MS,
+    );
+    if (recent.length === 0) return null;
+    return recent.reduce((sum, s) => sum + s.value, 0) / recent.length;
   }
 
   /**
@@ -1480,9 +1524,14 @@ module.exports = (app) => {
             seededDeployStateIds.delete(gen.id);
           }
         }
-        // For deployable generators, infer from power output
+        // For deployable generators, infer from power output — the
+        // window-averaged output when history exists (a 0↔20 W flicker at
+        // cut-in must not flip the detected state every sample), the
+        // instantaneous reading otherwise.
         if (gen.deployable && gen.powerPath) {
-          const powerVal = toNumber(deltaState.get(gen.powerPath));
+          const powerVal =
+            averagedPowerW(gen.powerPath) ??
+            toNumber(deltaState.get(gen.powerPath));
           if (powerVal != null && powerVal > 0) {
             currentDeployStates.set(gen.id, "deployed");
             seededDeployStateIds.delete(gen.id);
@@ -1493,7 +1542,9 @@ module.exports = (app) => {
         // overwrites the carried-forward state; no wind evidence leaves the
         // seed in place.
         if (gen.deployable && gen.type === "wind") {
-          const powerVal = toNumber(deltaState.get(gen.powerPath));
+          const powerVal =
+            averagedPowerW(gen.powerPath) ??
+            toNumber(deltaState.get(gen.powerPath));
           const startupSpeed = gen.startupSpeedKnots ?? 5;
           // Use average wind speed over recent history to avoid false positives
           // from brief gusts - wind generators need sustained wind to spin up
@@ -1548,10 +1599,19 @@ module.exports = (app) => {
           seededDeployStateIds.delete(gen.id);
         }
         // Hydro: if sailing above min speed but no power output, it is stowed.
-        // Runs even when a seed is present (definite live reading wins).
+        // Runs even when a seed is present (definite live reading wins). The
+        // power read is the window average (flicker-proof) and the speed the
+        // sustained STW average — marginal-production conditions must not
+        // flap the state.
         if (gen.deployable && gen.type === "hydro") {
-          const powerVal = toNumber(deltaState.get(gen.powerPath));
-          const speed = toKnots(deltaState.get("navigation.speedThroughWater"));
+          const powerVal =
+            averagedPowerW(gen.powerPath) ??
+            toNumber(deltaState.get(gen.powerPath));
+          const sustainedMs = observedStwMs();
+          const speed =
+            sustainedMs != null
+              ? toKnots(sustainedMs)
+              : toKnots(deltaState.get("navigation.speedThroughWater"));
           const minSpeed = gen.minSpeedKnots ?? 3;
           if (
             powerVal != null &&
@@ -1569,7 +1629,8 @@ module.exports = (app) => {
         if (gen.deployable && gen.type === "wind" && underway) {
           const powerVal =
             gen.powerPath != null
-              ? toNumber(deltaState.get(gen.powerPath))
+              ? (averagedPowerW(gen.powerPath) ??
+                toNumber(deltaState.get(gen.powerPath)))
               : null;
           if (!(powerVal != null && powerVal > 0)) {
             currentDeployStates.set(gen.id, "stowed");
@@ -2261,6 +2322,7 @@ module.exports = (app) => {
           engineRunning: detectEngineRunning(
             deltaState,
             renewablePowerPaths(pluginConfig),
+            getActiveEngines(pluginConfig),
           ),
           batterySoc:
             deltaState.get(
@@ -2763,6 +2825,14 @@ module.exports = (app) => {
         extraPaths.push(gen.powerPath);
       }
     }
+    for (const engine of getActiveEngines(pluginConfig)) {
+      if (engine.alternatorPowerPath) {
+        extraPaths.push(engine.alternatorPowerPath);
+      }
+      if (engine.alternatorModePath) {
+        extraPaths.push(engine.alternatorModePath);
+      }
+    }
 
     const allPaths = [...SUBSCRIPTION_PATHS, ...extraPaths];
     const subscription = {
@@ -2834,8 +2904,18 @@ module.exports = (app) => {
           solarPowerPaths.add(array.powerPath);
         }
       }
+      // Generator power paths are tracked in the same history map so the
+      // deploy-state inference can read a window average instead of an
+      // instantaneous flicker (a hydro producing 0↔20 W at the cut-in
+      // speed flipped its detected state 78 times over the 2026-08-30 –
+      // 09-05 passage).
+      for (const gen of getActiveGenerators(config)) {
+        if (gen.powerPath) {
+          solarPowerPaths.add(gen.powerPath);
+        }
+      }
       app.debug(
-        `Tracking ${solarPowerPaths.size} solar power paths for learning triggers`,
+        `Tracking ${solarPowerPaths.size} power paths for learning triggers and deploy-state averaging`,
       );
 
       // Initialize components
@@ -2897,7 +2977,11 @@ module.exports = (app) => {
         // charging signature on boats without propulsion instrumentation
         // (Victron-only setups) so motoring is never invisible to the model.
         getEngineRunning: () =>
-          detectEngineRunning(deltaState, renewablePowerPaths(pluginConfig)),
+          detectEngineRunning(
+            deltaState,
+            renewablePowerPaths(pluginConfig),
+            getActiveEngines(pluginConfig),
+          ),
         // Surplus-mode detector for the consumption-learning gate
         // (LoadProfile): inside a forecast surplus window, or with an
         // instrumented elective load running, samples reflect opportunistic

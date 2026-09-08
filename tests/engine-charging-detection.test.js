@@ -20,7 +20,10 @@ const { join } = require("node:path");
 const { tmpdir } = require("node:os");
 const { EventEmitter } = require("node:events");
 
-const { detectEngineCharging } = require("../plugin/combustion.js");
+const {
+  detectEngineCharging,
+  detectEngineRunning,
+} = require("../plugin/combustion.js");
 const { PredictionEngine, LoadProfile } = require("../plugin/prediction.js");
 const makePlugin = require("../plugin/index.js");
 
@@ -323,7 +326,127 @@ test.describe("motoring on a Victron-only boat (no propulsion paths)", () => {
   });
 });
 
-// --- Engine-level: alternator attribution with uninstrumented engines ------
+// --- Alternator / DC-DC charger path detection ---------------------------
+
+test.describe("alternator charger paths (mode + power)", () => {
+  const read = (vals) => (path) => vals[path];
+
+  test("an active charging mode marks the engine running", () => {
+    const engine = {
+      id: "main",
+      alternatorModePath: "electrical.chargers.alternator.chargingMode",
+      alternatorPowerPath: "electrical.chargers.alternator.power",
+    };
+    // Absorption-tapered trickle while the engine still runs hard — the
+    // mode, not the watts, is the truthful signal.
+    const vals = {
+      "electrical.chargers.alternator.chargingMode": "absorption",
+      "electrical.chargers.alternator.power": 15,
+    };
+    assert.strictEqual(
+      detectEngineRunning(engine, read(vals)),
+      true,
+      "active mode must read as running despite trickle power",
+    );
+  });
+
+  test("float mode still counts as running", () => {
+    const engine = {
+      id: "main",
+      alternatorModePath: "electrical.chargers.alternator.chargingMode",
+    };
+    assert.strictEqual(
+      detectEngineRunning(
+        engine,
+        read({ "electrical.chargers.alternator.chargingMode": "float" }),
+      ),
+      true,
+    );
+  });
+
+  test("an explicit off mode means not running", () => {
+    const engine = {
+      id: "main",
+      alternatorModePath: "electrical.chargers.alternator.chargingMode",
+    };
+    assert.strictEqual(
+      detectEngineRunning(
+        engine,
+        read({ "electrical.chargers.alternator.chargingMode": "off" }),
+      ),
+      false,
+    );
+  });
+
+  test("without a mode path, positive power means running", () => {
+    const engine = {
+      id: "main",
+      alternatorPowerPath: "electrical.chargers.alternator.power",
+    };
+    assert.strictEqual(
+      detectEngineRunning(
+        engine,
+        read({ "electrical.chargers.alternator.power": 1350 }),
+      ),
+      true,
+    );
+    assert.strictEqual(
+      detectEngineRunning(
+        engine,
+        read({ "electrical.chargers.alternator.power": 0 }),
+      ),
+      false,
+    );
+  });
+
+  test("no paths at all stays unknown (propulsion-less, path-less)", () => {
+    assert.strictEqual(detectEngineRunning({ id: "main" }, read({})), null);
+  });
+
+  test("ideal-track attribution falls back to measured watts", () => {
+    const app = makeFakeApp();
+    app.setSelfPath("navigation.state", "motoring");
+    app.setSelfPath("electrical.batteries.house.capacity.stateOfCharge", 0.9);
+    app.setSelfPath("electrical.chargers.alternator.chargingMode", "bulk");
+    app.setSelfPath("electrical.chargers.alternator.power", 1350);
+
+    const engine = new PredictionEngine({
+      battery: {
+        capacityAh: 400,
+        systemVoltage: 12,
+        minSafeSoC: 0.2,
+        chemistry: "lifepo4",
+      },
+      solarArrays: [],
+      mechanicalGenerators: [],
+      // No alternatorWatts — the measured output must stand in
+      engines: [
+        {
+          id: "main",
+          alternatorPowerPath: "electrical.chargers.alternator.power",
+          alternatorModePath: "electrical.chargers.alternator.chargingMode",
+        },
+      ],
+      getEfficiency: () => 0.7,
+      getSelfPath: (path) => app.getSelfPath(path),
+      app,
+    });
+
+    const forecast = Array.from({ length: 24 }, (_, h) => ({
+      time: new Date(Date.now() + h * 3600000),
+      ghi: 0,
+      cloudCover: 0,
+      gustSpeedMs: null,
+      windSpeedMs: null,
+    }));
+    engine.runPrediction(forecast);
+    assert.strictEqual(
+      engine.getHourlyForecast()[0].alternatorWh,
+      1350,
+      "measured charger output models the ideal track when watts unset",
+    );
+  });
+});
 
 test.describe("PredictionEngine alternator attribution", () => {
   test("engine detected via shunt (getEngineRunning) counts its alternator", () => {

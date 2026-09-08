@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Engines can be detected and modeled via their alternator / DC-DC
+  charger paths.** New optional per-engine config `alternatorPowerPath`
+  and `alternatorModePath` (e.g.
+  `electrical.chargers.alternator.power` /
+  `.chargingMode`): an active charging mode — bulk, absorption, float —
+  or positive output marks the engine as running regardless of
+  propulsion instrumentation. The mode is checked first and is the
+  truthful signal: a DC-DC charger tapers to a trickle in
+  absorption/float while the engine still runs, so watts alone go blind
+  late in the charge. When `alternatorWatts` is unset, the measured
+  output also models the ideal track's alternator contribution. Both
+  paths are subscribed when configured.
+
 ### Fixed
 - **The 24h outlook no longer fabricates critical/deficit from a
   broken forecast.** 2026-08-31 incident: a degraded tier-1 fetch served
@@ -44,6 +58,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the fallback average toward zero — an optimistic load estimate. The
   rolling average now skips engine-running and shore-power samples
   exactly like the bins (and like surplus mode already did).
+- **Deployable-generator detected states no longer flap on flickering
+  output.** The live inference read the *instantaneous* power path, so a
+  hydrogenerator producing 0↔20 W at its cut-in speed flipped its
+  detected state between deployed and stowed on every 5-minute sample
+  (78 flips over the 2026-08-30 – 09-05 passage, 49 on the worst day) —
+  each mismatch against the recommendation nagging "deploy/stow
+  hydrogenerator". The inference now reads the same 5-minute
+  window-averaged power the solar learning uses (generator power paths
+  are tracked in the history map), and the hydro 0 W-while-sailing
+  stow test uses the sustained STW average.
 - **Hydrogenerator deploy/stow verdicts no longer flap or fabricate.**
   The verdict compared the *instantaneous* speed through water against
   hard thresholds, so surfing over the stow limit or a lull below

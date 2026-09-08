@@ -156,9 +156,23 @@ function buildPluginSchema() {
               type: "number",
               title: "Alternator Output",
               description:
-                "Expected alternator output when this engine runs (watts). 0 for electric drives or engines without an alternator — they are consumers and never recommended as generators",
+                "Expected alternator output when this engine runs (watts). 0 for electric drives or engines without an alternator — they are consumers and never recommended as generators. When an alternator power path is configured but this is 0, the measured output stands in",
               default: 0,
               minimum: 0,
+            },
+            alternatorPowerPath: {
+              type: "string",
+              title: "Alternator Power Path",
+              description:
+                "Signal K path for measured alternator/DC-DC charger output (watts), e.g. electrical.chargers.alternator.power. A readable positive output marks the engine as running even without propulsion instrumentation, and when Alternator Output is 0 the measured watts model the ideal track",
+              default: "",
+            },
+            alternatorModePath: {
+              type: "string",
+              title: "Alternator Charging Mode Path",
+              description:
+                "Signal K path for the charger's charging mode (e.g. electrical.chargers.alternator.chargingMode — bulk/absorption/float/off). Any active mode marks the engine as running; unlike power, the mode stays truthful when the charger tapers in absorption or float while the engine still runs",
+              default: "",
             },
             enabled: {
               type: "boolean",
