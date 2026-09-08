@@ -46,6 +46,7 @@ const {
   getDisplayName,
   validateConfig,
 } = require("./schema.js");
+const { detectEngineCharging } = require("./combustion.js");
 const { sunPosition } = require("./solar.js");
 const { formatWh } = require("./format.js");
 const { Recorder } = require("./recorder.js");
@@ -71,10 +72,23 @@ const PROPULSION_REVOLUTIONS_RE = /^propulsion\.([A-Za-z0-9]+)\.revolutions$/;
  * all engines instrument state). Multi-engine vessels (catamarans, larger
  * power boats) are handled by scanning all instances.
  *
+ * When no propulsion instrumentation exists at all (a Victron-only boat
+ * has no `propulsion.*` paths), the battery shunt takes over: net
+ * charging beyond the measured renewables is the alternator's signature
+ * (see {@link detectEngineCharging}). Without it, motoring is invisible
+ * to the model — the ideal track shows a deficit while the alternator
+ * bulk-charges the bank, and load samples clamp to 0 W during charging.
+ * Either signal firing means "a combustion source is active" (a genset
+ * charger reads the same); propulsion instrumentation, when present,
+ * can still veto with a definite "stopped".
+ *
  * @param {Map<string, unknown>} pathValues - Path → value map (delta state)
+ * @param {Array<string>} [renewablePowerPaths] - Configured wind/hydro
+ *        power paths (their output flows through the shunt and must be
+ *        subtracted; solar is already added back by Venus into dcPower)
  * @returns {boolean|null} true if any engine runs, false if all stopped, null if unknown
  */
-function detectEngineRunning(pathValues) {
+function detectEngineRunning(pathValues, renewablePowerPaths = []) {
   let anyRunning = false;
   let anySignal = false;
 
@@ -102,7 +116,49 @@ function detectEngineRunning(pathValues) {
     }
   }
 
+  if (anyRunning) return true;
+
+  // Shunt signature: the alternator out-producing the house load. Only
+  // consulted when the propulsion scan found nothing — a definite
+  // "stopped" from instrumentation wins over an ambiguous shunt reading
+  // (which a genset charger or battery charger could also produce).
+  if (!anySignal) {
+    const charging = detectEngineCharging({
+      dcPowerW: toNumber(pathValues.get("electrical.venus.dcPower")),
+      unaccountedChargingW: renewablePowerPaths.reduce((sum, path) => {
+        const w = toNumber(pathValues.get(path));
+        return w != null && w > 0 ? sum + w : sum;
+      }, 0),
+      shorePowerConnected: isTruthySignal(
+        pathValues.get("electrical.shore.power.connected"),
+      ),
+    });
+    if (charging === true) return true;
+    if (
+      charging === false &&
+      pathValues.get("electrical.venus.dcPower") != null
+    ) {
+      // A readable shunt balance with no combustion charging is a
+      // definite "no engine" on boats without instrumentation.
+      return false;
+    }
+  }
+
   return anySignal ? anyRunning : null;
+}
+
+/**
+ * Unwraps a Signal K boolean-ish value (bare boolean, "true"/"false"
+ * string, or a `{value}` wrapper) to a boolean. Null-ish stays null.
+ *
+ * @param {unknown} v
+ * @returns {boolean}
+ */
+function isTruthySignal(v) {
+  if (v && typeof v === "object" && "value" in v) v = v.value;
+  if (v === true) return true;
+  if (typeof v === "string" && v.toLowerCase() === "true") return true;
+  return false;
 }
 
 /**
@@ -313,6 +369,8 @@ const SUBSCRIPTION_PATHS = [
   "electrical.batteries.house.capacity.stateOfCharge",
   "electrical.venus.dcPower",
   "electrical.venus.acPower",
+  "electrical.shore.power.connected",
+  "navigation.speedOverGround",
   "propulsion.*.state",
   "propulsion.*.revolutions",
   "network.internet.state",
@@ -440,6 +498,31 @@ module.exports = (app) => {
   }
 
   /**
+   * Power paths of the configured renewable generators (wind, hydro).
+   *
+   * Venus `dcPower` is `shunt + solar` — only solar is added back, so
+   * wind, hydro, and alternator charging all drive it negative (see
+   * {@link detectEngineCharging}). To read the alternator's signature
+   * off the shunt, the measured renewable output must be subtracted
+   * first; these are the paths to subtract. Solar is deliberately
+   * excluded (already added back by Venus), and so are gensets (their
+   * charging is combustion — the signature should fire for them).
+   *
+   * @param {object} config - Plugin configuration
+   * @returns {Array<string>} Power paths of wind/hydro generators
+   */
+  function renewablePowerPaths(config) {
+    return getActiveGenerators(config)
+      .filter(
+        (g) =>
+          (g.type === "wind" || g.type === "hydro") &&
+          typeof g.powerPath === "string" &&
+          g.powerPath !== "",
+      )
+      .map((g) => g.powerPath);
+  }
+
+  /**
    * Configured engines, with the legacy single-alternator setting
    * (`battery.engineAlternatorWatts`) normalized into a default "main"
    * engine entry when no engines are configured. Engine ids are Signal K
@@ -536,6 +619,22 @@ module.exports = (app) => {
       return airHeight;
     }
     return DEFAULT_ANEMOMETER_HEIGHT_M;
+  }
+
+  /**
+   * Estimates the current sustained boat speed (m/s) as the mean of the
+   * recent speed-through-water samples — the basis for hydrogenerator
+   * deploy/stow verdicts, so a single surf spike over the stow limit (or
+   * a lull below cut-in) cannot flip a recommendation the sustained
+   * speed does not justify. Null when no recent samples exist.
+   *
+   * @returns {number|null} Sustained STW in m/s, or null
+   */
+  function observedStwMs() {
+    const now = Date.now();
+    const recent = stwHistory.filter((s) => s.time >= now - STW_HISTORY_MS);
+    if (recent.length === 0) return null;
+    return recent.reduce((sum, s) => sum + s.speed, 0) / recent.length;
   }
 
   /**
@@ -1519,7 +1618,7 @@ module.exports = (app) => {
 
       // Get unified deployment recommendations for all deployable systems
       const deploymentRecommendations =
-        predictionEngine.getDeploymentRecommendations();
+        predictionEngine.getDeploymentRecommendations(currentDeployStates);
 
       // Day/night and navigation-state context for urgency-aware
       // notifications. At night, deployables use visual-only and at-rest
@@ -1721,6 +1820,18 @@ module.exports = (app) => {
   const WIND_SAMPLE_INTERVAL_MS = 30 * 1000; // 30 seconds
 
   /**
+   * Recent speed-through-water samples (m/s) for the hydrogenerator
+   * deploy/stow verdict: a momentary surf over the stow limit or a lull
+   * below cut-in must not flip the recommendation when the sustained
+   * speed is fine. Same window recipe as the wind history.
+   *
+   * @type {{speed: number, time: number}[]}
+   */
+  const stwHistory = [];
+  const STW_HISTORY_MS = 10 * 60 * 1000; // 10 minutes
+  const STW_SAMPLE_INTERVAL_MS = 30 * 1000; // 30 seconds
+
+  /**
    * Last known detected deploy state per device, carried forward across
    * null (unknown) inference gaps. At night a deployable solar array
    * produces ~0 W so the per-sample inference yields null; without
@@ -1890,6 +2001,29 @@ module.exports = (app) => {
                   samples.shift();
                 }
                 solarPowerHistory.set(v.path, samples);
+              }
+            }
+
+            // Track speed-through-water history for the sustained-speed
+            // hydrogenerator verdicts (mean over the window — see
+            // observedStwMs)
+            if (v.path === "navigation.speedThroughWater") {
+              const speedMs = toNumber(v.value);
+              if (speedMs != null) {
+                const now = update.timestamp
+                  ? new Date(update.timestamp).getTime()
+                  : Date.now();
+                if (
+                  stwHistory.length === 0 ||
+                  now - stwHistory[stwHistory.length - 1].time >=
+                    STW_SAMPLE_INTERVAL_MS
+                ) {
+                  stwHistory.push({ speed: speedMs, time: now });
+                  const cutoff = now - STW_HISTORY_MS;
+                  while (stwHistory.length > 0 && stwHistory[0].time < cutoff) {
+                    stwHistory.shift();
+                  }
+                }
               }
             }
 
@@ -2124,7 +2258,10 @@ module.exports = (app) => {
 
         // Build sanitization gate readings (prefer delta state, fall back to app.getSelfPath)
         const readings = {
-          engineRunning: detectEngineRunning(deltaState),
+          engineRunning: detectEngineRunning(
+            deltaState,
+            renewablePowerPaths(pluginConfig),
+          ),
           batterySoc:
             deltaState.get(
               pluginConfig.battery?.socPath ||
@@ -2756,9 +2893,11 @@ module.exports = (app) => {
         combustionConfig: config.combustion,
         // Dynamic any-engine detection: scans every subscribed propulsion
         // instance (arbitrary names — "port"/"starboard" work without
-        // listing them twice in config). Configured engines remain the
-        // fallback for exact-path probing.
-        getEngineRunning: () => detectEngineRunning(deltaState),
+        // listing them twice in config), falling back to the battery-shunt
+        // charging signature on boats without propulsion instrumentation
+        // (Victron-only setups) so motoring is never invisible to the model.
+        getEngineRunning: () =>
+          detectEngineRunning(deltaState, renewablePowerPaths(pluginConfig)),
         // Surplus-mode detector for the consumption-learning gate
         // (LoadProfile): inside a forecast surplus window, or with an
         // instrumented elective load running, samples reflect opportunistic
@@ -2774,6 +2913,9 @@ module.exports = (app) => {
         // real gust at the limit must drive a "stow now" even when the
         // forecast says it's calm.
         getObservedGustMs: () => currentWindGustMs(),
+        // Sustained (window-averaged) speed through water for the
+        // hydrogenerator verdicts — surfs and lulls must not flip them.
+        getObservedStwMs: () => observedStwMs(),
         getEfficiency,
         getSelfPath: (path) => deltaState.get(path) ?? app.getSelfPath(path),
         getWindProtection,

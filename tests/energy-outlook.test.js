@@ -191,6 +191,31 @@ test.describe("PredictionEngine.getEnergyOutlook", () => {
     const outlook = engine.getEnergyOutlook();
     assert.strictEqual(outlook.status, "critical");
   });
+
+  test("withholds the outlook on a zero-solar forecast with arrays configured", () => {
+    // 2026-08-31 incident: a broken tier-1 fetch served 24 h of ghi-less
+    // points; with solar arrays configured the ideal track showed zero
+    // production and the outlook reported "critical" on a bank at 98%
+    // in absorption. A 24 h window with arrays and zero solar is broken
+    // forecast data, not physics — no outlook rather than a fabricated
+    // trajectory. (ghi seeds an array in the helper; the forecast itself
+    // carries zero GHI.)
+    const { engine } = makeEngine({ soc: 0.98, ghi: 1, capacityWp: 1000 });
+    engine.runPrediction(dayForecast(0));
+    assert.strictEqual(
+      engine.getEnergyOutlook(),
+      null,
+      "zero-solar window with arrays configured must withhold the outlook",
+    );
+  });
+
+  test("a zero-solar boat (no arrays configured) still gets an outlook", () => {
+    // Wind/hydro-only vessels legitimately track zero solar — the guard
+    // must not silence their deficit reporting.
+    const { engine } = makeEngine({ soc: 0.5, dcPowerW: 40 });
+    engine.runPrediction(dayForecast(0));
+    assert.strictEqual(engine.getEnergyOutlook().status, "deficit");
+  });
 });
 
 function makePublisher() {

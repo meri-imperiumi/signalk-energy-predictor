@@ -7,6 +7,65 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The 24h outlook no longer fabricates critical/deficit from a
+  broken forecast.** 2026-08-31 incident: a degraded tier-1 fetch served
+  24 h of ghi-less points that slipped past the ingestion degenerate
+  guard, and with solar arrays configured the ideal track showed zero
+  production — the outlook reported "critical" on a bank at 98% in
+  absorption (projected drain to 11%), then "deficit" once the engine
+  was running (its configured alternator didn't out-pace the load).
+  The outlook now applies the same transient guard the combustion
+  advisory already uses: when solar arrays are configured and the
+  window's total solar is exactly zero with daylight in the window
+  (i.e. not polar night), the forecast is data-degraded — no outlook is
+  published rather than a fabricated trajectory. Solar-less boats
+  (wind/hydro only) are exempt and keep full deficit reporting.
+- **Motoring is no longer invisible on boats without propulsion
+  instrumentation.** Engine-running detection relied solely on
+  `propulsion.*` paths; a Victron-only setup has none, so `engineRunning`
+  read null forever — with the engine charging hard, the 24h outlook
+  kept showing "deficit" (2026-09 incident: critical while sailing in
+  light air with the hydrogenerator stowed, then deficit after starting
+  the engine, while the alternator bulk-charged the bank). The battery
+  shunt now provides a fallback signature: Venus `dcPower` is
+  `shunt + solar`, so `dcPower + measured wind/hydro = load − alternator`;
+  a balance more than 150 W below zero means a combustion source is
+  charging (a genset charger reads the same — deliberate, see below).
+  Shore power defeats the signature. When the aggregate detector fires,
+  engines whose per-instance detection is unknown (null) contribute
+  their configured `alternatorWatts` to the ideal track. The same signal
+  gates solar learning and the load profile (below).
+- **Load learning no longer absorbs engine-running and shore-power
+  samples into the rolling average.** `addSample` pushed every sample
+  into the 3-hour rolling window before the engine/shore gates applied
+  (only the binned EMAs were gated). While motoring, the shunt goes
+  negative and the reconstruction clamps each sample to 0 W, dragging
+  the fallback average toward zero — an optimistic load estimate. The
+  rolling average now skips engine-running and shore-power samples
+  exactly like the bins (and like surplus mode already did).
+- **Hydrogenerator deploy/stow verdicts no longer flap or fabricate.**
+  The verdict compared the *instantaneous* speed through water against
+  hard thresholds, so surfing over the stow limit or a lull below
+  cut-in flipped the recommendation every cycle (the flip cooldown only
+  holds notifications, not the published delta). Verdicts now use a
+  10-minute window average (with a 1 kn hysteresis band on each
+  threshold: a stow-for-fast holds until the sustained speed is 1 kn
+  under the limit, a deploy holds through lulls 1 kn below cut-in).
+  A missing paddlewheel no longer fabricates "sailing too slow (0.0kn)":
+  speed falls back to SOG (labelled "SOG (no STW)" in the reason), and
+  with no speed source at all the last verdict — or the detected state —
+  is held with an honest "no boat speed data" reason.
+- **Wind-generator verdicts no longer fabricate calm on windless
+  forecast tiers.** `getMaxForecastWind` collapses an all-null forecast
+  (tier 3/4 carry no wind) to 0 kn, so a down weather API stowed the
+  wind generator with "forecast wind too low (0kn < 5kn)" while real
+  wind blew. When the forecast tier carries no wind at all, the verdict
+  basis is the measured nowcast (true → over-ground → apparent wind,
+  observed gust), with reasons labelled "measured"; with neither
+  forecast nor measurement the detected state is held ("no wind data")
+  instead of inventing calm. A forecast that carries wind still governs.
+
 ## [0.8.2] - 2026-09-05
 
 ### Fixed

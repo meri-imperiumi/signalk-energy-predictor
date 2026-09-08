@@ -556,6 +556,25 @@ class LoadProfile {
       return;
     }
 
+    // Engine running or shore power: skip the sample entirely, the same
+    // policy the bins already apply via shouldGate. The rolling average
+    // is the *baseline house consumption* fallback for unlearned bins,
+    // and combustion charging corrupts it the other way: Venus dcPower
+    // (shunt + solar) goes strongly negative while the alternator
+    // bulk-charges, the reconstruction clamps at 0 W, and a stream of
+    // 0 W samples drags the average toward zero — an optimistic load
+    // that suppresses deficit warnings. (Before the shunt-based engine
+    // detection, uninstrumented engines also slipped past shouldGate.)
+    if (
+      this.isEngineRunning() === true ||
+      this.isShorePowerConnected() === true
+    ) {
+      this.app?.debug?.(
+        `Load profile sample skipped: engine running or shore power (dc=${Math.round(dcLoadW)}W, ac=${Math.round(acLoadW)}W)`,
+      );
+      return;
+    }
+
     const now = new Date();
 
     // Track in rolling average (fallback)
@@ -1008,6 +1027,7 @@ class PredictionEngine {
     getEngineRunning,
     isSurplusActive,
     getObservedGustMs,
+    getObservedStwMs,
     getEfficiency,
     getSelfPath,
     getWindProtection,
@@ -1046,12 +1066,24 @@ class PredictionEngine {
     /** Run-transition state per combustion source id: runningSince
      * (batching minimum-run accounting) and lastRunEnd (cooldown). */
     this.combustionRuns = new Map();
+    /** Last hydrogenerator deploy/stow verdict per generator id (with its
+     * cause) — the hysteresis state that keeps surfs and lulls from
+     * flipping the recommendation every cycle. Reset on restart; the
+     * first verdict after a restart seeds it. */
+    this.hydroVerdicts = new Map();
     this.getEfficiency = getEfficiency;
     this.getSelfPath = getSelfPath;
     // Observed (live) wind gust in m/s — reality overrides forecast for
     // the current-hour stow verdict (a real gust at the limit must drive
     // a "stow now" even when the forecast is calm).
     this.getObservedGustMs = getObservedGustMs || null;
+    // Observed (live, window-averaged) speed through water in m/s — the
+    // sustained-speed basis for hydrogenerator verdicts, so a momentary
+    // surf over the stow limit or a lull below cut-in cannot flip a
+    // recommendation the sustained speed does not justify. Null when no
+    // injector is provided; getBoatSpeedMs() then falls back through the
+    // instantaneous reading to speed over ground.
+    this.getObservedStwMs = getObservedStwMs || null;
     this.getWindProtection = getWindProtection || (() => null);
     this.windProtectionConfig = windProtectionConfig || {};
     this.getDisplayName =
@@ -1175,12 +1207,46 @@ class PredictionEngine {
   }
 
   /**
+   * Short label for which speed source a hydro verdict is based on — so
+   * the reason string tells the crew when the paddlewheel is missing and
+   * SOG (current-biased) is standing in for it.
+   *
+   * @returns {string} "STW", "SOG (no STW)", or "" when nothing readable
+   */
+  stwSourceLabel() {
+    const averaged = this.getObservedStwMs?.();
+    if (averaged != null && Number.isFinite(averaged)) return "STW";
+    if (this.getSpeedThroughWater() != null) return "STW";
+    if (toMs(this.getSelfPath("navigation.speedOverGround")) != null)
+      return "SOG (no STW)";
+    return "";
+  }
+
+  /**
    * Gets the current speed through water.
    *
    * @returns {number|null} Speed in m/s
    */
   getSpeedThroughWater() {
     return toMs(this.getSelfPath("navigation.speedThroughWater"));
+  }
+
+  /**
+   * Gets the best available boat speed for hydrogenerator decisions: the
+   * window-averaged speed through water (surfs and lulls smoothed out),
+   * falling back to the instantaneous reading, then to speed over ground
+   * (current introduces error, but a fabricated 0 kn from a missing
+   * paddlewheel is worse — it stows a hydrogenerator on a boat that is
+   * sailing well). Null when nothing is readable.
+   *
+   * @returns {number|null} Speed in m/s, or null
+   */
+  getBoatSpeedMs() {
+    const averaged = this.getObservedStwMs?.();
+    if (averaged != null && Number.isFinite(averaged)) return averaged;
+    const stw = this.getSpeedThroughWater();
+    if (stw != null) return stw;
+    return toMs(this.getSelfPath("navigation.speedOverGround"));
   }
 
   /**
@@ -1265,6 +1331,41 @@ class PredictionEngine {
     return this.lastPrediction.reduce((max, p) => {
       return Math.max(max, p.windSpeedMs ?? 0);
     }, 0);
+  }
+
+  /**
+   * Whether the current prediction's forecast carries any wind data at
+   * all. Tiers 3/4 of the weather ladder (logbook oktas, clear sky) have
+   * no wind — every hour reads null — which must not be collapsed into
+   * a fabricated calm ("forecast wind 0kn < startup 5kn" stowed a wind
+   * generator while a gale was blowing; the same no-fabrication rule the
+   * gust gates already follow).
+   *
+   * @returns {boolean} True when at least one forecast hour has wind
+   */
+  forecastCarriesWind() {
+    // NOTE: the prediction's own `windSpeedMs` field is 0-filled at
+    // storage time (`?? 0` in the hour push), so it cannot distinguish a
+    // calm forecast from a windless one — `forecastWindSpeedMs` (the raw
+    // forecast value, null when the tier carries no wind) is the honest
+    // signal.
+    return this.lastPrediction.some((p) => p.forecastWindSpeedMs != null);
+  }
+
+  /**
+   * Current measured sustained wind in m/s — the nowcast basis for
+   * wind-generator verdicts when the forecast tier carries no wind.
+   * Prefers true wind, then over-ground, then apparent (the same chain
+   * the wind-protection paths use).
+   *
+   * @returns {number|null} Wind speed in m/s, or null when unreadable
+   */
+  getMeasuredWindMs() {
+    return (
+      toMs(this.getSelfPath("environment.wind.speedTrue")) ??
+      toMs(this.getSelfPath("environment.wind.speedOverGround")) ??
+      toMs(this.getSelfPath("environment.wind.speedApparent"))
+    );
   }
 
   /**
@@ -1492,8 +1593,8 @@ class PredictionEngine {
       let hours = 0;
       for (const point of this.lastForecast) {
         // Forecast doesn't carry speedThroughWater; use the current
-        // reading as a proxy for the near-term window.
-        const speed = this.getSpeedThroughWater() ?? 0;
+        // sustained reading as a proxy for the near-term window.
+        const speed = this.getBoatSpeedMs() ?? 0;
         if (speed >= minSpeed) {
           hours++;
         } else {
@@ -2068,14 +2169,33 @@ class PredictionEngine {
    *
    * @returns {Array<{id: string, name: string, type: string, recommendedState: string, reason: string, currentGustMs?: number, currentSpeedMs?: number, limitMs?: number}>}}
    */
-  getDeploymentRecommendations() {
+  getDeploymentRecommendations(detectedStates = null) {
     const recommendations = [];
     const navState = this.getNavState();
     const underway = this.isUnderway();
     const isSailing = navState === "sailing";
-    const speedThroughWater = this.getSpeedThroughWater() ?? 0;
-    const maxGust = this.getMaxForecastGust();
-    const maxWind = this.getMaxForecastWind();
+    // Sustained boat speed (window-averaged STW, SOG fallback) — the
+    // verdict basis. A single surf spike over the stow limit (or a lull
+    // below cut-in) must not flip the recommendation; the instantaneous
+    // reading used to do exactly that. Null when no speed source is
+    // readable at all — never fabricated as 0 kn ("sailing too slow
+    // 0.0kn" on a boat making way was a real false-stow).
+    const boatSpeedMs = this.getBoatSpeedMs();
+    const speedThroughWater = boatSpeedMs;
+    // Wind basis for wind-generator verdicts: the forecast max when the
+    // active tier carries wind; otherwise the measured nowcast (sustained
+    // wind + observed gust). A windless forecast tier must not fabricate
+    // calm — "forecast wind too low" stowed wind generators in real
+    // wind when the weather API was down.
+    const forecastHasWind = this.forecastCarriesWind();
+    const measuredWindMs = forecastHasWind ? null : this.getMeasuredWindMs();
+    const windLabel = forecastHasWind ? "forecast" : "measured";
+    const maxGust = forecastHasWind
+      ? this.getMaxForecastGust()
+      : (this.getObservedGustMs?.() ?? 0);
+    const maxWind = forecastHasWind
+      ? this.getMaxForecastWind()
+      : (measuredWindMs ?? 0);
     // Observed (live) gust overrides forecast for the current-hour stow
     // verdict: a real gust at or above the limit must drive a "stow now"
     // even when the forecast says it's calm. The forecast still governs
@@ -2241,52 +2361,98 @@ class PredictionEngine {
       if (generator.type === "hydro") {
         const minSpeed = generator.minSpeedMs ?? msFromKnots(3);
         const maxSpeed = generator.maxSpeedMs ?? msFromKnots(12);
+        // Hysteresis band: once a verdict is reached, the speed must
+        // clear the opposite threshold by this margin to flip it — the
+        // same idea as the gust hysteresis on deployable solar. 1 kn
+        // covers normal surfing/lull oscillation around a threshold.
+        const bandMs = msFromKnots(1);
         // User-facing reasons render knots.
-        const speedKn = speedThroughWater * MS_TO_KN;
         const minSpeedKn = minSpeed * MS_TO_KN;
         const maxSpeedKn = maxSpeed * MS_TO_KN;
+        const speedKn = (boatSpeedMs ?? 0) * MS_TO_KN;
+        const speedSource = this.stwSourceLabel();
+
+        const remember = (state, cause) => {
+          this.hydroVerdicts.set(generator.id, { state, cause });
+        };
+        const last = this.hydroVerdicts.get(generator.id) ?? null;
+
+        const push = (recommendedState, reason, extra = {}) => {
+          recommendations.push({
+            id: generator.id,
+            name,
+            type: "hydro",
+            recommendedState,
+            reason,
+            ...extra,
+          });
+        };
 
         if (!isSailing) {
           // Hydro can only be deployed when sailing (not motoring)
-          recommendations.push({
-            id: generator.id,
-            name,
-            type: "hydro",
-            recommendedState: "stowed",
-            reason: underway
+          remember("stowed", "nav");
+          push(
+            "stowed",
+            underway
               ? `vessel ${navState}, hydro requires sailing`
               : "vessel not sailing",
-          });
-        } else if (speedThroughWater >= maxSpeed) {
-          recommendations.push({
-            id: generator.id,
-            name,
-            type: "hydro",
-            recommendedState: "stowed",
-            reason: `boat speed ${speedKn.toFixed(1)}kn exceeds limit of ${maxSpeedKn.toFixed(1)}kn`,
-            currentSpeedMs: speedThroughWater,
-            limitMs: maxSpeed,
-          });
-        } else if (speedThroughWater >= minSpeed) {
-          recommendations.push({
-            id: generator.id,
-            name,
-            type: "hydro",
-            recommendedState: "deployed",
-            reason: `sailing at ${speedKn.toFixed(1)}kn (min ${minSpeedKn.toFixed(1)}kn, max ${maxSpeedKn.toFixed(1)}kn)`,
-            currentSpeedMs: speedThroughWater,
-            limitMs: maxSpeed,
-          });
+          );
+        } else if (boatSpeedMs == null) {
+          // No readable speed source: keep the last verdict rather than
+          // fabricating one from a missing sensor. With no history (fresh
+          // start), stay neutral: match the detected state so no action
+          // notification fires, or stow when even that is unknown.
+          const fallback =
+            last?.state ?? detectedStates?.get(generator.id) ?? "stowed";
+          push(
+            fallback,
+            `no boat speed data (STW and SOG unreadable), holding ${fallback}`,
+            { currentSpeedMs: null },
+          );
+        } else if (boatSpeedMs >= maxSpeed) {
+          remember("stowed", "fast");
+          push(
+            "stowed",
+            `sustained ${speedSource} speed ${speedKn.toFixed(1)}kn exceeds limit of ${maxSpeedKn.toFixed(1)}kn`,
+            { currentSpeedMs: boatSpeedMs, limitMs: maxSpeed },
+          );
+        } else if (
+          last?.state === "stowed" &&
+          last?.cause === "fast" &&
+          boatSpeedMs >= maxSpeed - bandMs
+        ) {
+          // Back under the limit but inside the hysteresis band: hold the
+          // stow until the sustained speed clearly drops.
+          push(
+            "stowed",
+            `speed ${speedKn.toFixed(1)}kn within hysteresis of limit ${maxSpeedKn.toFixed(1)}kn`,
+            { currentSpeedMs: boatSpeedMs, limitMs: maxSpeed },
+          );
+        } else if (boatSpeedMs >= minSpeed) {
+          remember("deployed", "speed");
+          push(
+            "deployed",
+            `sailing at ${speedKn.toFixed(1)}kn ${speedSource} (min ${minSpeedKn.toFixed(1)}kn, max ${maxSpeedKn.toFixed(1)}kn)`,
+            { currentSpeedMs: boatSpeedMs, limitMs: maxSpeed },
+          );
+        } else if (
+          last?.state === "deployed" &&
+          boatSpeedMs >= minSpeed - bandMs
+        ) {
+          // A lull below cut-in but inside the band: keep the hydro in
+          // the water — the next wave train brings the speed back.
+          push(
+            "deployed",
+            `sailing at ${speedKn.toFixed(1)}kn ${speedSource}, lull within hysteresis of min ${minSpeedKn.toFixed(1)}kn`,
+            { currentSpeedMs: boatSpeedMs, limitMs: minSpeed },
+          );
         } else {
-          recommendations.push({
-            id: generator.id,
-            name,
-            type: "hydro",
-            recommendedState: "stowed",
-            reason: `sailing too slow (${speedKn.toFixed(1)}kn < ${minSpeedKn.toFixed(1)}kn)`,
-            currentSpeedMs: speedThroughWater,
-            limitMs: minSpeed,
-          });
+          remember("stowed", "slow");
+          push(
+            "stowed",
+            `sailing too slow (${speedKn.toFixed(1)}kn ${speedSource} < ${minSpeedKn.toFixed(1)}kn)`,
+            { currentSpeedMs: boatSpeedMs, limitMs: minSpeed },
+          );
         }
       } else if (generator.type === "wind") {
         const maxWindMs = generator.maxWindMs ?? msFromKnots(30);
@@ -2342,7 +2508,7 @@ class PredictionEngine {
               recommendedState: "stowed",
               reason: observedOverLimit
                 ? `observed gusts ${Math.round(observedGustMs * MS_TO_KN)}kn ≥ limit of ${Math.round(maxWindKn)}kn`
-                : `forecast gusts ${Math.round(maxGustKn)}kn exceed limit of ${Math.round(maxWindKn)}kn`,
+                : `${windLabel} gusts ${Math.round(maxGustKn)}kn exceed limit of ${Math.round(maxWindKn)}kn`,
               currentGustMs: effectiveMaxGust,
               limitMs: maxWindMs,
             });
@@ -2365,9 +2531,21 @@ class PredictionEngine {
               name,
               type: "wind",
               recommendedState: "deployed",
-              reason: `forecast wind ${Math.round(maxWindValueKn)}kn (gusts ${Math.round(maxGustKn)}kn)`,
+              reason: `${windLabel} wind ${Math.round(maxWindValueKn)}kn (gusts ${Math.round(maxGustKn)}kn)`,
               currentGustMs: maxGust,
               limitMs: maxWindMs,
+            });
+          } else if (!forecastHasWind && measuredWindMs == null) {
+            // No wind data from any source: hold the detected state rather
+            // than fabricate a verdict (the forecast tier carries no wind
+            // AND nothing is measurable — say so, don't invent calm).
+            recommendations.push({
+              id: generator.id,
+              name,
+              type: "wind",
+              recommendedState: detectedStates?.get(generator.id) ?? "stowed",
+              reason:
+                "no wind data (forecast carries no wind, none measurable)",
             });
           } else {
             recommendations.push({
@@ -2375,7 +2553,7 @@ class PredictionEngine {
               name,
               type: "wind",
               recommendedState: "stowed",
-              reason: `forecast wind too low (${Math.round(maxWindValueKn)}kn < ${Math.round(minDeployWindKn)}kn)`,
+              reason: `${windLabel} wind too low (${Math.round(maxWindValueKn)}kn < ${Math.round(minDeployWindKn)}kn)`,
             });
           }
         }
@@ -2837,7 +3015,10 @@ class PredictionEngine {
       let mechanicalYieldWh = 0;
       let hydroYieldWh = 0;
       let detectedMechanicalYieldWh = 0;
-      const speedThroughWater = this.getSpeedThroughWater();
+      // Sustained boat speed (window-averaged STW, SOG fallback) — a
+      // single surf spike or lull must not swing the hydro yield estimate
+      const boatSpeedMs = this.getBoatSpeedMs();
+      const speedThroughWater = boatSpeedMs;
 
       for (const generator of this.mechanicalGenerators) {
         let genYield = 0;
@@ -2912,10 +3093,16 @@ class PredictionEngine {
       let alternatorWh = 0;
       if (underway && engineRunning === true) {
         for (const engine of this.engines) {
-          if (
-            engine.alternatorWatts > 0 &&
-            detectEngineRunning(engine, this.getSelfPath) === true
-          ) {
+          if (engine.alternatorWatts <= 0) continue;
+          const running = detectEngineRunning(engine, this.getSelfPath);
+          // Per-engine instrumentation wins. When it is unknown (null —
+          // no propulsion paths, e.g. a Victron-only boat) but the
+          // aggregate detector says an engine runs (shunt charging
+          // signature), count this engine: on an uninstrumented boat the
+          // configured engine IS the one charging. Multi-engine
+          // uninstrumented boats over-count here — acceptable rarity,
+          // noted in the aggregate detector's doc.
+          if (running === true || running == null) {
             alternatorWh += engine.alternatorWatts;
           }
         }
@@ -3330,6 +3517,50 @@ class PredictionEngine {
     const hours = Math.min(24, this.lastPrediction.length);
     const track = this.lastPrediction.slice(0, hours);
     const currentSoC = this.getCurrentSoC();
+
+    // Degenerate-forecast transient guard (2026-08-31 incident): a
+    // broken tier-1 fetch served 24 h of ghi-less points that slipped
+    // past the ingestion guard, and with solar arrays configured the
+    // ideal track showed zero production — the outlook reported
+    // "critical" on a bank at 98% in absorption, and (engine on, its
+    // 100 W configured alternator out-paced by the load) "deficit"
+    // while motoring. The combustion advisory already refuses to act on
+    // this signature (totalSolar === 0 = empty-weather transient, not a
+    // discharge worth nagging about); the outlook must not fabricate a
+    // trajectory from it either. Only applies when solar arrays are
+    // configured (a solar-less boat legitimately tracks 0 solar) and
+    // the sun rises within the window (polar night aside, a 24 h window
+    // on a solar boat always contains daylight — zero solar means the
+    // forecast is broken, not the sky).
+    if (this.solarArrays.length > 0) {
+      const totalSolar = track.reduce(
+        (sum, p) => sum + (p.idealSolarYieldWh || 0),
+        0,
+      );
+      if (totalSolar === 0) {
+        const position = unwrapPosition(
+          this.getSelfPath("navigation.position"),
+        );
+        const latitude = position?.latitude ?? 0;
+        const longitude = position?.longitude ?? 0;
+        // Daylight anywhere in the window? (Polar night keeps reporting —
+        // zero solar is physics there, not broken data.)
+        let sunUpInWindow = false;
+        for (const p of track) {
+          const t = p.time instanceof Date ? p.time : new Date(p.time);
+          if (sunPosition(t, latitude, longitude).altitude > 0) {
+            sunUpInWindow = true;
+            break;
+          }
+        }
+        if (sunUpInWindow) {
+          this.app?.debug?.(
+            "getEnergyOutlook: zero solar across the window with arrays configured — forecast is degenerate, withholding outlook",
+          );
+          return null;
+        }
+      }
+    }
 
     // Surplus over the window: same track-clamp math as
     // findSurplusOpportunity (energy the 100% SoC clamp throws away), but

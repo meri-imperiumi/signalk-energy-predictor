@@ -324,6 +324,54 @@ function toNumber(v) {
 }
 
 /**
+ * Detects combustion charging from the battery-shunt power balance —
+ * the engine-running fallback for boats without propulsion
+ * instrumentation (a Victron-only setup has no `propulsion.*` paths,
+ * so `detectEngineRunning` returns null and the alternator would be
+ * invisible to the model while it bulk-charges the bank).
+ *
+ * The Venus `dcPower` value is `shunt + solar`: solar is added back by
+ * Venus, but wind, hydro, and the alternator flow through the shunt and
+ * are not. Reconstructing the gross bus balance the same way
+ * `updateLoadProfile` does (`dcPower + wind + hydro`) yields
+ * `load − alternator`: strongly negative means a combustion charger is
+ * out-producing the house load. Renewable output must be subtracted so a
+ * windy anchorage with the wind generator covering the load is not
+ * misread as an engine run; a connected shore power defeats the signal
+ * entirely (the charger, not the alternator, explains the current).
+ *
+ * Deliberately coarse: a single sustained-margin reading, no smoothing —
+ * the consumers (load-learning gates, the ideal-track alternator
+ * addition) tolerate a cycle of lag, and absorption-tapered charging
+ * honestly should stop counting as "the engine is charging".
+ *
+ * @param {object} params
+ * @param {number|null} params.dcPowerW - Venus dcPower (shunt + solar),
+ *        negative when net charging; null when unavailable
+ * @param {number} [params.unaccountedChargingW=0] - Measured wind + hydro
+ *        output (W) — charging that flows through the shunt but is not
+ *        the alternator
+ * @param {boolean} [params.shorePowerConnected=false] - Shore power
+ *        connected (charging is the charger's, not the engine's)
+ * @param {number} [params.thresholdW=150] - How far below zero the
+ *        alternator must out-produce the load (W)
+ * @returns {boolean|null} true when a combustion source is charging,
+ *          false when the balance shows none, null when undecidable
+ *          (no dcPower reading)
+ */
+function detectEngineCharging({
+  dcPowerW,
+  unaccountedChargingW = 0,
+  shorePowerConnected = false,
+  thresholdW = 150,
+}) {
+  if (dcPowerW == null || !Number.isFinite(dcPowerW)) return null;
+  if (shorePowerConnected) return false;
+  const grossW = dcPowerW + unaccountedChargingW; // load − alternator
+  return grossW < -thresholdW;
+}
+
+/**
  * Detects whether a propulsion engine is currently running, from its
  * Signal K propulsion instance (e.g. "main", "port", "starboard").
  *
@@ -433,6 +481,7 @@ module.exports = {
   updateCombustionRuns,
   resolveGensetRunning,
   detectEngineRunning,
+  detectEngineCharging,
   flipCooldownHoursFor,
   Reluctance,
 };
