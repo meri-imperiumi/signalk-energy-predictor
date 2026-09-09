@@ -39,7 +39,8 @@
     ],
     "recommends": [
       "signalk-venus-plugin",
-      "@meri-imperiumi/signalk-logbook"
+      "@meri-imperiumi/signalk-logbook",
+      "signalk-polar-management"
     ]
   },
   "engines": {

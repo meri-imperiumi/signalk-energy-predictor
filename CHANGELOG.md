@@ -8,6 +8,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Hydrogenerator predictions can use the vessel's active polar.**
+  When a polar tool publishes the Signal K `polars` resource and
+  `polars.activePolar` (e.g. signalk-polar-management), the plugin
+  fetches the table in-process each cycle and estimates future boat
+  speed per forecast hour from the forecast wind (speed + direction
+  against the current heading, with COG fallback) while sailing. This
+  feeds the hourly hydro yield (no more constant current-speed snapshot
+  for the whole window), the hourly deploy/stow actions, the
+  good-output window, and a new `recommendedStateTime` for hydro
+  verdicts ("wind builds to deploy-worthy speed at 15:00"). The
+  published `polars.performanceFactor` is applied as a derating.
+  Strictly optional and configuration-free: with no polar selected,
+  no provider installed, or no wind direction in the forecast, every
+  consumer falls back to the previous observed-speed behavior.
 - **Engines can be detected and modeled via their alternator / DC-DC
   charger paths.** New optional per-engine config `alternatorPowerPath`
   and `alternatorModePath` (e.g.

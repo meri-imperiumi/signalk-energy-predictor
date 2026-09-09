@@ -1016,6 +1016,9 @@ class PredictionEngine {
    *   learned factor). When null, the forecast values pass through unchanged.
    * @param {number} [params.predictionHours] - Prediction horizon in hours
    *   (24–168; from `weather.forecastHours`, defaults to 24)
+   * @param {() => (object|null)} [params.getPolarModel] - Active polar speed
+   *        model injector (see plugin/polar.js); null model means no
+   *        polar, and hydro yield/timing fall back to observed speed
    */
   constructor({
     battery,
@@ -1036,6 +1039,7 @@ class PredictionEngine {
     loadProfileConfig,
     windProtectionConfig,
     predictionHours,
+    getPolarModel,
   }) {
     this.battery = battery;
     // Config thresholds come from the schema in knots (sailor-friendly).
@@ -1085,6 +1089,12 @@ class PredictionEngine {
     // instantaneous reading to speed over ground.
     this.getObservedStwMs = getObservedStwMs || null;
     this.getWindProtection = getWindProtection || (() => null);
+    // Active polar speed model (see plugin/polar.js): consumed to
+    // estimate future boat speed from forecast wind while sailing.
+    // Null injector / null model = no polar available, hydro yield and
+    // timing fall back to the observed sustained speed (today's
+    // behavior) — polars are strictly optional.
+    this.getPolarModel = getPolarModel || (() => null);
     this.windProtectionConfig = windProtectionConfig || {};
     this.getDisplayName =
       getDisplayName || ((config) => config.name || config.id);
@@ -1263,6 +1273,67 @@ class PredictionEngine {
     while (heading >= Math.PI) heading -= 2 * Math.PI;
     while (heading < -Math.PI) heading += 2 * Math.PI;
     return heading;
+  }
+
+  /**
+   * The heading to steer TWA computations against: true heading when
+   * available, course over ground as fallback (current and leeway make
+   * COG a proxy, but a missing heading must not disable the polar — a
+   * fabricated 0 TWA would be worse).
+   *
+   * @returns {number|null} Heading in radians [-π, π), or null
+   */
+  getSteeringHeadingRad() {
+    const heading = this.getHeadingTrue();
+    if (heading != null) return heading;
+    const cog = toNumber(this.getSelfPath("navigation.courseOverGroundTrue"));
+    if (cog == null || isNaN(cog)) return null;
+    return normalizeAngle(cog);
+  }
+
+  /**
+   * Estimates boat speed from the active polar at a forecast wind
+   * state.
+   *
+   * TWA is the forecast wind direction (true, degrees from north) minus
+   * the steering heading (persistence assumption: the current heading
+   * holds over the forecast window — the same assumption the FLINsail
+   * morning pointing makes for an anchored boat).
+   *
+   * @param {number|null} windSpeedMs - Forecast true wind speed in m/s
+   * @param {number|null} windDirectionDeg - Forecast wind direction
+   *        (direction the wind comes from, degrees from north)
+   * @returns {number|null} Estimated STW in m/s, or null when no polar
+   *          is active / wind or heading is unavailable (never a
+   *          fabricated speed)
+   */
+  estimatePolarSpeedMs(windSpeedMs, windDirectionDeg) {
+    if (windSpeedMs == null || windDirectionDeg == null) return null;
+    const model = this.getPolarModel();
+    if (!model || model.available !== true) return null;
+    const heading = this.getSteeringHeadingRad();
+    if (heading == null) return null;
+    const twaRad = normalizeAngle((windDirectionDeg * Math.PI) / 180 - heading);
+    return model.speedAt(windSpeedMs, twaRad);
+  }
+
+  /**
+   * Per-hour boat speed basis for the hydro ideal track while sailing:
+   * the polar estimate when one is available, null otherwise (the
+   * caller falls back to the observed sustained speed). Gated on the
+   * sailing nav state — a polar is a sailing model, so it must not
+   * fabricate speed for a motoring or anchored vessel (at anchor the
+   * bow heads into the wind, so TWA≈0 and the polar itself would give
+   * ~0 anyway, but the explicit gate keeps motoring honest).
+   *
+   * @param {number|null} windSpeedMs - Forecast true wind speed in m/s
+   * @param {number|null} windDirectionDeg - Forecast wind direction in
+   *        degrees from north
+   * @returns {number|null} Estimated STW in m/s, or null
+   */
+  hydroForecastSpeedMs(windSpeedMs, windDirectionDeg) {
+    if (this.getNavState() !== "sailing") return null;
+    return this.estimatePolarSpeedMs(windSpeedMs, windDirectionDeg);
   }
 
   /**
@@ -1479,9 +1550,16 @@ class PredictionEngine {
             navState,
           });
         } else if (generator.type === "hydro") {
+          // While sailing with an active polar, each hour's speed comes
+          // from that hour's forecast wind; otherwise the current STW
+          // stands in for the whole window (as before).
+          const est = this.hydroForecastSpeedMs(
+            point.windSpeedMs ?? null,
+            point.windDirectionDeg ?? null,
+          );
           total += predictHydroHour({
             generator,
-            speedThroughWaterMs: speedThroughWater,
+            speedThroughWaterMs: est ?? speedThroughWater,
             isSailing,
           });
         }
@@ -1586,16 +1664,24 @@ class PredictionEngine {
       return hours;
     }
 
-    // Hydro: good output while there's boat speed. Count hours with
-    // speedThroughWater above the generator's startup (default 0).
+    // Hydro: good output while there's boat speed above the cut-in —
+    // the higher of the configured startup speed and the min (cut-in)
+    // speed. With a polar, each hour's speed comes from that hour's
+    // forecast wind; without one the current sustained reading stands
+    // in for the near-term window.
     if (generator && generator.type === "hydro") {
-      const minSpeed = generator.startupSpeedMs ?? 0;
+      const floorMs = Math.max(
+        generator.startupSpeedMs ?? 0,
+        generator.minSpeedMs ?? msFromKnots(3),
+      );
       let hours = 0;
       for (const point of this.lastForecast) {
-        // Forecast doesn't carry speedThroughWater; use the current
-        // sustained reading as a proxy for the near-term window.
-        const speed = this.getBoatSpeedMs() ?? 0;
-        if (speed >= minSpeed) {
+        const est = this.hydroForecastSpeedMs(
+          point.windSpeedMs ?? null,
+          point.windDirectionDeg ?? null,
+        );
+        const speed = est ?? this.getBoatSpeedMs() ?? 0;
+        if (speed >= floorMs) {
           hours++;
         } else {
           break;
@@ -1842,6 +1928,38 @@ class PredictionEngine {
       return null;
     }
 
+    // Hydrogenerators: crossings of the min/max speed band — but only
+    // with a polar-derived speed forecast (without one there is no
+    // future boat speed to reason about, and the verdict stays on the
+    // observed sustained speed, so no time is published — today's
+    // behavior).
+    if (generator && generator.type === "hydro") {
+      const minSpeed = generator.minSpeedMs ?? msFromKnots(3);
+      const maxSpeed = generator.maxSpeedMs ?? msFromKnots(12);
+      for (const point of this.lastForecast) {
+        const est = this.hydroForecastSpeedMs(
+          point.windSpeedMs ?? null,
+          point.windDirectionDeg ?? null,
+        );
+        // A missing estimate (no polar, no wind data, not sailing) is
+        // not evidence of anything: skip it rather than fabricate a
+        // crossing.
+        if (est == null) continue;
+        if (currentState === "stowed") {
+          // Would deploy once the polar-derived speed reaches the band
+          if (est >= minSpeed && est < maxSpeed) {
+            return this.toISOString(point.time);
+          }
+        } else if (currentState === "deployed") {
+          // Would stow once the polar-derived speed exceeds the limit
+          if (est >= maxSpeed) {
+            return this.toISOString(point.time);
+          }
+        }
+      }
+      return null;
+    }
+
     return null;
   }
 
@@ -2022,6 +2140,9 @@ class PredictionEngine {
    * @param {Map<string, {state: string, reason: string}>} [solarStates] - Precomputed
    *        deployable solar states for this hour (from computeDeployableSolarStates)
    * @param {string} [navState] - Navigation state (anchored/moored/...)
+   * @param {string} [hydroSpeedLabel] - Label for the hydro speed basis
+   *        ("polar est." when derived from the active polar, or the
+   *        observed-speed source label), shown in reasons
    * @returns {Array<{id: string, type: string, idealState: string, idealAction: string, detectedAction: string|null, reason: string}>}
    */
   getHourlyActions(
@@ -2033,6 +2154,7 @@ class PredictionEngine {
     detectedDeployStates,
     solarStates,
     navState = "unknown",
+    hydroSpeedLabel = "",
   ) {
     const actions = [];
 
@@ -2120,22 +2242,24 @@ class PredictionEngine {
         const minSpeed = generator.minSpeedMs ?? msFromKnots(3);
         const maxSpeed = generator.maxSpeedMs ?? msFromKnots(12);
         const speed = speedThroughWaterMs ?? 0;
-        // User-facing reasons render knots.
+        // User-facing reasons render knots; the label tells the crew
+        // whether the speed is observed or a polar estimate.
         const speedKn = speed * MS_TO_KN;
         const minSpeedKn = minSpeed * MS_TO_KN;
         const maxSpeedKn = maxSpeed * MS_TO_KN;
+        const src = hydroSpeedLabel ? ` ${hydroSpeedLabel}` : "";
         if (!isSailing) {
           idealState = "stowed";
           reason = "not sailing";
         } else if (speed >= maxSpeed) {
           idealState = "stowed";
-          reason = `boat speed ${speedKn.toFixed(1)}kn ≥ max ${maxSpeedKn.toFixed(1)}kn`;
+          reason = `boat speed ${speedKn.toFixed(1)}kn${src} ≥ max ${maxSpeedKn.toFixed(1)}kn`;
         } else if (speed >= minSpeed) {
           idealState = "deployed";
-          reason = `sailing ${speedKn.toFixed(1)}kn (min ${minSpeedKn.toFixed(1)}kn)`;
+          reason = `sailing ${speedKn.toFixed(1)}kn${src} (min ${minSpeedKn.toFixed(1)}kn)`;
         } else {
           idealState = "stowed";
-          reason = `sailing too slow (${speedKn.toFixed(1)}kn < ${minSpeedKn.toFixed(1)}kn)`;
+          reason = `sailing too slow (${speedKn.toFixed(1)}kn${src} < ${minSpeedKn.toFixed(1)}kn)`;
         }
       } else {
         continue;
@@ -3018,7 +3142,17 @@ class PredictionEngine {
       // Sustained boat speed (window-averaged STW, SOG fallback) — a
       // single surf spike or lull must not swing the hydro yield estimate
       const boatSpeedMs = this.getBoatSpeedMs();
-      const speedThroughWater = boatSpeedMs;
+      // While sailing with an active polar, the per-hour boat speed
+      // comes from the forecast wind (TWS + direction vs heading);
+      // without a polar (or wind/heading) this stays null and the
+      // observed sustained speed stands in for every hour, as before.
+      const polarSpeedMs = this.hydroForecastSpeedMs(
+        windSpeedMs,
+        windDirectionDeg,
+      );
+      const hydroSpeedMs = polarSpeedMs ?? boatSpeedMs;
+      const hydroSpeedLabel =
+        polarSpeedMs != null ? "polar est." : this.stwSourceLabel();
 
       for (const generator of this.mechanicalGenerators) {
         let genYield = 0;
@@ -3033,7 +3167,7 @@ class PredictionEngine {
         } else if (generator.type === "hydro") {
           genYield = predictHydroHour({
             generator,
-            speedThroughWaterMs: speedThroughWater ?? 0,
+            speedThroughWaterMs: hydroSpeedMs ?? 0,
             isSailing,
           });
         }
@@ -3145,10 +3279,11 @@ class PredictionEngine {
         windSpeedMs,
         underway,
         isSailing,
-        speedThroughWater ?? null,
+        hydroSpeedMs ?? null,
         detectedDeployStates,
         solarStatesPerHour[h],
         navState,
+        hydroSpeedLabel,
       );
       const actions = allActions.filter(
         (a) =>

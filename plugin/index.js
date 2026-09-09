@@ -53,6 +53,7 @@ const {
 const { sunPosition } = require("./solar.js");
 const { formatWh } = require("./format.js");
 const { Recorder } = require("./recorder.js");
+const { loadActivePolarModel } = require("./polar.js");
 const {
   detectSolarArrayState,
   detectGeneratorState,
@@ -396,6 +397,8 @@ const SUBSCRIPTION_PATHS = [
   "propulsion.*.state",
   "propulsion.*.revolutions",
   "network.internet.state",
+  "polars.activePolar",
+  "polars.performanceFactor",
 ];
 
 /**
@@ -460,6 +463,15 @@ module.exports = (app) => {
 
   /** @type {object|null} */
   let pluginConfig = null;
+
+  /** @type {object|null} */
+  let polarModel = null;
+
+  /** @type {string|null} */
+  let polarLoadedId = null;
+
+  /** @type {object|null} */
+  let polarLoadedTable = null;
 
   /** @type {boolean} */
   let hasPosition = false;
@@ -1381,6 +1393,41 @@ module.exports = (app) => {
   }
 
   /**
+   * Refreshes the polar speed model from the active polar resource.
+   *
+   * Reads the `polars.activePolar` pointer (published by polar tools
+   * like signalk-polar-management), fetches the referenced polar table
+   * in-process via the resource provider API, and keeps it cached until
+   * the pointer changes. With no polar selected or no provider
+   * installed, the model is null and the prediction engine keeps its
+   * observed-speed behavior — polars are strictly optional and need no
+   * configuration: if a polar is there, we use it.
+   *
+   * @returns {Promise<void>}
+   */
+  async function refreshPolarModel() {
+    const readValue = (p) => deltaState.get(p) ?? app.getSelfPath(p);
+    const { model, id, table } = await loadActivePolarModel({
+      app,
+      readValue,
+      cachedId: polarLoadedId,
+      cachedTable: polarLoadedTable,
+    });
+    if (model !== polarModel || id !== polarLoadedId) {
+      if (model) {
+        app.debug(
+          `Active polar '${id}' loaded (performanceFactor ${model.performanceFactor})`,
+        );
+      } else if (polarModel) {
+        app.debug("Active polar no longer available");
+      }
+    }
+    polarModel = model;
+    polarLoadedId = id;
+    polarLoadedTable = table;
+  }
+
+  /**
    * Runs the prediction cycle.
    *
    * @returns {Promise<void>}
@@ -1638,6 +1685,11 @@ module.exports = (app) => {
           }
         }
       }
+
+      // Refresh the optional polar speed model before the engine runs
+      // so every consumer (hourly hydro yield, actions, timing) sees the
+      // same table this cycle.
+      await refreshPolarModel();
 
       // Run prediction engine (with detected deploy states for the detected track)
       const hourly = predictionEngine.runPrediction(
@@ -3008,6 +3060,9 @@ module.exports = (app) => {
         loadProfileConfig: config.loadProfile || {},
         windProtectionConfig: config.windProtection || {},
         predictionHours: config.weather?.forecastHours,
+        // Optional polar speed model (refreshed each prediction cycle
+        // from the active `polars` resource; null when unavailable)
+        getPolarModel: () => polarModel,
       });
 
       await initializeLoadProfile();
