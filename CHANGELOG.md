@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.0] - 2026-09-09
+
 ### Added
 - **Hydrogenerator predictions can use the vessel's active polar.**
   When a polar tool publishes the Signal K `polars` resource and
