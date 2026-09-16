@@ -49,6 +49,7 @@ const {
 } = require("../plugin/history-backfill.js");
 const { SolarMatrix } = require("../plugin/learning.js");
 const { parseManufacturerCurve } = require("../plugin/schema.js");
+const { RecordStore } = require("../plugin/storage.js");
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -245,16 +246,21 @@ async function runPopulate(args) {
   }
 
   const config = await loadConfig(args.config);
+  const dataDir = args["data-dir"].replace("~", process.env.HOME || "~");
+  const store = new RecordStore({ debug() {}, error() {} }, dataDir, {});
+  store.open();
   const result = await populateFromHistory({
     config,
     baseUrl: args["base-url"],
     provider: args.provider || undefined,
     from: new Date(`${args.from}T00:00:00Z`),
     to: new Date(`${args.to}T23:59:59Z`),
-    dataDir: args["data-dir"].replace("~", process.env.HOME || "~"),
+    dataDir,
+    store,
     fresh: args.fresh,
     resolution: parseInt(args.resolution, 10),
   });
+  store.close();
 
   printResults([...result.arrays, ...result.generators]);
   console.log(`\nSamples written to recordings: ${result.samplesWritten}`);

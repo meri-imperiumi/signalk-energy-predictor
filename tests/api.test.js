@@ -9,7 +9,7 @@ const fs = require("node:fs/promises");
 const os = require("node:os");
 const path = require("node:path");
 
-const { Recorder } = require("../plugin/recorder.js");
+const { RecordStore } = require("../plugin/storage.js");
 const {
   ApiError,
   parseTimeWindow,
@@ -20,13 +20,15 @@ const {
   downsamplePoints,
   hourlyPredictions,
   buildActuals,
-  buildPredictions,
+  buildRawPredictions,
+  buildDailyPredictions,
+  winnersToHourly,
   buildEnvironment,
   buildSummary,
   buildDeployStates,
   registerApiRoutes,
   cycleHorizonMs,
-  loadRecords,
+  loadCycles: loadCyclesFromStore,
   resolveNavState,
   MAX_WINDOW_DAYS,
   offsetMinutesFromSamples,
@@ -47,9 +49,10 @@ function makeApp() {
   return { debug() {}, error() {} };
 }
 
-/** Writes fixtures via the real recorder into a temp dir. */
+/** Writes fixtures via the real record store into a temp dir. */
 async function writeFixtures(dataDir) {
-  const recorder = new Recorder(makeApp(), dataDir, {});
+  const recorder = new RecordStore(makeApp(), dataDir, {});
+  recorder.open();
   const base = new Date("2026-08-22T00:00:00Z").getTime();
 
   // One cycle at 00:05 predicting 24 hours; hour 12 predicts 100 Wh solar,
@@ -92,7 +95,7 @@ async function writeFixtures(dataDir) {
       position: { latitude: -18.86, longitude: -159.8 },
     });
   }
-  return { base };
+  return { base, store: recorder };
 }
 
 test.describe("parseTimeWindow", () => {
@@ -338,29 +341,24 @@ test.describe("hourlyPredictions", () => {
 test.describe("builders over recorded fixtures", () => {
   let dataDir;
   let base;
+  let store;
 
   test.before(async () => {
     dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "energy-api-"));
-    ({ base } = await writeFixtures(dataDir));
+    ({ base, store } = await writeFixtures(dataDir));
   });
 
   test.after(async () => {
+    store.close();
     await fs.rm(dataDir, { recursive: true, force: true });
   });
 
   async function loadSamples(from, to) {
-    const { getRecordings } = require("../plugin/recorder.js");
-    return getRecordings(dataDir, from, to, "sample");
+    return store.getRecords("sample", from, to);
   }
 
   async function loadCycles(from, to) {
-    const { getRecordings } = require("../plugin/recorder.js");
-    return getRecordings(
-      dataDir,
-      new Date(from.getTime() - 24 * 3600000),
-      to,
-      "cycle",
-    );
+    return loadCyclesFromStore(store, from, to);
   }
 
   test("buildActuals: raw series, per-source totals, averages", async () => {
@@ -397,22 +395,25 @@ test.describe("builders over recorded fixtures", () => {
     assert.strictEqual(actuals.points.length, 9); // 2h / 15min + 1
   });
 
-  test("buildPredictions: day window returns raw cycles", async () => {
+  test("buildRawPredictions: day window returns raw cycles", async () => {
     const from = new Date(base);
     const to = new Date(base + 24 * 3600000);
     const cycles = await loadCycles(from, to);
-    const predictions = buildPredictions(cycles, from, to);
+    const predictions = buildRawPredictions(cycles, from, to);
     assert.strictEqual(predictions.granularity, "raw");
     assert.strictEqual(predictions.cycles.length, 1);
     assert.strictEqual(predictions.cycles[0].weatherTier, 1);
     assert.strictEqual(predictions.cycles[0].forecast.length, 24);
   });
 
-  test("buildPredictions: week window returns daily totals", async () => {
+  test("buildDailyPredictions: week window returns daily totals from SQL winners", async () => {
     const from = new Date(base);
     const to = new Date(base + 7 * 24 * 3600000);
-    const cycles = await loadCycles(from, to);
-    const predictions = buildPredictions(cycles, from, to);
+    const predictions = buildDailyPredictions(
+      winnersToHourly(await store.getHourlyWinners(from, to)),
+      from,
+      to,
+    );
     assert.strictEqual(predictions.granularity, "daily");
     assert.strictEqual(predictions.days.length, 1);
     const day = predictions.days[0];
@@ -444,8 +445,13 @@ test.describe("builders over recorded fixtures", () => {
     const from = new Date(base);
     const to = new Date(base + 2 * 3600000);
     const samples = await loadSamples(from, to);
-    const cycles = await loadCycles(from, to);
-    const summary = buildSummary(cycles, samples, SOURCE_TYPES, from, to);
+    const summary = buildSummary(
+      winnersToHourly(await store.getHourlyWinners(from, to)),
+      samples,
+      SOURCE_TYPES,
+      from,
+      to,
+    );
 
     assert.ok(Math.abs(summary.consumption.totalWh - 120) < 25);
     assert.strictEqual(summary.soc.min, 0.8);
@@ -467,90 +473,93 @@ test.describe("builders over recorded fixtures", () => {
   });
 });
 
-test.describe("loadRecords adaptive lookback", () => {
+test.describe("loadCycles adaptive lookback", () => {
   const MS_PER_HOUR = 3600000;
   const from = new Date("2026-08-22T00:00:00Z");
   const to = new Date("2026-08-29T00:00:00Z");
 
-  test("configured horizon is the initial lookback (single read, no re-read)", async () => {
+  /**
+   * Fake store capturing cycle-metadata reads; its points "reassemble"
+   * to arrays of the length each fixture cycle declares.
+   */
+  function makeFakeStore(cycles) {
     const reads = [];
-    const readRecordings = async (f, t, type) => {
-      reads.push({ fromMs: f.getTime(), type });
-      // Cycles carrying 24h forecasts: shorter than the configured 48h
-      // horizon, so no adaptive re-read is needed
-      return [
-        {
+    return {
+      reads,
+      async getRecords(type, f) {
+        reads.push(f.getTime());
+        return cycles.map((c) => ({
           type: "cycle",
-          timestamp: new Date(from.getTime() + 3600000).toISOString(),
-          forecast: new Array(24),
-        },
-      ];
+          timestamp: c.timestamp,
+        }));
+      },
+      getPointsByCycleRange() {
+        const byCycle = new Map();
+        for (const c of cycles) {
+          byCycle.set(
+            Date.parse(c.timestamp),
+            Array.from({ length: c.points }, () => ({
+              ts: 0,
+              actions: [],
+            })),
+          );
+        }
+        return byCycle;
+      },
     };
+  }
 
-    const records = await loadRecords(readRecordings, from, to, "cycle", {
+  test("configured horizon is the initial lookback (single read, no re-read)", async () => {
+    // Cycles carrying 24h forecasts: shorter than the configured 48h
+    // horizon, so no adaptive re-read is needed
+    const store = makeFakeStore([
+      {
+        timestamp: new Date(from.getTime() + 3600000).toISOString(),
+        points: 24,
+      },
+    ]);
+
+    const records = await loadCyclesFromStore(store, from, to, {
       initialHorizonHours: 48,
     });
 
     assert.strictEqual(records.length, 1);
-    assert.strictEqual(reads.length, 1, "expected a single read");
+    assert.strictEqual(store.reads.length, 1, "expected a single read");
     assert.strictEqual(
-      reads[0].fromMs,
+      store.reads[0],
       from.getTime() - 48 * MS_PER_HOUR,
       "lookback must start from the configured forecast horizon",
     );
+    assert.strictEqual(records[0].forecast.length, 24);
   });
 
   test("re-reads with the larger horizon only when a cycle exceeds the configured one", async () => {
-    const reads = [];
-    const readRecordings = async (f) => {
-      reads.push(f.getTime());
-      return [
-        {
-          type: "cycle",
-          timestamp: new Date(from.getTime() + 3600000).toISOString(),
-          // 96 forecast points → 96h horizon > configured 48h
-          forecast: new Array(96),
-        },
-      ];
-    };
+    // 96 forecast points → 96h horizon > configured 48h
+    const store = makeFakeStore([
+      {
+        timestamp: new Date(from.getTime() + 3600000).toISOString(),
+        points: 96,
+      },
+    ]);
 
-    await loadRecords(readRecordings, from, to, "cycle", {
+    await loadCyclesFromStore(store, from, to, {
       initialHorizonHours: 48,
     });
 
-    assert.strictEqual(reads.length, 2, "expected the adaptive re-read");
-    assert.strictEqual(reads[0], from.getTime() - 48 * MS_PER_HOUR);
-    assert.strictEqual(reads[1], from.getTime() - 96 * MS_PER_HOUR);
+    assert.strictEqual(store.reads.length, 2, "expected the adaptive re-read");
+    assert.strictEqual(store.reads[0], from.getTime() - 48 * MS_PER_HOUR);
+    assert.strictEqual(store.reads[1], from.getTime() - 96 * MS_PER_HOUR);
   });
 
   test("horizon is clamped to the schema maximum", async () => {
-    const reads = [];
-    const readRecordings = async (f) => {
-      reads.push(f.getTime());
-      return [];
-    };
+    const store = makeFakeStore([]);
 
-    await loadRecords(readRecordings, from, to, "cycle", {
+    await loadCyclesFromStore(store, from, to, {
       initialHorizonHours: 10000,
     });
 
-    assert.strictEqual(reads.length, 1);
-    assert.strictEqual(reads[0], from.getTime() - 168 * MS_PER_HOUR);
-  });
-
-  test("samples pass straight through without lookback", async () => {
-    const reads = [];
-    const readRecordings = async (f) => {
-      reads.push(f.getTime());
-      return [];
-    };
-
-    await loadRecords(readRecordings, from, to, "sample", {
-      initialHorizonHours: 48,
-    });
-
-    assert.strictEqual(reads.length, 1);
-    assert.strictEqual(reads[0], from.getTime());
+    assert.strictEqual(store.reads.length, 1);
+    assert.strictEqual(store.reads[0], from.getTime() - 168 * MS_PER_HOUR);
   });
 });
 
@@ -582,20 +591,22 @@ test.describe("route registration", () => {
 
   async function withFixtures(fn) {
     const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "energy-routes-"));
+    const { store } = await writeFixtures(dataDir);
     try {
-      await writeFixtures(dataDir);
-      await fn(dataDir);
+      await fn(dataDir, store);
     } finally {
+      store.close();
       await fs.rm(dataDir, { recursive: true, force: true });
     }
   }
 
   test("routes are registered with window validation", async () => {
-    await withFixtures(async (dataDir) => {
+    await withFixtures(async (dataDir, store) => {
       const router = makeRouter();
       registerApiRoutes(router, {
         app: makeApp(),
         getConfig: () => CONFIG,
+        store,
         dataDir,
       });
       for (const p of [
@@ -623,11 +634,12 @@ test.describe("route registration", () => {
   });
 
   test("routes serve fixture data end to end", async () => {
-    await withFixtures(async (dataDir) => {
+    await withFixtures(async (dataDir, store) => {
       const router = makeRouter();
       registerApiRoutes(router, {
         app: makeApp(),
         getConfig: () => CONFIG,
+        store,
         dataDir,
       });
       const from = "2026-08-22T00:00:00Z";
@@ -652,79 +664,79 @@ test.describe("route registration", () => {
     });
   });
 
-  test("concurrent identical window reads are shared between endpoints", async () => {
-    await withFixtures(async (dataDir) => {
-      // Count underlying reads by patching the recorder module (the API
-      // resolves it through require at call time, so the patch applies)
-      const recorder = require("../plugin/recorder.js");
-      const orig = recorder.getRecordings;
+  test("concurrent identical window loads are shared between endpoints", async () => {
+    await withFixtures(async (dataDir, store) => {
+      // Count underlying cycle-metadata reads by patching the fixture
+      // store (the API resolves reads through it at call time)
+      const orig = store.getRecords.bind(store);
       const calls = [];
-      recorder.getRecordings = async (dir, from, to, type) => {
+      store.getRecords = async (type, from, to) => {
         calls.push(`${type}|${from.getTime()}|${to.getTime()}`);
-        return orig(dir, from, to, type);
+        return orig(type, from, to);
       };
-      try {
-        const router = makeRouter();
-        registerApiRoutes(router, {
-          app: makeApp(),
-          getConfig: () => ({ ...CONFIG, weather: { forecastHours: 48 } }),
-          dataDir,
-        });
-        const from = "2026-08-22T00:00:00Z";
-        const to = "2026-08-22T02:00:00Z";
+      const router = makeRouter();
+      registerApiRoutes(router, {
+        app: makeApp(),
+        getConfig: () => ({ ...CONFIG, weather: { forecastHours: 48 } }),
+        store,
+        dataDir,
+      });
+      const from = "2026-08-22T00:00:00Z";
+      const to = "2026-08-22T02:00:00Z";
 
-        // The webapp fires its window endpoints together: /api/predictions,
-        // /api/summary and /api/deploy-states all load the same cycles with
-        // the same lookback and must share a single underlying read
-        const [predictions, summary, deploy] = [
-          makeRes(),
-          makeRes(),
-          makeRes(),
-        ];
-        await Promise.all([
-          router.routes.get("/api/predictions")(
-            { query: { from, to } },
-            predictions,
-          ),
-          router.routes.get("/api/summary")({ query: { from, to } }, summary),
-          router.routes.get("/api/deploy-states")(
-            { query: { from, to } },
-            deploy,
-          ),
-        ]);
-        assert.strictEqual(predictions.statusCode, null);
-        assert.strictEqual(summary.statusCode, null);
-        assert.strictEqual(deploy.statusCode, null);
-        const cycleCalls = calls.filter((c) => c.startsWith("cycle|"));
-        assert.strictEqual(
-          cycleCalls.length,
-          1,
-          `expected one shared cycle read, got: ${calls.join(", ")}`,
-        );
-
-        // After the reads settle the in-flight map is clean: a later
-        // identical request performs a fresh read (freshly appended
-        // records must be visible, no result caching)
-        calls.length = 0;
-        const again = makeRes();
-        await router.routes.get("/api/predictions")(
+      // The webapp fires its window endpoints together: /api/predictions
+      // and /api/deploy-states load the same cycles with the same lookback
+      // and must share a single underlying read (/api/summary aggregates
+      // in SQL and reads no cycle rows at all)
+      const [predictions, summary, deploy] = [makeRes(), makeRes(), makeRes()];
+      await Promise.all([
+        router.routes.get("/api/predictions")(
           { query: { from, to } },
-          again,
-        );
-        assert.strictEqual(again.statusCode, null);
-        assert.strictEqual(
-          calls.filter((c) => c.startsWith("cycle|")).length,
-          1,
-          "sequential request must re-read",
-        );
-      } finally {
-        recorder.getRecordings = orig;
-      }
+          predictions,
+        ),
+        router.routes.get("/api/summary")({ query: { from, to } }, summary),
+        router.routes.get("/api/deploy-states")(
+          { query: { from, to } },
+          deploy,
+        ),
+      ]);
+      assert.strictEqual(predictions.statusCode, null);
+      assert.strictEqual(summary.statusCode, null);
+      assert.strictEqual(deploy.statusCode, null);
+      // Three distinct underlying reads in the burst, none duplicated:
+      // cycle metadata (shared by predictions' raw cycles and
+      // deploy-states' slim cycles), window samples (shared by
+      // actuals + retro + summary) and deploy-states' lookback samples
+      assert.deepStrictEqual(
+        calls.slice().sort(),
+        [
+          `cycle|${Date.parse("2026-08-20T00:00:00Z")}|${Date.parse("2026-08-22T02:00:00Z")}`,
+          `sample|${Date.parse("2026-08-15T00:00:00Z")}|${Date.parse("2026-08-22T02:00:00Z")}`,
+          `sample|${Date.parse("2026-08-22T00:00:00Z")}|${Date.parse("2026-08-22T02:00:00Z")}`,
+        ].sort(),
+        `expected three shared underlying reads, got: ${calls.join(", ")}`,
+      );
+
+      // After the reads settle the in-flight map is clean: a later
+      // identical request performs a fresh read (freshly appended
+      // records must be visible, no result caching)
+      calls.length = 0;
+      const again = makeRes();
+      await router.routes.get("/api/predictions")(
+        { query: { from, to } },
+        again,
+      );
+      assert.strictEqual(again.statusCode, null);
+      assert.strictEqual(
+        calls.filter((c) => c.startsWith("cycle|")).length,
+        1,
+        "sequential request must re-read",
+      );
     });
   });
 
   test("GET /api/vessel returns the solar-local offset from the live position", async () => {
-    await withFixtures(async (dataDir) => {
+    await withFixtures(async (dataDir, store) => {
       const router = makeRouter();
       // 30°E → +120 minutes solar-local offset
       registerApiRoutes(router, {
@@ -736,6 +748,7 @@ test.describe("route registration", () => {
           }),
         },
         getConfig: () => CONFIG,
+        store,
         dataDir,
       });
       const res = makeRes();
@@ -746,11 +759,12 @@ test.describe("route registration", () => {
   });
 
   test("GET /api/vessel returns null offset when the position is unknown", async () => {
-    await withFixtures(async (dataDir) => {
+    await withFixtures(async (dataDir, store) => {
       const router = makeRouter();
       registerApiRoutes(router, {
         app: { debug() {}, error() {}, getSelfPath: () => null },
         getConfig: () => CONFIG,
+        store,
         dataDir,
       });
       const res = makeRes();
@@ -761,7 +775,7 @@ test.describe("route registration", () => {
   });
 
   test("GET /api/retro-predicted responds cache-only: no network on the request path", async () => {
-    await withFixtures(async (dataDir) => {
+    await withFixtures(async (dataDir, store) => {
       // Blackholed uplink: a fetch would never settle. Before the fix a
       // cold weather cache made this endpoint hang (and with it the whole
       // webapp, which awaits all endpoints together) behind retries.
@@ -776,6 +790,7 @@ test.describe("route registration", () => {
         registerApiRoutes(router, {
           app: makeApp(),
           getConfig: () => CONFIG,
+          store,
           dataDir,
           // No getUplinkStatus: unknown uplink defaults to offline, so no
           // background warm either
@@ -799,7 +814,7 @@ test.describe("route registration", () => {
   });
 
   test("GET /api/retro-predicted warms the weather cache only on an unmetered online uplink", async () => {
-    await withFixtures(async (dataDir) => {
+    await withFixtures(async (dataDir, store) => {
       const realFetch = globalThis.fetch;
       let warmFetches = 0;
       let warmStarted;
@@ -816,6 +831,7 @@ test.describe("route registration", () => {
         registerApiRoutes(router, {
           app: makeApp(),
           getConfig: () => CONFIG,
+          store,
           dataDir,
           getUplinkStatus: () => ({ online: true, metered: false }),
         });
@@ -843,6 +859,7 @@ test.describe("route registration", () => {
         registerApiRoutes(meteredRouter, {
           app: makeApp(),
           getConfig: () => CONFIG,
+          store,
           dataDir,
           getUplinkStatus: () => ({ online: true, metered: true }),
         });

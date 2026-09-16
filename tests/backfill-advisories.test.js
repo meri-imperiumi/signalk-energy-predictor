@@ -20,6 +20,18 @@ const {
 } = require("node:fs");
 const { tmpdir } = require("node:os");
 const { join } = require("node:path");
+const { RecordStore } = require("../plugin/storage.js");
+
+/** Reads cycle metadata rows back from the CLI's record store. */
+async function readCycles(dataDir, fromIso, toIso) {
+  const store = new RecordStore({ debug() {}, error() {} }, dataDir, {});
+  store.open();
+  try {
+    return await store.getRecords("cycle", new Date(fromIso), new Date(toIso));
+  } finally {
+    store.close();
+  }
+}
 
 function makeCycleRecord(timestamp, forecast) {
   return {
@@ -82,7 +94,7 @@ function runCLI(dataDir, { from, to, dryRun = false } = {}) {
   });
 }
 
-test("backfill-advisories: populates surplus advisory on a cycle record", () => {
+test("backfill-advisories: populates surplus advisory on a cycle record", async () => {
   const tmp = mkdtempSync(join(tmpdir(), "ep-backfill-"));
   mkdirSync(join(tmp, "recordings"), { recursive: true });
   const file = join(tmp, "recordings", "2026-08-23.jsonl");
@@ -110,13 +122,20 @@ test("backfill-advisories: populates surplus advisory on a cycle record", () => 
   const res = runCLI(tmp, { from: "2026-08-23", to: "2026-08-23" });
   assert.strictEqual(res.status, 0, `CLI failed: ${res.stderr}`);
 
-  // Re-read and parse
-  const lines = readFileSync(file, { encoding: "utf-8" })
-    .split("\n")
-    .filter((l) => l.trim());
-  assert.strictEqual(lines.length, 2);
-  const c1 = JSON.parse(lines[0]);
-  const c2 = JSON.parse(lines[1]);
+  // Read the recomputed cycles back from the record store (the imported
+  // NDJSON originals live on untouched in recordings-ndjson/)
+  const cycles = await readCycles(
+    tmp,
+    "2026-08-23T00:00:00.000Z",
+    "2026-08-24T00:00:00.000Z",
+  );
+  assert.strictEqual(cycles.length, 2);
+  const c1 = cycles.find((c) => c.timestamp === "2026-08-23T12:00:00.000Z");
+  const c2 = cycles.find((c) => c.timestamp === "2026-08-23T23:45:00.000Z");
+  assert.ok(
+    c1 && c2,
+    `expected both cycles: ${JSON.stringify(cycles.map((c) => c.timestamp))}`,
+  );
 
   // Surplus cycle: should now have a surplus advisory
   assert.ok(Array.isArray(c1.advisories), "advisories should be an array");
@@ -137,7 +156,7 @@ test("backfill-advisories: populates surplus advisory on a cycle record", () => 
   );
 });
 
-test("backfill-advisories: --dry-run does not modify files", () => {
+test("backfill-advisories: --dry-run recomputes but writes nothing", async () => {
   const tmp = mkdtempSync(join(tmpdir(), "ep-backfill-dry-"));
   mkdirSync(join(tmp, "recordings"), { recursive: true });
   const file = join(tmp, "recordings", "2026-08-23.jsonl");
@@ -152,8 +171,22 @@ test("backfill-advisories: --dry-run does not modify files", () => {
   });
   assert.strictEqual(res.status, 0, `CLI failed: ${res.stderr}`);
 
-  const after = readFileSync(file, { encoding: "utf-8" });
+  // The NDJSON original is untouched (import only reads it; after a
+  // clean import it lives on under recordings-ndjson/)
+  const after = readFileSync(
+    join(tmp, "recordings-ndjson", "2026-08-23.jsonl"),
+    { encoding: "utf-8" },
+  );
   assert.strictEqual(after, original, "dry-run must not modify the file");
+
+  // And the imported store rows carry no recomputed advisories
+  const cycles = await readCycles(
+    tmp,
+    "2026-08-23T00:00:00.000Z",
+    "2026-08-24T00:00:00.000Z",
+  );
+  assert.strictEqual(cycles.length, 1);
+  assert.deepStrictEqual(cycles[0].advisories, []);
 });
 
 test("backfill-advisories: missing --data-dir exits non-zero", () => {
@@ -164,9 +197,9 @@ test("backfill-advisories: missing --data-dir exits non-zero", () => {
   assert.match(res.stderr, /--data-dir is required/);
 });
 
-test("backfill-advisories: missing recordings dir exits non-zero", () => {
+test("backfill-advisories: empty store exits non-zero", () => {
   const tmp = mkdtempSync(join(tmpdir(), "ep-backfill-empty-"));
   const res = runCLI(tmp, { from: "2026-08-23", to: "2026-08-23" });
   assert.notStrictEqual(res.status, 0);
-  assert.match(res.stderr, /recordings dir not found/);
+  assert.match(res.stderr, /No recorded cycles found/);
 });

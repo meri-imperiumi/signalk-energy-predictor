@@ -8,7 +8,6 @@
  */
 
 const { SolarMatrix, theoreticalPower } = require("./learning.js");
-const fs = require("node:fs/promises");
 const { sunPosition, irradianceFromCloudCover } = require("./solar.js");
 const {
   predictWindHour,
@@ -19,7 +18,6 @@ const {
 } = require("./prediction.js");
 const matrixPersistence = require("./matrix.js");
 const { parseManufacturerCurve } = require("./schema.js");
-const recorderModule = require("./recorder.js");
 const weatherCache = require("./weather-cache.js");
 const {
   detectSolarArrayState,
@@ -1182,6 +1180,7 @@ async function populateFromHistory({
   from,
   to,
   dataDir,
+  store,
   fresh = false,
   resolution = DEFAULT_RESOLUTION,
   fetchImpl = fetch,
@@ -1442,7 +1441,7 @@ async function populateFromHistory({
   // samples win, replayed ticks only fill the holes)
   const samplesWritten = await backfillSamples({
     app: { debug() {} },
-    dataDir,
+    store,
     historyData,
     weather,
     arrays,
@@ -1462,7 +1461,7 @@ async function populateFromHistory({
   // per-sample inference is stored here.
   const deployStatesBackfilled = await augmentSamplesDeployStates({
     app: { debug() {} },
-    dataDir,
+    store,
     arrays,
     generators,
     from,
@@ -1660,7 +1659,7 @@ function writeCarriedStickyBack(historyData, columns, carried) {
  *
  * @param {object} params
  * @param {object} params.app - Logger (for recorder)
- * @param {string} params.dataDir - Plugin data directory
+ * @param {import("./storage.js").RecordStore} params.store - Record store
  * @param {object} params.historyData - History API /values response
  * @param {Array<object>} params.weather - Historical weather points
  * @param {object[]} params.arrays - Solar array configs
@@ -1672,7 +1671,7 @@ function writeCarriedStickyBack(historyData, columns, carried) {
  */
 async function backfillSamples({
   app,
-  dataDir,
+  store,
   historyData,
   weather,
   arrays,
@@ -1683,12 +1682,7 @@ async function backfillSamples({
   carried,
 }) {
   // Existing live samples: skip any replayed tick near one of these
-  const existing = await recorderModule.getRecordings(
-    dataDir,
-    from,
-    to,
-    "sample",
-  );
+  const existing = await store.getRecords("sample", from, to);
   const existingTimes = existing
     .map((s) => new Date(s.timestamp).getTime())
     .sort((a, b) => a - b);
@@ -1799,13 +1793,7 @@ async function backfillSamples({
         position: carriedState[idx].position,
       };
     };
-    await recorderModule.overwriteStickyFields(
-      app,
-      dataDir,
-      from,
-      to,
-      resolveSticky,
-    );
+    await store.overwriteStickyFields(from, to, resolveSticky);
   }
 
   let written = 0;
@@ -1891,7 +1879,7 @@ async function backfillSamples({
     }
     sample.deployStates = deployStates;
 
-    await recorderModule.recordSample(app, dataDir, sample);
+    await store.recordSample(sample);
     written++;
   }
 
@@ -1904,6 +1892,9 @@ async function backfillSamples({
  * using the shared deploy-state detector, then rewriting the recording
  * file in place.
  *
+ * Rewrites each sample row in place (streamed UPDATE) instead of the
+ * NDJSON era's whole-day-file rewrite.
+ *
  * This backfills the detected-state field onto samples written before the
  * field existed (and onto live samples that `backfillSamples` gap-fill
  * skipped). It reuses the same inference as live `recordSample` and the
@@ -1912,7 +1903,7 @@ async function backfillSamples({
  *
  * @param {object} params
  * @param {object} params.app - Signal K server API (for logging)
- * @param {string} params.dataDir - Plugin data directory
+ * @param {import("./storage.js").RecordStore} params.store - Record store
  * @param {object[]} params.arrays - Active solar array configs
  * @param {object[]} params.generators - Active generator configs
  * @param {Date} params.from - Window start
@@ -1921,18 +1912,13 @@ async function backfillSamples({
  */
 async function augmentSamplesDeployStates({
   app,
-  dataDir,
+  store,
   arrays,
   generators,
   from,
   to,
 }) {
-  const samples = await recorderModule.getRecordings(
-    dataDir,
-    from,
-    to,
-    "sample",
-  );
+  const samples = await store.getRecords("sample", from, to);
   if (samples.length === 0) return 0;
 
   // Sort all samples in time order so carry-forward is continuous across days.
@@ -2015,65 +2001,27 @@ async function augmentSamplesDeployStates({
     computed.set(new Date(sample.timestamp).getTime(), deployStates);
   }
 
-  // Group by recording file so each file is rewritten once.
-  const byFile = new Map(); // filePath -> sample[]
-  for (const s of samples) {
-    const filePath = recorderModule.getRecordingsPath(
-      dataDir,
-      new Date(s.timestamp),
-    );
-    if (!byFile.has(filePath)) byFile.set(filePath, []);
-    byFile.get(filePath).push(s);
-  }
-
+  // Streamed row rewrite: recompute deployStates on every sample in the
+  // window (recomputing existing ones keeps them consistent with the
+  // current detection logic — e.g. 0 W near sunset was once "stowed";
+  // the carried-forward power at each timestamp is the same the live
+  // path saw, so the result is at least as good), counting only the
+  // newly-augmented ones.
   let augmented = 0;
-  for (const [filePath, fileSamples] of byFile) {
-    // Read all lines (including non-sample records) to rewrite the file.
-    let lines;
-    try {
-      lines = (await fs.readFile(filePath, "utf-8")).split("\n");
-    } catch (_error) {
-      continue; // file may have been pruned
-    }
-    const byTimestamp = new Map(
-      fileSamples.map((s) => [new Date(s.timestamp).getTime(), s]),
-    );
-    let changed = false;
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      if (!line.trim()) continue;
-      let record;
-      try {
-        record = JSON.parse(line);
-      } catch {
-        continue;
+  await store.updateSamples(from, to, (record) => {
+    const ts = new Date(record.timestamp).getTime();
+    if (record.deployStates && Object.keys(record.deployStates).length) {
+      const fresh = computed.get(ts) || {};
+      if (JSON.stringify(fresh) !== JSON.stringify(record.deployStates)) {
+        record.deployStates = fresh;
+        return record; // rewritten, not counted as newly augmented
       }
-      if (record.type !== "sample") continue;
-      const ts = new Date(record.timestamp).getTime();
-      if (!byTimestamp.has(ts)) continue;
-      if (record.deployStates && Object.keys(record.deployStates).length) {
-        // Already has deployStates. Recompute to stay consistent with the
-        // current detection logic (the live recording may have used an
-        // older inference — e.g. 0 W near sunset was once "stowed"). The
-        // carried-forward power at this timestamp is the same the live path
-        // saw, so the result is at least as good and uses the latest rules.
-        const fresh = computed.get(ts) || {};
-        if (JSON.stringify(fresh) !== JSON.stringify(record.deployStates)) {
-          record.deployStates = fresh;
-          changed = true;
-        }
-        continue;
-      }
-      const deployStates = computed.get(ts) || {};
-      record.deployStates = deployStates;
-      lines[i] = JSON.stringify(record);
-      changed = true;
-      augmented++;
+      return null; // unchanged
     }
-    if (changed) {
-      await fs.writeFile(filePath, lines.join("\n"), { encoding: "utf-8" });
-    }
-  }
+    record.deployStates = computed.get(ts) || {};
+    augmented++;
+    return record;
+  });
   app.debug?.(`Augmented ${augmented} samples with deployStates`);
   return augmented;
 }

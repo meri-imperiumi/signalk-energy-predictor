@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **SQLite is now the recording store** (`plugin/storage.js`):
+  cycle metadata plus one row per forecast hour (windowed reads never
+  parse out-of-window forecast JSON), samples and wind-protection
+  observations as JSON rows, keyset-paginated windowed reads that yield
+  to the event loop, write-time normalization of deploy actions and
+  spans, and SQL winner resolution (freshest prediction per hour) for
+  the aggregated endpoints. Measured on production-scale data (30 days
+  of 168h forecasts, the case that used to time out): week view 36 s →
+  ~0.4 s with worst event-loop stall ~0.1 s (was multi-second).
+- **Automatic NDJSON conversion** (`plugin/storage-migrate.js`): on
+  first start with an existing `recordings/` directory, day files are
+  imported in per-file transactions (tolerant of torn/unknown lines)
+  and the directory is renamed to `recordings-ndjson/` as a
+  manual-delete backup. Files are never imported twice: each filename
+  is committed to a done-list in the same transaction as its rows, and
+  re-runs are a no-op.
+
+### Changed
+- `plugin/recorder.js` (NDJSON day files) is removed; all consumers
+  (API endpoints, restart-seed queries, history backfill, the
+  backfill-advisories CLI) read and write the SQLite store. Sticky-field
+  and deploy-state backfill rewrites are streamed row UPDATEs instead
+  of whole-file rewrites. `bin/backfill-advisories.js` imports legacy
+  NDJSON first when present and recomputes against the store.
+- `/api/summary` and aggregated `/api/predictions` no longer load cycle
+  records at all — they aggregate SQL winner rows (response shapes
+  unchanged).
+- `engines.node` is now `>=22.5.0`: the storage layer uses the
+  built-in `node:sqlite` (unflagged from Node 23.4; on Node 22.5–22.x
+  the server must run with `--experimental-sqlite`, which is the
+  installer's business — the plugin fails fast with both remedies in
+  the message when the builtin is unavailable).
+
 ## [0.9.0] - 2026-09-09
 
 ### Added

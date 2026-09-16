@@ -440,32 +440,68 @@ function hourlyPredictions(cycles) {
  * @param {Date} to - Window end
  * @returns {object} Response body
  */
-function buildPredictions(cycles, from, to) {
-  const { intervalMs } = granularityForWindow(from, to);
-
-  if (intervalMs === null) {
-    // Raw day window: cycles overlapping [from, to]. A cycle overlaps when
-    // it was recorded within the window or its own horizon reaches into it.
-    const overlapping = cycles
-      .filter((c) => {
-        const t = new Date(c.timestamp).getTime();
-        return t >= from.getTime() - cycleHorizonMs(c) && t <= to.getTime();
-      })
-      .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
-    return {
-      window: { from: from.toISOString(), to: to.toISOString() },
-      granularity: "raw",
-      cycles: overlapping,
-    };
+/**
+ * Maps storage winner rows (freshest prediction per hour bucket) onto
+ * the exact entry shape hourlyPredictions produces, so the aggregated
+ * builders consume SQL winners and in-memory cycles identically.
+ *
+ * @param {object[]} winners - store.getHourlyWinners() rows
+ * @returns {Map<number, object>}
+ */
+function winnersToHourly(winners) {
+  const result = new Map();
+  for (const w of winners) {
+    result.set(w.hour, {
+      hour: w.hour,
+      solarWh: w.idealSolarYieldWh || 0,
+      windWh: w.idealWindYieldWh || 0,
+      hydroWh: w.idealHydroYieldWh || 0,
+      loadWh: w.houseLoadWh || 0,
+      netWh: w.idealNetWh || 0,
+      soc: w.idealSoC ?? null,
+      weatherTier: w.weatherTier,
+      cycleTimestamp: new Date(w.cycleTs).toISOString(),
+      cycleMs: w.cycleTs,
+    });
   }
+  return result;
+}
 
-  const hourly = hourlyPredictions(
-    cycles.filter((c) => {
+/**
+ * Builds the /api/predictions response for raw day windows (≤ 2 days):
+ * cycles whose horizon overlaps the window, with their full forecast
+ * arrays, for forecast-curve vs actual overlays.
+ *
+ * @param {object[]} cycles - Reassembled cycle records (with forecast)
+ * @param {Date} from - Window start
+ * @param {Date} to - Window end
+ * @returns {object} Response body
+ */
+function buildRawPredictions(cycles, from, to) {
+  const overlapping = cycles
+    .filter((c) => {
       const t = new Date(c.timestamp).getTime();
       return t >= from.getTime() - cycleHorizonMs(c) && t <= to.getTime();
-    }),
-  );
+    })
+    .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+  return {
+    window: { from: from.toISOString(), to: to.toISOString() },
+    granularity: "raw",
+    cycles: overlapping,
+  };
+}
 
+/**
+ * Builds the /api/predictions response for aggregated windows: daily
+ * predicted totals per source from the freshest hourly predictions.
+ *
+ * @param {Map<number, object>} hourly - Winner entries per hour bucket
+ *        (hourlyPredictions() map or winnersToHourly() output)
+ * @param {Date} from - Window start
+ * @param {Date} to - Window end
+ * @returns {object} Response body
+ */
+function buildDailyPredictions(hourly, from, to) {
   const days = [];
   let cursor = new Date(from);
   cursor.setUTCHours(0, 0, 0, 0);
@@ -601,14 +637,16 @@ function buildEnvironment(samples, from, to) {
  * Builds the /api/summary response: headline figures over the window
  * including prediction accuracy (predicted vs actual yield per hour).
  *
- * @param {object[]} cycles - Recorded cycle records overlapping the window
+ * @param {Map<number, object>} hourly - Winner entries per hour bucket
+ *        (freshest prediction per hour; hourlyPredictions() map or
+ *        winnersToHourly() output)
  * @param {object[]} samples - Recorded samples within the window
  * @param {{solarIds: Set<string>, windIds: Set<string>, hydroIds: Set<string>}} sourceTypes
  * @param {Date} from - Window start
  * @param {Date} to - Window end
  * @returns {object} Response body
  */
-function buildSummary(cycles, samples, sourceTypes, from, to) {
+function buildSummary(hourly, samples, sourceTypes, from, to) {
   const actuals = buildActuals(samples, sourceTypes, from, to);
   const points = samples
     .slice()
@@ -634,12 +672,7 @@ function buildSummary(cycles, samples, sourceTypes, from, to) {
     "hydroW",
     "houseLoadW",
   ]);
-  const hourlyPred = hourlyPredictions(
-    cycles.filter((c) => {
-      const t = new Date(c.timestamp).getTime();
-      return t >= from.getTime() - cycleHorizonMs(c) && t <= to.getTime();
-    }),
-  );
+  const hourlyPred = hourly;
 
   let hoursCompared = 0;
   let apeSum = 0;
@@ -725,46 +758,162 @@ function cycleHorizonMs(cycle) {
 }
 
 /**
- * Reads recordings for a window, filtered by type.
+ * Attaches each cycle's forecast array, reassembled from the point
+ * store in one paginated PK range scan. The rebuilt points carry the
+ * exact legacy shape (time ISO + engine fields + actions) so builders
+ * and the webapp see records indistinguishable from the NDJSON
+ * recorder's.
+ *
+ * @param {import("./storage.js").RecordStore} store
+ * @param {object[]} cycles - Cycle metadata records (mutated in place)
+ * @returns {Promise<void>}
+ */
+async function attachForecasts(store, cycles) {
+  if (cycles.length === 0) {
+    return;
+  }
+  let minTs = Number.POSITIVE_INFINITY;
+  let maxTs = 0;
+  for (const cycle of cycles) {
+    const ts = new Date(cycle.timestamp).getTime();
+    if (ts < minTs) minTs = ts;
+    if (ts > maxTs) maxTs = ts;
+  }
+  const byCycle = await store.getPointsByCycleRange(minTs, maxTs);
+  for (const cycle of cycles) {
+    const points = byCycle.get(new Date(cycle.timestamp).getTime()) || [];
+    cycle.forecast = points.map((p) => ({
+      time: new Date(p.ts).toISOString(),
+      idealSolarYieldWh: p.idealSolarYieldWh,
+      idealWindYieldWh: p.idealWindYieldWh,
+      idealHydroYieldWh: p.idealHydroYieldWh,
+      alternatorWh: p.alternatorWh,
+      houseLoadWh: p.houseLoadWh,
+      idealNetWh: p.idealNetWh,
+      idealSoC: p.idealSoC,
+      detectedYieldWh: p.detectedYieldWh,
+      detectedNetWh: p.detectedNetWh,
+      detectedSoC: p.detectedSoC,
+      windSpeedKnots: p.windSpeedKnots,
+      gustSpeedKnots: p.gustSpeedKnots,
+      forecastWindSpeedKnots: p.forecastWindSpeedKnots,
+      forecastGustKnots: p.forecastGustKnots,
+      windDirectionDeg: p.windDirectionDeg,
+      actions: p.actions,
+    }));
+  }
+}
+
+/**
+ * Loads cycles for the deploy-states endpoint as slim records whose
+ * `forecast` arrays contain only the coverage endpoints and the points
+ * with deploy/stow actions — everything buildDeployStates reads. The
+ * builder's coverage rule (hour set ∪ span) equals the contiguous range
+ * [round(firstPoint) … round(lastPoint)], so first/last points reproduce
+ * it exactly while the SQL side filters action points via json_each.
+ * Feeding the unchanged pure builder slim inputs keeps behavior parity
+ * without materializing every point row of every overlapping cycle.
+ *
+ * @param {import("./storage.js").RecordStore} store
+ * @param {Date} from - Window start
+ * @param {Date} to - Window end
+ * @param {object} [opts]
+ * @param {number} [opts.initialHorizonHours] - Configured forecast
+ *        horizon for the initial cycle lookback
+ * @returns {Promise<object[]>} Cycle records with slim forecasts
+ */
+async function loadDeployCycles(
+  store,
+  from,
+  to,
+  { initialHorizonHours = DEFAULT_CYCLE_HORIZON_HOURS } = {},
+) {
+  const lookbackHours = Math.min(
+    Math.max(initialHorizonHours, DEFAULT_CYCLE_HORIZON_HOURS),
+    MAX_CYCLE_HORIZON_HOURS,
+  );
+  const build = async (fromDate) => {
+    const cycles = await store.getRecords("cycle", fromDate, to);
+    if (cycles.length === 0) {
+      return { cycles, maxHorizonMs: 0 };
+    }
+    let minTs = Number.POSITIVE_INFINITY;
+    let maxTs = 0;
+    for (const cycle of cycles) {
+      const ts = new Date(cycle.timestamp).getTime();
+      if (ts < minTs) minTs = ts;
+      if (ts > maxTs) maxTs = ts;
+    }
+    const spans = store.getDeploySpans(minTs, maxTs);
+    const actionPoints = store.getDeployActionPoints(minTs, maxTs);
+    let maxHorizonMs = 0;
+    for (const cycle of cycles) {
+      const ts = new Date(cycle.timestamp).getTime();
+      const span = spans.get(ts);
+      const points = actionPoints.get(ts) || [];
+      if (span) {
+        cycle.forecast = [
+          { time: new Date(span.startMs).toISOString(), actions: [] },
+          { time: new Date(span.endMs).toISOString(), actions: [] },
+          ...points.map((p) => ({
+            time: new Date(p.ts).toISOString(),
+            actions: p.actions,
+          })),
+        ];
+        maxHorizonMs = Math.max(maxHorizonMs, span.endMs - ts);
+      } else {
+        // No points recorded: match the builder's default horizon
+        cycle.forecast = [];
+        maxHorizonMs = Math.max(
+          maxHorizonMs,
+          DEFAULT_CYCLE_HORIZON_HOURS * MS_PER_HOUR,
+        );
+      }
+    }
+    return { cycles, maxHorizonMs };
+  };
+
+  const initial = await build(
+    new Date(from.getTime() - lookbackHours * MS_PER_HOUR),
+  );
+  if (initial.maxHorizonMs <= lookbackHours * MS_PER_HOUR) {
+    return initial.cycles;
+  }
+  const wider = await build(new Date(from.getTime() - initial.maxHorizonMs));
+  return wider.cycles;
+}
+
+/**
+ * Loads cycles overlapping a window as legacy-shaped records (metadata
+ * + reattached forecast arrays).
  *
  * Cycles get an adaptive lookback starting from the configured forecast
  * horizon (weather.forecastHours): cycles recorded that far back still
- * have forecasts reaching into the window. Reading with the configured
- * horizon up front avoids the previous default-24h read followed by a
- * full re-read with the real horizon — on production-sized day files
- * (every cycle carries its complete forecast array) that double read
- * doubled the load time of every cycle-serving endpoint. The adaptive
- * re-read remains as a fallback for cycles carrying horizons longer
- * than the current configuration (the horizon was reduced after they
- * were recorded).
+ * have forecasts reaching into the window. The adaptive re-read remains
+ * for cycles carrying horizons longer than the current configuration
+ * (the horizon was reduced after they were recorded).
  *
- * @param {Function} readRecordings - `(from, to, type) => Promise<object[]>`
+ * @param {import("./storage.js").RecordStore} store
  * @param {Date} from - Window start
  * @param {Date} to - Window end
- * @param {string} type - Record type ("cycle" or "sample")
  * @param {object} [opts]
  * @param {number} [opts.initialHorizonHours] - Configured forecast
  *        horizon to use as the initial cycle lookback
  * @returns {Promise<object[]>}
  */
-async function loadRecords(
-  readRecordings,
+async function loadCycles(
+  store,
   from,
   to,
-  type,
   { initialHorizonHours = DEFAULT_CYCLE_HORIZON_HOURS } = {},
 ) {
-  // Samples are filtered to the window by the recorder itself
-  if (type !== "cycle") {
-    return readRecordings(from, to, type);
-  }
-
   const lookbackHours = Math.min(
     Math.max(initialHorizonHours, DEFAULT_CYCLE_HORIZON_HOURS),
     MAX_CYCLE_HORIZON_HOURS,
   );
   const initialFrom = new Date(from.getTime() - lookbackHours * MS_PER_HOUR);
-  const initial = await readRecordings(initialFrom, to, type);
+  const initial = await store.getRecords("cycle", initialFrom, to);
+  await attachForecasts(store, initial);
 
   let maxHorizonMs = lookbackHours * MS_PER_HOUR;
   for (const cycle of initial) {
@@ -773,7 +922,13 @@ async function loadRecords(
   if (maxHorizonMs <= lookbackHours * MS_PER_HOUR) {
     return initial;
   }
-  return readRecordings(new Date(from.getTime() - maxHorizonMs), to, type);
+  const wider = await store.getRecords(
+    "cycle",
+    new Date(from.getTime() - maxHorizonMs),
+    to,
+  );
+  await attachForecasts(store, wider);
+  return wider;
 }
 
 /**
@@ -792,30 +947,44 @@ async function loadRecords(
  */
 function registerApiRoutes(
   router,
-  { app, getConfig, dataDir, getWindProtection, getUplinkStatus },
+  { app, getConfig, store, dataDir, getWindProtection, getUplinkStatus },
 ) {
-  // Concurrent identical reads are shared: the webapp fires all window
-  // endpoints at once, and several of them ask for the same (window,
-  // type) — /api/predictions, /api/summary and /api/deploy-states all
-  // load the same cycles with the same lookback. Without sharing, each
-  // read its own copy of the same multi-megabyte day files in parallel,
-  // starving the server's single event loop and I/O budget (the week view
-  // timed out on production data for exactly this reason). The map holds
+  // Concurrent identical loads are shared at the underlying record-read
+  // level: the webapp fires all window endpoints at once, and several
+  // build different shapes over the same (window, type) rows — raw
+  // cycles (predictions), slim cycles (deploy-states), samples
+  // (actuals/retro/summary) — so sharing the row reads themselves
+  // deduplicates work no matter which consumers overlap. The map holds
   // only in-flight promises: once a read settles it is forgotten, so a
-  // later read always sees freshly appended records.
+  // later load always sees freshly recorded rows.
   const inflightReads = new Map();
-  const readRecordings = (from, to, type) => {
-    const key = `${type}|${from.getTime()}|${to.getTime()}`;
+  const share = (key, load) => {
     const pending = inflightReads.get(key);
     if (pending) {
       return pending;
     }
-    const read = require("./recorder.js")
-      .getRecordings(dataDir, from, to, type)
+    const read = Promise.resolve()
+      .then(load)
       .finally(() => inflightReads.delete(key));
     inflightReads.set(key, read);
     return read;
   };
+  const readRecords = (type, from, to) =>
+    share(`records|${type}|${from.getTime()}|${to.getTime()}`, () =>
+      store.getRecords(type, from, to),
+    );
+  // Adapter the loaders use; row reads go through the shared closure
+  const sharedReadStore = {
+    getRecords: readRecords,
+    getPointsByCycleRange: (f, t) => store.getPointsByCycleRange(f, t),
+    getDeploySpans: (f, t) => store.getDeploySpans(f, t),
+    getDeployActionPoints: (f, t) => store.getDeployActionPoints(f, t),
+  };
+  const readSamples = (from, to) => readRecords("sample", from, to);
+  const loadWindowCycles = (from, to) =>
+    loadCycles(sharedReadStore, from, to, {
+      initialHorizonHours: configuredCycleHorizonHours(),
+    });
 
   /**
    * The configured forecast horizon (weather.forecastHours), clamped to
@@ -893,9 +1062,7 @@ function registerApiRoutes(
    */
   async function handle(req, res, type, build) {
     const { from, to } = parseTimeWindow(req.query);
-    const records = await loadRecords(readRecordings, from, to, type, {
-      initialHorizonHours: configuredCycleHorizonHours(),
-    });
+    const records = await readRecords(type, from, to);
     const config = getConfig();
     const sourceTypes = sourceTypesFromConfig(config);
     res.json(await build(records, sourceTypes, from, to));
@@ -928,11 +1095,27 @@ function registerApiRoutes(
     });
   });
 
-  router.get("/api/predictions", (req, res) =>
-    handle(req, res, "cycle", (records, _sourceTypes, from, to) =>
-      buildPredictions(records, from, to),
-    ).catch((error) => handleError(error, res)),
-  );
+  router.get("/api/predictions", (req, res) => {
+    const { from, to } = parseTimeWindow(req.query);
+    const { intervalMs } = granularityForWindow(from, to);
+    const load =
+      intervalMs === null
+        ? // Raw day window: cycles with their full forecast arrays for
+          // the forecast-curve vs actual overlay
+          loadWindowCycles(from, to).then((cycles) =>
+            buildRawPredictions(cycles, from, to),
+          )
+        : // Aggregated window: freshest prediction per hour, resolved in
+          // SQL (no forecast JSON parsed at all)
+          store
+            .getHourlyWinners(from, to)
+            .then((winners) =>
+              buildDailyPredictions(winnersToHourly(winners), from, to),
+            );
+    return load
+      .then((body) => res.json(body))
+      .catch((error) => handleError(error, res));
+  });
 
   router.get("/api/actuals", (req, res) =>
     handle(req, res, "sample", buildActuals).catch((error) =>
@@ -949,7 +1132,7 @@ function registerApiRoutes(
   router.get("/api/retro-predicted", (req, res) => {
     const { from, to } = parseTimeWindow(req.query);
     const config = getConfig();
-    return loadRecords(readRecordings, from, to, "sample")
+    return readSamples(from, to)
       .then((samples) => {
         // Response weather is cache-only (never blocks on the WAN); the
         // warm fills the cache for later loads when the uplink allows it
@@ -966,18 +1149,23 @@ function registerApiRoutes(
     const { from, to } = parseTimeWindow(req.query);
     const config = getConfig();
     const sourceTypes = sourceTypesFromConfig(config);
-    // Load samples and cycles in parallel (not sequentially inside the
-    // builder) so the cycle read starts at the same moment as the other
-    // endpoints' reads and joins the shared in-flight read instead of
-    // re-reading the same day files after those have settled
+    // Samples and the SQL winner aggregate load in parallel; winners
+    // resolve overlapping forecasts inside SQLite, so the summary never
+    // materializes cycle records at all
     return Promise.all([
-      loadRecords(readRecordings, from, to, "sample"),
-      loadRecords(readRecordings, from, to, "cycle", {
-        initialHorizonHours: configuredCycleHorizonHours(),
-      }),
+      readSamples(from, to),
+      Promise.resolve(store.getHourlyWinners(from, to)),
     ])
-      .then(([samples, cycles]) =>
-        res.json(buildSummary(cycles, samples, sourceTypes, from, to)),
+      .then(([samples, winners]) =>
+        res.json(
+          buildSummary(
+            winnersToHourly(winners),
+            samples,
+            sourceTypes,
+            from,
+            to,
+          ),
+        ),
       )
       .catch((error) => handleError(error, res));
   });
@@ -991,8 +1179,8 @@ function registerApiRoutes(
     // [from, to] are emitted.
     const lookbackFrom = new Date(from.getTime() - 7 * 24 * 3600000);
     return Promise.all([
-      readRecordings(lookbackFrom, to, "sample"),
-      loadRecords(readRecordings, from, to, "cycle", {
+      readSamples(lookbackFrom, to),
+      loadDeployCycles(sharedReadStore, from, to, {
         initialHorizonHours: configuredCycleHorizonHours(),
       }),
     ])
@@ -1655,8 +1843,10 @@ module.exports = {
   integratePerHour,
   downsamplePoints,
   hourlyPredictions,
+  winnersToHourly,
   buildActuals,
-  buildPredictions,
+  buildRawPredictions,
+  buildDailyPredictions,
   buildEnvironment,
   buildSummary,
   buildRetroPredicted,
@@ -1664,7 +1854,9 @@ module.exports = {
   buildDeployStates,
   registerApiRoutes,
   cycleHorizonMs,
-  loadRecords,
+  loadCycles,
+  loadDeployCycles,
+  attachForecasts,
   DEFAULT_CYCLE_HORIZON_HOURS,
   offsetMinutesFromSamples,
 };

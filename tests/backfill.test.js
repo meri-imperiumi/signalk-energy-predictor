@@ -34,7 +34,14 @@ const {
   StateClass,
   SunPhase,
 } = require("../plugin/prediction.js");
-const { getRecordings } = require("../plugin/recorder.js");
+const { RecordStore } = require("../plugin/storage.js");
+
+/** Opens a record store on a (temp) data dir for backfill tests. */
+function openStore(dataDir) {
+  const store = new RecordStore({ debug() {}, error() {} }, dataDir, {});
+  store.open();
+  return store;
+}
 
 /** Latitude/longitude with a high sun at fixture noon (French Polynesia) */
 const LAT = -18.86;
@@ -828,10 +835,10 @@ test.describe("replayLoadProfile", () => {
 test.describe("recordings gap-fill", () => {
   test("replayed ticks skip timestamps near live samples", async () => {
     const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "bf-gap-"));
+    const store = openStore(dataDir);
     try {
-      const { recordSample } = require("../plugin/recorder.js");
       // Live sample at noon sharp
-      await recordSample({ debug() {} }, dataDir, {
+      await store.recordSample({
         timestamp: new Date(NOON),
         arrays: { live: 1 },
         generators: {},
@@ -849,7 +856,7 @@ test.describe("recordings gap-fill", () => {
 
       const written = await backfillSamples({
         app: { debug() {} },
-        dataDir,
+        store,
         historyData,
         weather: makeWeather(NOON),
         arrays: [
@@ -867,11 +874,10 @@ test.describe("recordings gap-fill", () => {
       // 5 ticks, but the one at noon (±2.5 min) is a live sample
       assert.strictEqual(written, 4);
 
-      const samples = await getRecordings(
-        dataDir,
+      const samples = await store.getRecords(
+        "sample",
         new Date(NOON - 3600000),
         new Date(NOON + 3600000),
-        "sample",
       );
       assert.strictEqual(samples.length, 5);
       // The noon bucket keeps the live sample (arrays: {live: 1}), not a replayed one
@@ -886,6 +892,7 @@ test.describe("recordings gap-fill", () => {
 
   test("writes controllerModes and awaRad into gap-filled samples", async () => {
     const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "bf-fields-"));
+    const store = openStore(dataDir);
     try {
       const modePath = "electrical.solar.test.controllerMode";
       const historyData = {
@@ -914,7 +921,7 @@ test.describe("recordings gap-fill", () => {
 
       const written = await backfillSamples({
         app: { debug() {} },
-        dataDir,
+        store,
         historyData,
         weather: makeWeather(NOON),
         arrays: [
@@ -930,11 +937,10 @@ test.describe("recordings gap-fill", () => {
         to: new Date(NOON + 3600000),
       });
       assert.strictEqual(written, 3);
-      const samples = await getRecordings(
-        dataDir,
+      const samples = await store.getRecords(
+        "sample",
         new Date(NOON - 3600000),
         new Date(NOON + 3600000),
-        "sample",
       );
       assert.strictEqual(samples.length, 3);
       for (const s of samples) {
@@ -950,6 +956,7 @@ test.describe("recordings gap-fill", () => {
 test.describe("populateFromHistory", () => {
   test("full flow: matrices, generator stats, samples written", async () => {
     const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "bf-pop-"));
+    const store = openStore(dataDir);
     try {
       const config = {
         battery: {
@@ -1018,6 +1025,7 @@ test.describe("populateFromHistory", () => {
         latitude: LAT,
         longitude: LON,
         dataDir,
+        store,
         resolution: 300,
         fetchImpl,
       });
@@ -1039,11 +1047,10 @@ test.describe("populateFromHistory", () => {
 
       // Samples gap-filled into recordings
       assert.strictEqual(result.samplesWritten, 6);
-      const samples = await getRecordings(
-        dataDir,
+      const samples = await store.getRecords(
+        "sample",
         new Date(NOON - 3600000),
         new Date(NOON + 3600000),
-        "sample",
       );
       assert.strictEqual(samples.length, 6);
       assert.ok(Math.abs(samples[0].windSpeedKnots - 15) < 0.1);
@@ -1070,6 +1077,7 @@ test.describe("populateFromHistory", () => {
 
   test("fresh: true wipes existing matrices and rebuilds from scratch", async () => {
     const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "bf-fresh-"));
+    const store = openStore(dataDir);
     try {
       const config = {
         battery: {
@@ -1125,6 +1133,7 @@ test.describe("populateFromHistory", () => {
         latitude: LAT,
         longitude: LON,
         dataDir,
+        store,
         resolution: 300,
         fetchImpl,
       });
@@ -1142,6 +1151,7 @@ test.describe("populateFromHistory", () => {
         latitude: LAT,
         longitude: LON,
         dataDir,
+        store,
         fresh: true,
         resolution: 300,
         fetchImpl,
@@ -1456,6 +1466,7 @@ test.describe("replayWindProtection", () => {
 test.describe("populateFromHistory: wind protection", () => {
   test("seeds and persists the WPF store from history", async () => {
     const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "bf-wpf-"));
+    const store = openStore(dataDir);
     try {
       const config = {
         battery: {
@@ -1539,6 +1550,7 @@ test.describe("populateFromHistory: wind protection", () => {
         latitude: LAT,
         longitude: LON,
         dataDir,
+        store,
         resolution: 300,
         fetchImpl,
       });
@@ -1561,6 +1573,7 @@ test.describe("populateFromHistory: wind protection", () => {
 
   test("omits windProtection when disabled in config", async () => {
     const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "bf-wpf-off-"));
+    const store = openStore(dataDir);
     try {
       const config = {
         battery: {
@@ -1613,6 +1626,7 @@ test.describe("populateFromHistory: wind protection", () => {
         latitude: LAT,
         longitude: LON,
         dataDir,
+        store,
         resolution: 300,
         fetchImpl,
       });

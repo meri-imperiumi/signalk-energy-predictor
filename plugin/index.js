@@ -52,7 +52,8 @@ const {
 } = require("./combustion.js");
 const { sunPosition } = require("./solar.js");
 const { formatWh } = require("./format.js");
-const { Recorder } = require("./recorder.js");
+const { RecordStore } = require("./storage.js");
+const { migrateNdjsonRecordings } = require("./storage-migrate.js");
 const { loadActivePolarModel } = require("./polar.js");
 const {
   detectSolarArrayState,
@@ -409,7 +410,8 @@ const deps = {
   IngestionFSM,
   PredictionEngine,
   AdvisoryPublisher,
-  Recorder,
+  Recorder: RecordStore,
+  migrateNdjsonRecordings,
   registerApiRoutes,
   loadMatrices: matrixModule.loadAllMatrices,
   saveMatrices: matrixModule.saveMatrices,
@@ -1186,7 +1188,7 @@ module.exports = (app) => {
       const now = Date.now();
       const from = new Date(now - 2 * 24 * 3600000);
       const to = new Date(now);
-      const samples = await recorder.getRecordings(from, to, "sample");
+      const samples = await recorder.getRecords("sample", from, to);
       if (samples.length === 0) return null;
       // Walk newest-first; take the most recent definite state per device
       // within the freshness window. A device absent from the newest sample
@@ -1234,7 +1236,7 @@ module.exports = (app) => {
       // Look back up to 2 days for the most recent sample
       const from = new Date(now - 2 * 24 * 3600000);
       const to = new Date(now);
-      const samples = await recorder.getRecordings(from, to, "sample");
+      const samples = await recorder.getRecords("sample", from, to);
       if (samples.length === 0) {
         app.debug("seedStickyState: no recent samples found, skipping seed");
         return;
@@ -3000,13 +3002,35 @@ module.exports = (app) => {
       ];
       advisoryPublisher.sendMeta(metaDevices);
 
-      // Initialize recorder
+      // Initialize the record store (SQLite) and import any legacy
+      // NDJSON recordings once — the importer is idempotent per file
+      // (done-list), so a crash mid-import resumes on the next start
       const dataDir = app.getDataDirPath();
       const recordingConfig = config.recording || {};
       recorder = new deps.Recorder(app, dataDir, recordingConfig);
+      recorder.open();
+      try {
+        const migration = await deps.migrateNdjsonRecordings({
+          app,
+          store: recorder,
+          dataDir,
+        });
+        if (migration.imported > 0) {
+          app.setPluginStatus?.(
+            `Imported ${migration.imported} NDJSON records from ${migration.files} day file(s)` +
+              (migration.renamed
+                ? " (originals kept in recordings-ndjson/)"
+                : ""),
+          );
+        }
+      } catch (error) {
+        app.error(
+          `NDJSON import failed (will retry next start): ${error.message}`,
+        );
+      }
       recorder.startPruneInterval();
       app.debug(
-        `Recorder initialized: enabled=${recorder.enabled}, retentionDays=${recorder.retentionDays}`,
+        `Record store initialized: enabled=${recorder.enabled}, retentionDays=${recorder.retentionDays}`,
       );
 
       await initializeMatrices(config);
@@ -3190,9 +3214,10 @@ module.exports = (app) => {
         sampleIntervalId = null;
       }
 
-      // Stop recorder
+      // Stop record store
       if (recorder) {
         recorder.stopPruneInterval();
+        recorder.close();
         recorder = null;
       }
 
@@ -3249,6 +3274,7 @@ module.exports = (app) => {
       deps.registerApiRoutes(router, {
         app,
         getConfig: () => pluginConfig,
+        store: recorder,
         dataDir: app.getDataDirPath(),
         getWindProtection: () => windProtection,
         // Uplink state for the retro-weather background warm: archive

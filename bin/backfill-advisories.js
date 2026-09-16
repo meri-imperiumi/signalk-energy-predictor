@@ -4,17 +4,20 @@
  * Backfill CLI for cycle advisories.
  *
  * Recomputes the surplus/engine-run/stowage advisories for recorded cycle
- * records across a date range and writes them back into the JSONL day-files
- * in place. This both retroactively populates the `advisories` field on old
- * cycles (so the webapp Events list shows surplus/deficit history for
- * verification) and overwrites any transient advisory a glitchy cycle may
- * have recorded (e.g. an empty-weather + SoC-fallback transient producing
- * a bogus 24h "run the engine" — recomputed with the corrected shortfall-
- * to-floor logic, that cycle now yields no engine-run advisory).
+ * records across a date range and writes them back into the SQLite record
+ * store in place. This both retroactively populates the `advisories` field
+ * on old cycles (so the webapp Events list shows surplus/deficit history
+ * for verification) and overwrites any transient advisory a glitchy cycle
+ * may have recorded (e.g. an empty-weather + SoC-fallback transient
+ * producing a bogus 24h "run the engine" — recomputed with the corrected
+ * shortfall-to-floor logic, that cycle now yields no engine-run advisory).
  *
  * The recompute is pure: it works from each cycle's stored forecast track
  * with no dependency on the live Signal K tree or the wall clock, so it is
  * deterministic and safe to re-run.
+ *
+ * Legacy NDJSON day files are imported first when `recordings/` still
+ * exists (same idempotent importer the plugin start runs).
  *
  * Usage:
  *   node bin/backfill-advisories.js \
@@ -25,26 +28,27 @@
  *     --from=2026-08-23 --to=2026-08-23 --dry-run
  *
  * Args:
- *   --data-dir=<path>  Plugin data directory (recordings/ lives under it)
- *   --from=YYYY-MM-DD  Start date (inclusive, UTC). Default: earliest file
- *   --to=YYYY-MM-DD    End date (inclusive, UTC). Default: latest file
+ *   --data-dir=<path>  Plugin data directory (records.db lives under it)
+ *   --from=YYYY-MM-DD  Start date (inclusive, UTC). Default: earliest cycle
+ *   --to=YYYY-MM-DD    End date (inclusive, UTC). Default: latest cycle
  *   --config=<path>    Plugin config JSON (for battery/surplus settings).
  *                      Default: <data-dir>/../signalk-energy-predictor.json
- *   --dry-run          Recompute and print a summary, don't write files
+ *   --dry-run          Recompute and print a summary, don't write rows
  *
  * @file backfill-advisories.js
  */
 
 import { existsSync } from "node:fs";
-import { readdir, readFile, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 
 const require = createRequire(import.meta.url);
 const { recomputeAdvisories } = require("../plugin/advisory-recompute.js");
-const { getRecordingsPath } = require("../plugin/recorder.js");
+const { RecordStore } = require("../plugin/storage.js");
+const { migrateNdjsonRecordings } = require("../plugin/storage-migrate.js");
+const { attachForecasts } = require("../plugin/api.js");
 
 function expandPath(p) {
   if (!p) return p;
@@ -57,16 +61,6 @@ function parseDateArg(s) {
   // YYYY-MM-DD, interpreted as UTC midnight
   const [y, m, d] = s.split("-").map(Number);
   return new Date(Date.UTC(y, m - 1, d));
-}
-
-async function findDateRange(recordingsDir) {
-  const files = (await readdir(recordingsDir))
-    .filter((f) => /^\d{4}-\d{2}-\d{2}\.jsonl$/.test(f))
-    .sort();
-  if (files.length === 0) return null;
-  const from = parseDateArg(basename(files[0], ".jsonl"));
-  const to = parseDateArg(basename(files[files.length - 1], ".jsonl"));
-  return { from, to };
 }
 
 function loadConfig(configPath) {
@@ -136,36 +130,13 @@ function readFileSyncSafe(p) {
   return readFileSync(p, { encoding: "utf-8" });
 }
 
-async function processDayFile(filePath, opts) {
-  let lines;
-  try {
-    lines = (await readFile(filePath, { encoding: "utf-8" })).split("\n");
-  } catch (error) {
-    if (error.code === "ENOENT") return null;
-    throw error;
-  }
-  let cycles = 0;
+async function processWindow(store, from, to, opts, dryRun) {
+  const cycles = await store.getRecords("cycle", from, to);
+  await attachForecasts(store, cycles);
   let changed = 0;
   let added = 0;
   let removed = 0;
-  const out = [];
-  for (const line of lines) {
-    if (!line.trim()) {
-      out.push(line);
-      continue;
-    }
-    let record;
-    try {
-      record = JSON.parse(line);
-    } catch {
-      out.push(line);
-      continue;
-    }
-    if (record.type !== "cycle") {
-      out.push(line);
-      continue;
-    }
-    cycles++;
+  for (const record of cycles) {
     const cycleTime = new Date(record.timestamp);
     const forecast = (record.forecast || []).map((p) => ({
       ...p,
@@ -186,9 +157,11 @@ async function processDayFile(filePath, opts) {
     changed++;
     if (oldAdvisories.length === 0 && advisories.length > 0) added++;
     if (oldAdvisories.length > 0 && advisories.length === 0) removed++;
-    out.push(JSON.stringify(record));
+    if (!dryRun) {
+      store.writeRecord("cycle", record.timestamp, record);
+    }
   }
-  return { cycles, changed, added, removed, out, changedAny: changed > 0 };
+  return { cycles: cycles.length, changed, added, removed };
 }
 
 async function main() {
@@ -207,22 +180,49 @@ async function main() {
     console.error("Error: --data-dir is required");
     process.exit(1);
   }
-  const recordingsDir = join(dataDir, "recordings");
-  if (!existsSync(recordingsDir)) {
-    console.error(`Error: recordings dir not found: ${recordingsDir}`);
+
+  const store = new RecordStore({ debug() {}, error() {} }, dataDir, {});
+  store.open();
+
+  // Import legacy NDJSON first when present (idempotent; same as plugin
+  // start would do)
+  if (existsSync(join(dataDir, "recordings"))) {
+    const migration = await migrateNdjsonRecordings({
+      app: {
+        debug() {},
+        error(msg) {
+          console.error(`  import: ${msg}`);
+        },
+      },
+      store,
+      dataDir,
+    });
+    if (migration.imported > 0) {
+      console.error(
+        `  imported ${migration.imported} NDJSON records from ${migration.files} day file(s)`,
+      );
+    }
+  }
+
+  // A store with no cycles at all means a wrong --data-dir (or a
+  // recorder that never ran): recomputing nothing is never intended
+  if (!store.recordsRange("cycle")) {
+    console.error("No recorded cycles found.");
+    store.close();
     process.exit(1);
   }
 
   let from = values.from ? parseDateArg(values.from) : null;
   let to = values.to ? parseDateArg(values.to) : null;
   if (!from || !to) {
-    const range = await findDateRange(recordingsDir);
+    const range = store.recordsRange("cycle");
     if (!range) {
-      console.error("No recording day-files found.");
+      console.error("No recorded cycles found.");
+      store.close();
       process.exit(1);
     }
-    from = from || range.from;
-    to = to || range.to;
+    from = from || new Date(range.from);
+    to = to || new Date(range.to);
   }
 
   const configPath = expandPath(
@@ -256,32 +256,33 @@ async function main() {
   let totalChanged = 0;
   let totalAdded = 0;
   let totalRemoved = 0;
-  let filesWritten = 0;
 
   const current = new Date(from);
   while (current <= to) {
-    const filePath = getRecordingsPath(dataDir, current);
-    const result = await processDayFile(filePath, opts);
-    if (result) {
-      totalCycles += result.cycles;
-      totalChanged += result.changed;
-      totalAdded += result.added;
-      totalRemoved += result.removed;
-      if (result.changedAny && !values["dry-run"]) {
-        await writeFile(filePath, result.out.join("\n"), { encoding: "utf-8" });
-        filesWritten++;
-      }
-      if (result.cycles > 0) {
-        console.error(
-          `  ${current.toISOString().slice(0, 10)}: ${result.cycles} cycles, ${result.changed} rewritten (+${result.added} added, -${result.removed} cleared)`,
-        );
-      }
+    const dayEnd = new Date(current.getTime() + 86400000 - 1);
+    const result = await processWindow(
+      store,
+      current,
+      dayEnd,
+      opts,
+      values["dry-run"],
+    );
+    totalCycles += result.cycles;
+    totalChanged += result.changed;
+    totalAdded += result.added;
+    totalRemoved += result.removed;
+    if (result.cycles > 0) {
+      console.error(
+        `  ${current.toISOString().slice(0, 10)}: ${result.cycles} cycles, ${result.changed} rewritten (+${result.added} added, -${result.removed} cleared)`,
+      );
     }
     current.setUTCDate(current.getUTCDate() + 1);
   }
 
+  store.close();
+
   console.error(
-    `\nDone: ${totalCycles} cycles, ${totalChanged} rewritten, +${totalAdded} advisories added, -${totalRemoved} cleared, ${filesWritten} files written.`,
+    `\nDone: ${totalCycles} cycles, ${totalChanged} rewritten, +${totalAdded} advisories added, -${totalRemoved} cleared${values["dry-run"] ? " (dry run)" : ""}.`,
   );
 }
 
