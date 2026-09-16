@@ -95,6 +95,69 @@ export function formatShortDateTime(t, offsetMinutes) {
 }
 
 /**
+ * Solar-local wall-clock calendar date of an instant under the given
+ * offset. `offsetMinutes` is east positive; null falls back to the
+ * browser's local date. Returns the numeric fields (m 0-based per JS
+ * convention) for the calendar arithmetic the window selector does
+ * (stepping days, week/month anchoring) — the numeric counterpart of
+ * {@link solarDayKey}'s YYYY-MM-DD string.
+ * @param {Date|number} t - epoch ms or Date
+ * @param {number|null} offsetMinutes
+ * @returns {{y: number, m: number, d: number}}
+ */
+export function solarDateOf(t, offsetMinutes) {
+  const inst = t instanceof Date ? t : new Date(t);
+  if (offsetMinutes == null) {
+    return { y: inst.getFullYear(), m: inst.getMonth(), d: inst.getDate() };
+  }
+  const shifted = new Date(inst.getTime() + offsetMinutes * 60 * 1000);
+  return {
+    y: shifted.getUTCFullYear(),
+    m: shifted.getUTCMonth(),
+    d: shifted.getUTCDate(),
+  };
+}
+
+/**
+ * Epoch-ms instant of solar-local midnight for a solar-local calendar
+ * date (m 0-based). At UTC−10, solar midnight of Aug 23 is 10:00 UTC:
+ * `Date.UTC(y, m, d) − offset·60·1000` — the offset is *subtracted* to
+ * move the wall clock back to UTC. Null offset falls back to
+ * browser-local midnight.
+ * @param {number} y - solar-local full year
+ * @param {number} m - solar-local month (0-based, JS convention)
+ * @param {number} d - solar-local day-of-month
+ * @param {number|null} offsetMinutes
+ * @returns {number}
+ */
+export function solarMidnightOf(y, m, d, offsetMinutes) {
+  if (offsetMinutes == null) {
+    return new Date(y, m, d).getTime();
+  }
+  return Date.UTC(y, m, d) - offsetMinutes * 60 * 1000;
+}
+
+/**
+ * Epoch-ms instant of solar-local midnight for the sun-day containing
+ * `now` — the live-day anchor the window selector follows. `now` is
+ * injectable so the rollover arithmetic is testable without a clock.
+ * Null offset falls back to browser-local midnight.
+ *
+ * Across the date line the longitude-derived offset flips by ~24h, so
+ * the sun-day containing a fixed instant moves to a different calendar
+ * date: the anchor must be resolved against the *current* offset, never
+ * carried over as a date number.
+ * @param {number|null} offsetMinutes
+ * @param {Date|number} [now=Date.now()]
+ * @returns {number}
+ */
+export function solarMidnightToday(offsetMinutes, now = Date.now()) {
+  const inst = now instanceof Date ? now : new Date(now);
+  const { y, m, d } = solarDateOf(inst, offsetMinutes);
+  return solarMidnightOf(y, m, d, offsetMinutes);
+}
+
+/**
  * Solar-local calendar-day key (YYYY-MM-DD) for a timestamp — for daily
  * bucketing and bar labels so a sun-day straddling UTC midnight stays in
  * one bucket. Falls back to the browser's local day when the offset is
@@ -104,16 +167,8 @@ export function formatShortDateTime(t, offsetMinutes) {
  * @returns {string}
  */
 export function solarDayKey(t, offsetMinutes) {
-  if (offsetMinutes == null) {
-    const d = new Date(t);
-    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(
-      d.getDate(),
-    ).padStart(2, "0")}`;
-  }
-  const shifted = new Date(t + offsetMinutes * 60 * 1000);
-  return `${shifted.getUTCFullYear()}-${String(
-    shifted.getUTCMonth() + 1,
-  ).padStart(2, "0")}-${String(shifted.getUTCDate()).padStart(2, "0")}`;
+  const { y, m, d } = solarDateOf(t, offsetMinutes);
+  return `${y}-${String(m + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
 }
 
 /**
@@ -125,9 +180,5 @@ export function solarDayKey(t, offsetMinutes) {
  */
 export function solarDayStart(day, offsetMinutes) {
   const [y, m, d] = day.split("-").map(Number);
-  if (offsetMinutes == null) {
-    return new Date(y, m - 1, d).getTime();
-  }
-  // solar-local midnight shifted back to UTC
-  return Date.UTC(y, m - 1, d) - offsetMinutes * 60 * 1000;
+  return solarMidnightOf(y, m - 1, d, offsetMinutes);
 }

@@ -98,13 +98,12 @@ class EpApp extends HTMLElement {
 
     // Auto-refresh when a new prediction cycle is published; the same
     // stream drives day/night theme reactivity (environment.mode) and the
-    // header's connection indicator
+    // header's connection indicator. Each cycle also re-tracks the
+    // vessel's solar-local frame (see onLiveCycle): the offset follows
+    // the boat's longitude, and the live day window rolls over at solar
+    // midnight instead of showing yesterday on a long-lived session.
     this.stream = new SignalKStream({
-      onCycle: () => {
-        if (this.lastSpec) {
-          this.refresh(this.lastSpec);
-        }
-      },
+      onCycle: () => this.onLiveCycle(),
       onMode: (mode) => this.applyEnvironmentMode(mode),
       onStatus: (online) => this.applyConnectionStatus(online),
     });
@@ -120,20 +119,7 @@ class EpApp extends HTMLElement {
     this.mode = spec.mode;
     this.lastSpec = spec;
     this.refresh(spec);
-    fetch(`${API_BASE}/api/vessel`, {
-      signal: AbortSignal.timeout(VESSEL_TIMEOUT_MS),
-    })
-      .then((r) => (r.ok ? r.json() : null))
-      .then((v) => {
-        const off =
-          v && typeof v.solarOffsetMinutes === "number"
-            ? v.solarOffsetMinutes
-            : null;
-        this.applySolarOffset(off);
-      })
-      .catch(() => {
-        // Vessel meta unavailable: keep the browser-timezone fallback
-      });
+    this.refreshVesselMeta();
   }
 
   disconnectedCallback() {
@@ -170,20 +156,80 @@ class EpApp extends HTMLElement {
   }
 
   /**
+   * A prediction cycle landed on a live session. Besides refreshing the
+   * current window, this is the hook that keeps the webapp in the crew's
+   * *current* solar-local frame:
+   *
+   * - the longitude-derived offset is re-fetched, so a date-line
+   *   crossing (offset flips ~24h, the crew's calendar date jumps a day)
+   *   moves the sun-day the window anchors on instead of leaving the
+   *   webapp rendering one day behind in the pre-crossing frame
+   * - the live day window rolls over at solar midnight
+   *
+   * When either re-anchoring fired, the selector re-emitted a window
+   * change and the refresh already ran — skip the duplicate.
+   * @returns {Promise<void>}
+   */
+  async onLiveCycle() {
+    if (!this.lastSpec) {
+      return;
+    }
+    const offsetMoved = await this.refreshVesselMeta();
+    const dayMoved = this.selectorEl.followToday();
+    if (!offsetMoved && !dayMoved) {
+      this.refresh(this.lastSpec);
+    }
+  }
+
+  /**
+   * Fetches the vessel meta (`/api/vessel`) and applies the solar-local
+   * UTC offset to the selector, chart and Events list. Called on load and
+   * on every prediction cycle — the offset tracks the vessel's longitude
+   * as it moves, so it must not be cached for the session. A failed fetch
+   * keeps the last known offset (or the browser-timezone fallback) and
+   * retries on the next cycle.
+   * @returns {Promise<boolean>} whether the offset changed and was applied
+   */
+  async refreshVesselMeta() {
+    let body;
+    try {
+      const response = await fetch(`${API_BASE}/api/vessel`, {
+        signal: AbortSignal.timeout(VESSEL_TIMEOUT_MS),
+      });
+      if (!response.ok) {
+        return false;
+      }
+      body = await response.json();
+    } catch {
+      // Vessel meta unavailable: keep the current offset, retry next cycle
+      return false;
+    }
+    const offset =
+      body && typeof body.solarOffsetMinutes === "number"
+        ? body.solarOffsetMinutes
+        : null;
+    return this.applySolarOffset(offset);
+  }
+
+  /**
    * Pushes the vessel's solar-local UTC offset (from `/api/vessel`) to
    * the selector, chart and Events list so every user-facing time renders
    * in the crew's solar-local frame. The selector re-emits a window-change
-   * (re-anchored on solar-local midnight), which triggers a refresh; the
-   * chart and Events list re-render with the new offset. Stored so later
-   * refreshes (live cycle stream) keep using it.
+   * (re-anchored on the vessel's solar-local midnight — or, when following
+   * the live day, on the sun-day containing now under the new offset),
+   * which triggers a refresh; the chart and Events list re-render with
+   * the new offset. Stored so later refreshes (live cycle stream) keep
+   * using it.
    * @param {number|null} offsetMinutes
+   * @returns {boolean} whether the offset changed and was applied
    */
   applySolarOffset(offsetMinutes) {
-    if (offsetMinutes === this.solarOffsetMinutes) return;
+    if (offsetMinutes === this.solarOffsetMinutes) return false;
     this.solarOffsetMinutes = offsetMinutes;
     this.chartEl.setSolarOffsetMinutes?.(offsetMinutes);
     this.actionsEl.setSolarOffsetMinutes?.(offsetMinutes);
     this.selectorEl.setSolarOffsetMinutes?.(offsetMinutes);
+    return true;
   }
 
   /**

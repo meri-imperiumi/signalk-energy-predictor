@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Webapp now follows sun-day jumps at the date line** (`public/`):
+  crossing the International Date Line (e.g. at ~173°W where the line
+  bulges east) flips the longitude-derived solar-local offset by ~24h
+  and the crew's calendar date jumps a day. The webapp used to miss
+  that jump and render one day behind: `/api/vessel`'s offset was
+  fetched only at load (a long-lived session kept the pre-crossing
+  frame forever), and an offset change preserved the previously picked
+  calendar date instead of re-anchoring the live window on the sun-day
+  containing *now*. The offset is now re-fetched on every prediction
+  cycle, and the window selector tracks the live sun-day (advancing at
+  solar midnight, following date-line jumps) until the user navigates
+  to a specific window, which stays pinned. The solar-midnight anchor
+  arithmetic moved into `public/ep-solar-time.js` next to the formatters
+  (one source of truth, testable under node).
+
 ## [0.10.0] - 2026-09-17
 
 ### Added

@@ -238,8 +238,11 @@ test("window selector anchors the day on the vessel's solar-local midnight", () 
   // setSolarOffsetMinutes lets the app feed /api/vessel's offset in after
   // load and re-emit so the window re-anchors.
   assert.match(source, /setSolarOffsetMinutes/);
-  // Browser-timezone fallback when the vessel position is unknown
-  assert.match(source, /offsetMinutes == null/);
+  // The anchor arithmetic (including the browser-timezone fallback when
+  // the vessel position is unknown) lives in the shared solar-time module
+  // the selector imports since the live-day following rework
+  const solar = readFileSync(path.join(PUBLIC_DIR, "ep-solar-time.js"), "utf8");
+  assert.match(solar, /offsetMinutes == null/);
 });
 
 test("window selector spans calendar weeks (Mon–Sun) and months (1st–last) in the solar-local frame", () => {
@@ -261,10 +264,8 @@ test("window selector solar-local midnight is the true solar midnight instant, n
   // this guards against: returning Date.UTC(y,m,d) (UTC midnight) instead
   // of Date.UTC(y,m,d) − offset·60·1000, which at UTC−10 makes the sun-day
   // start at 14:00 the previous civil day ("sometime in the afternoon").
-  const src = readFileSync(
-    path.join(PUBLIC_DIR, "ep-window-selector.js"),
-    "utf8",
-  );
+  // The anchor arithmetic lives in the shared solar-time module.
+  const src = readFileSync(path.join(PUBLIC_DIR, "ep-solar-time.js"), "utf8");
   // The offset must be subtracted to reach true solar midnight.
   assert.match(
     src,
@@ -281,7 +282,7 @@ test("window selector solar-local midnight is the true solar midnight instant, n
   const wrong = new Date(Date.UTC(2026, 7, 23));
   assert.notStrictEqual(got.getTime(), wrong.getTime());
   // Cross-check against the shared formatter's solarDayStart, which must
-  // agree with the selector's midnight arithmetic (both use the same sign).
+  // agree with the module's midnight arithmetic (both use the same sign).
   const { solarDayStart } = await import(
     `file://${path.join(PUBLIC_DIR, "ep-solar-time.js")}`
   );
@@ -507,6 +508,52 @@ test("events console badge colors follow the semantic contract", () => {
     /\[data-advisory="surplus"\]\s*\.ep-action-badge\s*\{[\s\S]*?\n\}/,
   )[0];
   assert.doesNotMatch(surplus, /--color-(orange|red)/);
+});
+
+test("app tracks the vessel solar offset on every live cycle, not only at load", () => {
+  const source = readFileSync(path.join(PUBLIC_DIR, "ep-app.js"), "utf8");
+  // The offset comes from /api/vessel keyed to the boat's longitude and
+  // flips ~24h at the date line — a load-time-only fetch leaves a
+  // long-lived session rendering one day behind after the crossing.
+  // Every cycle-driven refresh must re-fetch it (refreshVesselMeta) and
+  // the initial load must go through the same path.
+  assert.match(source, /async refreshVesselMeta\(\) \{/);
+  const cycleCalls =
+    source.match(/onCycle: \(\) => this\.onLiveCycle\(\)/g) || [];
+  assert.strictEqual(cycleCalls.length, 1);
+  // The cycle path applies the offset (which may re-anchor and refresh)
+  // before refreshing data, and rolls the live day over solar midnight
+  assert.match(source, /await this\.refreshVesselMeta\(\)/);
+  assert.match(source, /this\.selectorEl\.followToday\(\)/);
+  // Load path uses the same meta fetch
+  assert.match(source, /this\.refreshVesselMeta\(\);\n {2}\}/);
+});
+
+test("selector follows the live sun-day across offset jumps and solar midnight", () => {
+  const source = readFileSync(
+    path.join(PUBLIC_DIR, "ep-window-selector.js"),
+    "utf8",
+  );
+  // followsLive: the window tracks the live sun-day from load and after
+  // "Today", and stops tracking when the user navigates to a specific
+  // window (step / date picker / dated deep link)
+  assert.match(source, /this\.followsLive = true/);
+  assert.match(source, /this\.followsLive = false/);
+  // followToday advances the window at solar midnight on live sessions
+  const follow = source.match(/followToday\(\) \{[\s\S]*?\n {2}\}/);
+  assert.ok(follow, "followToday() must exist");
+  assert.match(follow[0], /solarMidnightToday\(this\.solarOffsetMinutes\)/);
+  // An offset change while following re-anchors on the sun-day containing
+  // now under the NEW offset — across the date line the crew's calendar
+  // date jumps a day and the live view must jump with it. When pinned, the
+  // picked calendar date is preserved (only the midnight instant moves).
+  const offsetFn = source.match(
+    /setSolarOffsetMinutes\(offsetMinutes\) \{[\s\S]*?\n {2}\}/,
+  );
+  assert.ok(offsetFn, "setSolarOffsetMinutes must exist");
+  assert.match(offsetFn[0], /followsLive/);
+  assert.match(offsetFn[0], /this\.from = solarMidnightToday\(offsetMinutes\)/);
+  assert.match(offsetFn[0], /solarDateOf\(this\.from, previous\)/);
 });
 
 test("app drives day/night theme and offline state from the stream", () => {
