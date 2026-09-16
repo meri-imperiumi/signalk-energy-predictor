@@ -265,6 +265,125 @@ test.describe("Plugin basic functionality", () => {
   });
 });
 
+test.describe("Shutdown", () => {
+  test("stop waits for in-flight background prediction cycles", async () => {
+    const app = new FakeSignalKApp();
+    const plugin = makePlugin(app);
+    const config = {
+      battery: {
+        capacityAh: 400,
+        systemVoltage: 12,
+        minSafeSoC: 0.2,
+      },
+      solarArrays: [],
+      mechanicalGenerators: [],
+      weather: {
+        openMeteoEnabled: false,
+        useLogbook: false,
+      },
+    };
+
+    app.dataPath = tempDir;
+    await plugin.start(config, () => {});
+
+    const fsm = plugin.__getInternals().ingestionFSM;
+
+    // Hold any prediction cycle inside its forecast fetch so it is still
+    // running when stop() is called (mirrors a cycle mid network fetch)
+    let releaseForecast;
+    const gate = new Promise((resolve) => {
+      releaseForecast = resolve;
+    });
+    const events = [];
+    fsm.getForecast = async () => {
+      await gate;
+      events.push("forecast-returned");
+      return [];
+    };
+
+    // A position delta triggers the background (GPS-edge) prediction cycle
+    for (const { deltaHandler } of app.subscriptionmanager.subscriptions) {
+      deltaHandler({
+        context: "vessels.self",
+        updates: [
+          {
+            values: [
+              { path: "navigation.state", value: "moored" },
+              {
+                path: "navigation.position",
+                value: { latitude: 60, longitude: 18 },
+              },
+            ],
+          },
+        ],
+      });
+    }
+
+    // Let the background cycle park inside the patched getForecast
+    await new Promise((resolve) => setImmediate(resolve));
+
+    const stopPromise = plugin.stop();
+    let stopped = false;
+    stopPromise.then(() => {
+      stopped = true;
+    });
+
+    // stop() has its own async work (matrix save), so give it time to
+    // settle: it must still be pending, held by the in-flight cycle
+    const deadline = Date.now() + 200;
+    while (!stopped && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.equal(
+      stopped,
+      false,
+      "stop() must not resolve while a prediction cycle is in flight",
+    );
+
+    releaseForecast();
+    await stopPromise;
+    assert.deepEqual(events, ["forecast-returned"]);
+  });
+
+  test("prediction cycle is a no-op after stop", async () => {
+    const app = new FakeSignalKApp();
+    const plugin = makePlugin(app);
+    const config = {
+      battery: {
+        capacityAh: 400,
+        systemVoltage: 12,
+        minSafeSoC: 0.2,
+      },
+      solarArrays: [],
+      mechanicalGenerators: [],
+      weather: {
+        openMeteoEnabled: false,
+        useLogbook: false,
+      },
+    };
+
+    app.dataPath = tempDir;
+    await plugin.start(config, () => {});
+    await plugin.stop();
+
+    const internals = plugin.__getInternals();
+    let forecastCalled = false;
+    internals.ingestionFSM.getForecast = async () => {
+      forecastCalled = true;
+      return [];
+    };
+
+    // A late-scheduled cycle (e.g. a straggler delta) must bail at the
+    // stopped guard instead of fetching forecasts and writing to disk
+    await internals.runPredictionCycle();
+    assert.equal(
+      forecastCalled,
+      false,
+      "runPredictionCycle must skip entirely after stop",
+    );
+  });
+});
+
 test.describe("Configuration handling", () => {
   test("handles empty config gracefully", async () => {
     const app = new FakeSignalKApp();

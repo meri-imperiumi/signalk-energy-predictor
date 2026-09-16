@@ -22,6 +22,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   path must add it to `acPowerPaths` explicitly.
 
 ### Fixed
+- **Background prediction cycles can no longer outlive plugin
+  shutdown** (`plugin/index.js`): prediction cycles fired
+  fire-and-forget from four places (the periodic interval, the 10 s
+  initial-prediction delay, the first-GPS-position edge, and the
+  uplink-online edge) were never tracked or cancelled by `stop()`.
+  A cycle still inside its forecast fetch when the plugin stopped
+  kept writing weather-cache files into the data directory
+  afterwards — on Windows this raced directory removal with
+  `ENOTEMPTY` (the flaky "wind generator detected as stowed" test),
+  and a plugin restart left the old instance's pending initial
+  cycle running against the old data directory. `stop()` now sets a
+  stopped guard (late cycles bail at entry and mid-cycle), clears
+  the initial-prediction timer, and waits for in-flight cycles
+  before returning.
 - **Webapp now follows sun-day jumps at the date line** (`public/`):
   crossing the International Date Line (e.g. at ~173°W where the line
   bulges east) flips the longitude-derived solar-local offset by ~24h

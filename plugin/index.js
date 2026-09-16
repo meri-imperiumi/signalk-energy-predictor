@@ -462,6 +462,23 @@ module.exports = (app) => {
   /** @type {number|null} */
   let sampleIntervalId = null;
 
+  /** @type {number|null} */
+  let initialPredictionTimer = null;
+
+  /**
+   * Set while the plugin is stopped: background prediction cycles check it
+   * before starting (and mid-cycle) so no cycle outlives `stop()`.
+   * @type {boolean}
+   */
+  let pluginStopped = false;
+
+  /**
+   * In-flight background prediction cycles, so `stop()` can wait for them
+   * before the data directory goes away.
+   * @type {Set<Promise<void>>}
+   */
+  const activePredictionCycles = new Set();
+
   /** @type {Function[]} */
   const unsubscribes = [];
 
@@ -1432,11 +1449,33 @@ module.exports = (app) => {
   }
 
   /**
+   * Schedules a background prediction cycle (interval tick, initial delay,
+   * GPS/uplink edge triggers) and tracks it so `stop()` can wait for
+   * in-flight cycles. Without tracking, a cycle still inside its forecast
+   * fetch could write weather-cache files after shutdown, racing callers
+   * that remove the data directory (ENOTEMPTY on Windows).
+   *
+   * @param {string} label - Context for error logging
+   * @returns {void}
+   */
+  function schedulePredictionCycle(label) {
+    const run = runPredictionCycle().catch((error) => {
+      app.error(`${label} error: ${error.message}`);
+    });
+    activePredictionCycles.add(run);
+    run.then(() => activePredictionCycles.delete(run));
+  }
+
+  /**
    * Runs the prediction cycle.
    *
    * @returns {Promise<void>}
    */
   async function runPredictionCycle() {
+    if (pluginStopped) {
+      app.debug("Prediction cycle skipped: plugin stopped");
+      return;
+    }
     if (!ingestionFSM || !predictionEngine || !advisoryPublisher) {
       app.debug(
         `Prediction cycle skipped: components not ready (ingestionFSM: ${!!ingestionFSM}, predictionEngine: ${!!predictionEngine}, advisoryPublisher: ${!!advisoryPublisher})`,
@@ -1459,6 +1498,10 @@ module.exports = (app) => {
       // Get weather forecast
       app.debug("Fetching weather forecast...");
       const forecast = await ingestionFSM.getForecast();
+      if (pluginStopped) {
+        app.debug("Prediction cycle aborted: plugin stopped mid-cycle");
+        return;
+      }
       app.debug(
         `Got forecast with ${forecast.length} points, source: ${ingestionFSM.getSourceInfo().source}`,
       );
@@ -2069,11 +2112,7 @@ module.exports = (app) => {
                 );
                 if (!hasRunPredictionWithPosition) {
                   hasRunPredictionWithPosition = true;
-                  runPredictionCycle().catch((error) => {
-                    app.error(
-                      `Initial prediction cycle error: ${error.message}`,
-                    );
-                  });
+                  schedulePredictionCycle("Initial prediction cycle");
                 }
               }
             }
@@ -2092,11 +2131,7 @@ module.exports = (app) => {
               });
               if (becameOnline) {
                 app.debug("Uplink came online — triggering forecast fetch");
-                runPredictionCycle().catch((error) => {
-                  app.error(
-                    `Uplink-online prediction cycle error: ${error.message}`,
-                  );
-                });
+                schedulePredictionCycle("Uplink-online prediction cycle");
               }
             }
 
@@ -2946,6 +2981,8 @@ module.exports = (app) => {
       // Reset position tracking flags
       hasPosition = false;
       hasRunPredictionWithPosition = false;
+      // Re-arm background cycles (a stopped plugin may be restarted)
+      pluginStopped = false;
 
       // Populate solar power paths set for delta filtering
       solarPowerPaths.clear();
@@ -3135,9 +3172,7 @@ module.exports = (app) => {
       );
       updateIntervalId = setInterval(() => {
         app.debug(`Running scheduled prediction cycle...`);
-        runPredictionCycle().catch((error) => {
-          app.error(`Prediction cycle error: ${error.message}`);
-        });
+        schedulePredictionCycle("Scheduled prediction cycle");
       }, updateInterval);
 
       // Start periodic save cycle
@@ -3172,10 +3207,8 @@ module.exports = (app) => {
       app.debug(
         `Scheduling initial prediction in ${INITIAL_PREDICTION_DELAY_MS}ms...`,
       );
-      setTimeout(() => {
-        runPredictionCycle().catch((error) => {
-          app.error(`Initial prediction cycle error: ${error.message}`);
-        });
+      initialPredictionTimer = setTimeout(() => {
+        schedulePredictionCycle("Initial prediction cycle");
       }, INITIAL_PREDICTION_DELAY_MS);
 
       // Set initial status
@@ -3200,6 +3233,10 @@ module.exports = (app) => {
     async stop() {
       app.debug("Stopping Energy Predictor plugin");
 
+      // Halt new background work: cycles scheduled after this bail out at
+      // their entry (or mid-cycle) check instead of writing post-stop.
+      pluginStopped = true;
+
       // Clear intervals
       if (updateIntervalId) {
         clearInterval(updateIntervalId);
@@ -3221,6 +3258,13 @@ module.exports = (app) => {
         sampleIntervalId = null;
       }
 
+      // Cancel the not-yet-fired initial prediction so it cannot run
+      // (and write to the data directory) after shutdown
+      if (initialPredictionTimer != null) {
+        clearTimeout(initialPredictionTimer);
+        initialPredictionTimer = null;
+      }
+
       // Stop record store
       if (recorder) {
         recorder.stopPruneInterval();
@@ -3236,6 +3280,15 @@ module.exports = (app) => {
         unsubscribe();
       }
       unsubscribes.length = 0;
+
+      // Wait for in-flight prediction cycles so their (weather-cache)
+      // writes complete before the data directory goes away
+      if (activePredictionCycles.size > 0) {
+        app.debug(
+          `Waiting for ${activePredictionCycles.size} in-flight prediction cycle(s)...`,
+        );
+        await Promise.allSettled([...activePredictionCycles]);
+      }
 
       // Clear notifications
       if (advisoryPublisher) {
