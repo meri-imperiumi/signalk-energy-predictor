@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.0] - 2026-09-17
+
 ### Added
 - **SQLite is now the recording store** (`plugin/storage.js`):
   cycle metadata plus one row per forecast hour (windowed reads never
