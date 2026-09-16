@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Configurable AC (inverter) power paths** (`acPowerPaths`):
+  the AC consumption feeding the load profile's AC bins was read
+  from a hardcoded `electrical.venus.acPower` path specific to one
+  boat. The new top-level `acPowerPaths` setting takes any number
+  of Signal K paths (summed per sample — multi-inverter boats can
+  list them all), wired through the live subscription, the
+  prediction engine's load-profile learning, and the history
+  backfill replay. The default is the Venus plugin's standard
+  `electrical.venus.vebusDcPower` (VE.Bus inverter DC draw);
+  boats whose primary inverter is not on VE.Bus set their own
+  path. Migration: configurations that relied on the old hardcoded
+  path must add it to `acPowerPaths` explicitly.
+
 ### Fixed
 - **Webapp now follows sun-day jumps at the date line** (`public/`):
   crossing the International Date Line (e.g. at ~173°W where the line

@@ -8,6 +8,31 @@
 const { DEFAULT_TIER_SETTINGS } = require("./combustion.js");
 
 /**
+ * Default Signal K paths for AC (inverter) power consumption. The Venus
+ * plugin exposes the VE.Bus inverter's DC draw here — the standard source
+ * on Victron installations. Boats whose primary inverter is not on VE.Bus
+ * override this with their own path(s) in configuration.
+ */
+const DEFAULT_AC_POWER_PATHS = ["electrical.venus.vebusDcPower"];
+
+/**
+ * Normalizes the configured AC power paths: keeps non-empty strings,
+ * deduplicates, and falls back to the VE.Bus default when none are
+ * configured (pre-schema-default configs keep working).
+ *
+ * @param {unknown} acPowerPaths - Raw `acPowerPaths` config value
+ * @returns {string[]} AC power paths to read and subscribe to
+ */
+function getAcPowerPaths(acPowerPaths) {
+  const paths = Array.isArray(acPowerPaths)
+    ? acPowerPaths
+        .filter((p) => typeof p === "string" && p.trim().length > 0)
+        .map((p) => p.trim())
+    : [];
+  return paths.length > 0 ? [...new Set(paths)] : [...DEFAULT_AC_POWER_PATHS];
+}
+
+/**
  * Builds the per-tier property set for the combustion run-discipline
  * config (see plugin/combustion.js #11). Defaults mirror
  * DEFAULT_TIER_SETTINGS so the Admin UI shows what the engine does.
@@ -129,6 +154,18 @@ function buildPluginSchema() {
           },
         },
         required: ["capacityAh", "systemVoltage", "minSafeSoC"],
+      },
+      acPowerPaths: {
+        type: "array",
+        title: "AC Power Paths",
+        description:
+          "Signal K paths for AC power consumption in watts — read side by side with the Venus DC house load to learn the load profile's AC component. All paths are summed, so a boat with several inverters can list them all. The default covers a Victron VE.Bus inverter; boats whose primary inverter is not on VE.Bus should set their inverter's power path here",
+        items: {
+          type: "string",
+          title: "AC Power Path",
+          minLength: 1,
+        },
+        default: DEFAULT_AC_POWER_PATHS,
       },
       engines: {
         type: "array",
@@ -1140,4 +1177,6 @@ module.exports = {
   getActiveCapacity,
   getDisplayName,
   validateConfig,
+  DEFAULT_AC_POWER_PATHS,
+  getAcPowerPaths,
 };

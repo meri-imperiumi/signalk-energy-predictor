@@ -19,6 +19,7 @@ const {
 const { theoreticalPower } = require("./learning.js");
 const { formatWh, solarOffsetMinutesFromLongitude, formatLocalHHMM } =
   require("./format.js");
+const { getAcPowerPaths } = require("./schema.js");
 const SunCalc = require("suncalc");
 
 /**
@@ -1040,6 +1041,7 @@ class PredictionEngine {
     windProtectionConfig,
     predictionHours,
     getPolarModel,
+    acPowerPaths,
   }) {
     this.battery = battery;
     // Config thresholds come from the schema in knots (sailor-friendly).
@@ -1122,6 +1124,10 @@ class PredictionEngine {
       getEngineRunning,
       isSurplusActive,
     });
+    // AC (inverter) consumption paths feeding the load profile's AC bins:
+    // the Venus VE.Bus inverter DC draw by default, overridable for boats
+    // whose inverter is not on VE.Bus. Readings from all paths are summed.
+    this.acPowerPaths = getAcPowerPaths(acPowerPaths);
     this.lastPrediction = [];
     /** Raw (pre-WPF) forecast from the last run, for publishing raw values */
     this.lastRawForecast = [];
@@ -1180,15 +1186,24 @@ class PredictionEngine {
     // dcPower = shunt + solar, so wind/hydro/alternator charging (which flow
     // through the shunt but aren't added back) make it understate real load.
     // Add those back to reconstruct gross house consumption.
-    // acPower is AC consumption (inverter/shore), independent of the bus.
+    // AC consumption (inverter/shore) is independent of the DC bus: sum
+    // every configured path; a missing reading contributes nothing, and
+    // only an all-paths-missing cycle counts as "no AC sample".
     const rawDc = this.getSelfPath("electrical.venus.dcPower");
-    const rawAc = this.getSelfPath("electrical.venus.acPower");
     const dcPowerW = toNumber(rawDc);
-    const acPowerW = toNumber(rawAc);
     const chargingW = this.uncountedChargingW();
+    let acPowerW = null;
+    const acReadings = [];
+    for (const path of this.acPowerPaths) {
+      const v = toNumber(this.getSelfPath(path));
+      if (v != null) {
+        acPowerW = (acPowerW ?? 0) + v;
+        acReadings.push(`${path}=${v}`);
+      }
+    }
 
     this.app?.debug?.(
-      `updateLoadProfile: dcPower=${JSON.stringify(rawDc)} (${dcPowerW}), uncountedCharging=${chargingW}, gross=${dcPowerW != null ? dcPowerW + chargingW : null}, acPower=${JSON.stringify(rawAc)} (${acPowerW})`,
+      `updateLoadProfile: dcPower=${JSON.stringify(rawDc)} (${dcPowerW}), uncountedCharging=${chargingW}, gross=${dcPowerW != null ? dcPowerW + chargingW : null}, ac=[${acReadings.join(", ")}] (${acPowerW})`,
     );
 
     if (dcPowerW != null || acPowerW != null) {

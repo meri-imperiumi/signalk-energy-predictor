@@ -81,7 +81,7 @@ function makeHistoryData() {
       { path: "navigation.speedThroughWater" },
       { path: "electrical.dcsource.wind.power" },
       { path: "electrical.venus.dcPower" },
-      { path: "electrical.venus.acPower" },
+      { path: "electrical.venus.vebusDcPower" },
       { path: "navigation.position" },
     ],
     data: [],
@@ -830,6 +830,61 @@ test.describe("replayLoadProfile", () => {
     assert.ok(load, "getLoad should return a value");
     assert.ok(load.dcWh <= 1, `expected ~0W, got ${load.dcWh}`);
   });
+
+  test("sums configured AC inverter paths instead of the Venus default", () => {
+    // The AC consumption path is boat-specific (not every inverter is on
+    // VE.Bus): configured paths are summed per tick, and the default
+    // vebusDcPower column is ignored when paths are overridden.
+    const historyData = {
+      values: [
+        { path: "electrical.venus.dcPower" },
+        { path: "electrical.venus.vebusDcPower" },
+        { path: "electrical.inverters.main.acPower" },
+        { path: "electrical.inverters.aux.acPower" },
+        { path: "navigation.state" },
+        { path: "navigation.position" },
+      ],
+      data: [],
+    };
+    // dc 1 (column 1), vebus 2, main inverter 3, aux inverter 4
+    for (let day = 0; day < 4; day++) {
+      const t = NOON + day * 24 * 3600000;
+      historyData.data.push([
+        new Date(t).toISOString(),
+        10,
+        999,
+        80,
+        40,
+        "anchored",
+        [LON, LAT],
+      ]);
+    }
+
+    const loadProfile = new LoadProfile({
+      config: { minDaysPerBin: 3 },
+      getSelfPath: () => undefined,
+      app: undefined,
+    });
+    const stats = replayLoadProfile({
+      loadProfile,
+      historyData,
+      resolution: 300,
+      acPowerPaths: [
+        "electrical.inverters.main.acPower",
+        "electrical.inverters.aux.acPower",
+      ],
+    });
+
+    assert.strictEqual(stats.ingested, 4);
+    const load = loadProfile.getLoad(SunPhase.DAY, StateClass.AT_REST);
+    assert.ok(load, "getLoad should return a value after replay");
+    assert.strictEqual(
+      load.acWh,
+      120,
+      `AC load should sum 80+40 from the configured paths, got ${load.acWh}`,
+    );
+    assert.strictEqual(load.dcWh, 10);
+  });
 });
 
 test.describe("recordings gap-fill", () => {
@@ -1172,6 +1227,97 @@ test.describe("populateFromHistory", () => {
       await fs.rm(dataDir, { recursive: true, force: true });
     }
   });
+
+  test("queries and replays the configured AC power paths", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "bf-acpath-"));
+    const store = openStore(dataDir);
+    try {
+      const config = {
+        battery: {
+          socPath: "electrical.batteries.house.capacity.stateOfCharge",
+        },
+        solarArrays: [],
+        mechanicalGenerators: [],
+        acPowerPaths: ["electrical.inverters.main.acPower"],
+      };
+
+      // DC house load + custom inverter path (no vebus column at all —
+      // this boat's primary inverter is not on VE.Bus)
+      const historyData = {
+        values: [
+          { path: "electrical.venus.dcPower" },
+          { path: "electrical.inverters.main.acPower" },
+          { path: "navigation.state" },
+          { path: "navigation.position" },
+        ],
+        data: [],
+      };
+      for (let day = 0; day < 4; day++) {
+        const t = NOON + day * 24 * 3600000;
+        historyData.data.push([
+          new Date(t).toISOString(),
+          10,
+          120,
+          "anchored",
+          [LON, LAT],
+        ]);
+      }
+
+      /** @type {string[]} */
+      let queriedPaths = [];
+      const fetchImpl = async (url) => {
+        const u = String(url);
+        if (u.includes("/history/values")) {
+          queriedPaths = decodeURIComponent(
+            new URL(u).searchParams.get("paths") || "",
+          )
+            .split(",")
+            .filter(Boolean);
+          return { ok: true, json: async () => historyData };
+        }
+        if (u.includes("/history/paths")) {
+          return { ok: true, json: async () => [] };
+        }
+        throw new Error(`unexpected url ${u}`);
+      };
+
+      const result = await populateFromHistory({
+        config,
+        baseUrl: "http://localhost:3000",
+        from: new Date(NOON - 3600000),
+        to: new Date(NOON + 3600000),
+        latitude: LAT,
+        longitude: LON,
+        dataDir,
+        store,
+        resolution: 300,
+        fetchImpl,
+      });
+
+      // The configured inverter path is queried; the hardcoded Venus
+      // acPower path and the VE.Bus default are not
+      assert.ok(
+        queriedPaths.includes("electrical.inverters.main.acPower"),
+        `query should include the configured AC path, got ${queriedPaths.join(",")}`,
+      );
+      assert.ok(!queriedPaths.includes("electrical.venus.acPower"));
+      assert.ok(!queriedPaths.includes("electrical.venus.vebusDcPower"));
+
+      // ...and its load flows into the AC bins of the persisted profile
+      assert.ok(result.loadProfile.ingested > 0);
+      const persistedLp = JSON.parse(
+        await fs.readFile(path.join(dataDir, "load-profile.json"), "utf8"),
+      );
+      const bins = Object.values(persistedLp.bins);
+      assert.ok(
+        bins.some((b) => b.acEma === 120),
+        `a bin should learn AC 120W from the inverter path, got ${JSON.stringify(persistedLp.bins)}`,
+      );
+    } finally {
+      store.close();
+      await fs.rm(dataDir, { recursive: true, force: true });
+    }
+  });
 });
 
 test.describe("auth headers", () => {
@@ -1496,7 +1642,7 @@ test.describe("populateFromHistory: wind protection", () => {
           { path: "environment.wind.angleApparent" },
           { path: "navigation.speedThroughWater" },
           { path: "electrical.venus.dcPower" },
-          { path: "electrical.venus.acPower" },
+          { path: "electrical.venus.vebusDcPower" },
           { path: "environment.wind.speedTrue" },
           { path: "environment.wind.speedTrue", method: "max" },
           { path: "navigation.position" },

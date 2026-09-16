@@ -664,7 +664,7 @@ test.describe("PredictionEngine.updateLoadProfile gross consumption", () => {
     withDaytimeNow(() => {
       const pathValues = new Map([
         ["electrical.venus.dcPower", -50],
-        ["electrical.venus.acPower", 0],
+        ["electrical.venus.vebusDcPower", 0],
         ["electrical.chargers.wind.power", 60],
         ["electrical.chargers.hydrogenerator.power", 0],
         ["navigation.state", "moored"],
@@ -690,7 +690,7 @@ test.describe("PredictionEngine.updateLoadProfile gross consumption", () => {
     withDaytimeNow(() => {
       const pathValues = new Map([
         ["electrical.venus.dcPower", 130],
-        ["electrical.venus.acPower", 0],
+        ["electrical.venus.vebusDcPower", 0],
         ["electrical.chargers.wind.power", 0],
         ["electrical.chargers.hydrogenerator.power", 0],
         ["navigation.state", "moored"],
@@ -712,7 +712,7 @@ test.describe("PredictionEngine.updateLoadProfile gross consumption", () => {
     withDaytimeNow(() => {
       const pathValues = new Map([
         ["electrical.venus.dcPower", -50],
-        ["electrical.venus.acPower", 0],
+        ["electrical.venus.vebusDcPower", 0],
         ["electrical.chargers.wind.power", 10],
         ["electrical.chargers.hydrogenerator.power", 0],
         ["navigation.state", "moored"],
@@ -723,6 +723,71 @@ test.describe("PredictionEngine.updateLoadProfile gross consumption", () => {
       engine.updateLoadProfile();
       const after = engine.loadProfile.bins.get("at-rest:day").dcEma;
       assert.ok(after >= 0, `EMA should stay non-negative, got ${after}`);
+    });
+  });
+
+  test("AC consumption is read from the default VE.Bus path", () => {
+    // No acPowerPaths configured: the engine falls back to the Venus
+    // VE.Bus inverter DC draw (the standard source), feeding the AC bins.
+    // Fresh bin: the first sample seeds the EMA at its exact value.
+    withDaytimeNow(() => {
+      const pathValues = new Map([
+        ["electrical.venus.dcPower", 50],
+        ["electrical.venus.vebusDcPower", 120],
+        ["navigation.state", "moored"],
+        ["navigation.position", { latitude: -18.86, longitude: -159.8 }],
+      ]);
+      const engine = makeEngine(pathValues);
+      engine.updateLoadProfile();
+      const bin = engine.loadProfile.bins.get("at-rest:day");
+      assert.ok(bin, "sample should be ingested into a day bin");
+      assert.strictEqual(
+        bin.acEma,
+        120,
+        `AC EMA should learn the VE.Bus draw, got ${bin.acEma}`,
+      );
+    });
+  });
+
+  test("AC consumption sums configured inverter paths, ignoring the default", () => {
+    // Boats whose primary inverter is not on VE.Bus configure their own
+    // path(s): every configured path is summed, and the unconfigured
+    // default path is not read even when it publishes.
+    withDaytimeNow(() => {
+      const pathValues = new Map([
+        ["electrical.venus.dcPower", 50],
+        ["electrical.venus.vebusDcPower", 999],
+        ["electrical.inverters.main.acPower", 80],
+        ["electrical.inverters.aux.acPower", 40],
+        ["navigation.state", "moored"],
+        ["navigation.position", { latitude: -18.86, longitude: -159.8 }],
+      ]);
+      const { PredictionEngine } = require("../plugin/prediction.js");
+      const app = {
+        debug() {},
+        error() {},
+        getSelfPath: (p) => pathValues.get(p),
+      };
+      const engine = new PredictionEngine({
+        battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+        solarArrays: [],
+        mechanicalGenerators: [],
+        getEfficiency: () => 0.7,
+        getSelfPath: (p) => app.getSelfPath(p),
+        app,
+        acPowerPaths: [
+          "electrical.inverters.main.acPower",
+          "electrical.inverters.aux.acPower",
+        ],
+      });
+      engine.updateLoadProfile();
+      const bin = engine.loadProfile.bins.get("at-rest:day");
+      assert.ok(bin, "sample should be ingested into a day bin");
+      assert.strictEqual(
+        bin.acEma,
+        120,
+        `AC EMA should sum 80+40 from the configured inverter paths, got ${bin.acEma}`,
+      );
     });
   });
 });

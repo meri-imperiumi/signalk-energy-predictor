@@ -45,6 +45,8 @@ const {
   getActiveCapacity,
   getDisplayName,
   validateConfig,
+  DEFAULT_AC_POWER_PATHS,
+  getAcPowerPaths,
 } = require("./schema.js");
 const {
   detectEngineCharging,
@@ -357,6 +359,7 @@ const DEFAULT_CONFIG = {
     // is configured.
     engineAlternatorWatts: 100,
   },
+  acPowerPaths: DEFAULT_AC_POWER_PATHS,
   solarArrays: [],
   mechanicalGenerators: [],
   engines: [],
@@ -392,7 +395,6 @@ const SUBSCRIPTION_PATHS = [
   "environment.wind.directionTrue",
   "electrical.batteries.house.capacity.stateOfCharge",
   "electrical.venus.dcPower",
-  "electrical.venus.acPower",
   "electrical.shore.power.connected",
   "navigation.speedOverGround",
   "propulsion.*.state",
@@ -2887,6 +2889,9 @@ module.exports = (app) => {
         extraPaths.push(engine.alternatorModePath);
       }
     }
+    // AC (inverter) consumption paths for the load profile — configured
+    // per boat instead of a hardcoded Venus path (VE.Bus default when unset)
+    extraPaths.push(...getAcPowerPaths(pluginConfig?.acPowerPaths));
 
     const allPaths = [...SUBSCRIPTION_PATHS, ...extraPaths];
     const subscription = {
@@ -3084,6 +3089,8 @@ module.exports = (app) => {
         loadProfileConfig: config.loadProfile || {},
         windProtectionConfig: config.windProtection || {},
         predictionHours: config.weather?.forecastHours,
+        // AC (inverter) consumption paths for the load profile's AC bins
+        acPowerPaths: getAcPowerPaths(config.acPowerPaths),
         // Optional polar speed model (refreshed each prediction cycle
         // from the active `polars` resource; null when unavailable)
         getPolarModel: () => polarModel,

@@ -12,7 +12,42 @@ const {
   getActiveCapacity,
   getDisplayName,
   validateConfig,
+  DEFAULT_AC_POWER_PATHS,
+  getAcPowerPaths,
 } = require("../plugin/schema.js");
+
+test.describe("getAcPowerPaths", () => {
+  test("falls back to the VE.Bus default when unset or empty", () => {
+    assert.deepStrictEqual(getAcPowerPaths(undefined), [
+      "electrical.venus.vebusDcPower",
+    ]);
+    assert.deepStrictEqual(getAcPowerPaths(null), DEFAULT_AC_POWER_PATHS);
+    assert.deepStrictEqual(getAcPowerPaths([]), DEFAULT_AC_POWER_PATHS);
+    assert.deepStrictEqual(
+      getAcPowerPaths(["", "  ", 42]),
+      DEFAULT_AC_POWER_PATHS,
+    );
+  });
+
+  test("keeps configured inverter paths, deduplicated", () => {
+    assert.deepStrictEqual(
+      getAcPowerPaths([
+        "electrical.inverters.main.acPower",
+        "electrical.inverters.main.acPower",
+        "electrical.venus.acPower",
+      ]),
+      ["electrical.inverters.main.acPower", "electrical.venus.acPower"],
+    );
+  });
+
+  test("schema exposes acPowerPaths with the VE.Bus default", () => {
+    const schema = buildPluginSchema();
+    const prop = schema.properties.acPowerPaths;
+    assert.strictEqual(prop.type, "array");
+    assert.strictEqual(prop.items.type, "string");
+    assert.deepStrictEqual(prop.default, DEFAULT_AC_POWER_PATHS);
+  });
+});
 
 test.describe("validateConfig", () => {
   test("passes with valid config with unique paths", () => {

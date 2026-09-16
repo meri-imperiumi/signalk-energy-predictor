@@ -275,7 +275,7 @@ test.describe("motoring on a Victron-only boat (no propulsion paths)", () => {
         path: "electrical.generators.hydro.power",
         value: hydroPowerW,
       },
-      { path: "electrical.venus.acPower", value: 0 },
+      { path: "electrical.venus.vebusDcPower", value: 0 },
     ]);
     await plugin.__getInternals().runPredictionCycle();
     return { app, plugin };

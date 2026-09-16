@@ -17,7 +17,11 @@ const {
   msFromKnots,
 } = require("./prediction.js");
 const matrixPersistence = require("./matrix.js");
-const { parseManufacturerCurve } = require("./schema.js");
+const {
+  parseManufacturerCurve,
+  getAcPowerPaths,
+  DEFAULT_AC_POWER_PATHS,
+} = require("./schema.js");
 const weatherCache = require("./weather-cache.js");
 const {
   detectSolarArrayState,
@@ -1189,6 +1193,7 @@ async function populateFromHistory({
   const arrays = (config.solarArrays || []).filter(
     (a) => a.enabled !== false && a.powerPath,
   );
+  const acPowerPaths = getAcPowerPaths(config.acPowerPaths);
 
   const seeded = new Map();
   if (!fresh) {
@@ -1243,7 +1248,9 @@ async function populateFromHistory({
       // bucket (History API :max aggregate).
       "environment.wind.speedTrue:max",
       "electrical.venus.dcPower",
-      "electrical.venus.acPower",
+      // AC (inverter) consumption for the load profile replay — configured
+      // per boat (VE.Bus default when unset), not a hardcoded Venus path
+      ...acPowerPaths,
     ]),
   );
 
@@ -1394,6 +1401,7 @@ async function populateFromHistory({
     historyData,
     resolution,
     uncountedChargingPaths,
+    acPowerPaths,
   });
   await matrixPersistence.saveLoadProfile(dataDir, loadProfile);
 
@@ -2058,6 +2066,8 @@ function stateClassFromNavState(navState) {
  * @param {object} params.loadProfile - LoadProfile instance to update (in place)
  * @param {object} params.historyData - History API /values response
  * @param {number} [params.resolution] - Sample resolution in seconds
+ * @param {Array<string>} [params.uncountedChargingPaths=[]] - Charging-source power paths added back to dcPower
+ * @param {Array<string>} [params.acPowerPaths] - AC (inverter) consumption paths, summed per tick
  * @returns {{dataPoints: number, ingested: number, gated: number}}
  */
 function replayLoadProfile({
@@ -2065,14 +2075,19 @@ function replayLoadProfile({
   historyData,
   resolution = DEFAULT_RESOLUTION,
   uncountedChargingPaths = [],
+  acPowerPaths = DEFAULT_AC_POWER_PATHS,
 }) {
   const columns = pathColumns(historyData);
   const dcColumn = columns.get("electrical.venus.dcPower");
-  const acColumn = columns.get("electrical.venus.acPower");
   const navStateColumn = columns.get("navigation.state");
   const positionColumn = columns.get("navigation.position");
   const stwColumn = columns.get("navigation.speedThroughWater");
   const propulsionCols = propulsionColumns(historyData);
+  // AC (inverter) consumption columns: read side by side with the DC house
+  // load; a tick's AC load is the sum of every path that reported.
+  const acColumns = acPowerPaths
+    .map((p) => columns.get(p))
+    .filter((c) => c != null);
   // Charging-source power columns whose output flows through the battery
   // shunt but is NOT added back into dcPower (wind, hydro, alternator).
   // Venus computes dcPower = shunt + solar, so these uncounted chargers
@@ -2091,7 +2106,11 @@ function replayLoadProfile({
   for (const point of historyData.data || []) {
     const time = parseUtcTimestamp(point[0]);
     const dcLoadW = columnNumber(point, dcColumn);
-    const acLoadW = columnNumber(point, acColumn);
+    let acLoadW = null;
+    for (const c of acColumns) {
+      const v = columnNumber(point, c);
+      if (v != null) acLoadW = (acLoadW ?? 0) + v;
+    }
     if (dcLoadW == null && acLoadW == null) {
       continue;
     }

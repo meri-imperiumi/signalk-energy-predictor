@@ -64,6 +64,19 @@
         "minSafeSoC"
       ]
     },
+    "acPowerPaths": {
+      "type": "array",
+      "title": "AC Power Paths",
+      "description": "Signal K paths for AC power consumption in watts — read side by side with the Venus DC house load to learn the load profile's AC component. All paths are summed, so a boat with several inverters can list them all. The default covers a Victron VE.Bus inverter; boats whose primary inverter is not on VE.Bus should set their inverter's power path here",
+      "items": {
+        "type": "string",
+        "title": "AC Power Path",
+        "minLength": 1
+      },
+      "default": [
+        "electrical.venus.vebusDcPower"
+      ]
+    },
     "engines": {
       "type": "array",
       "title": "Propulsion Engines",
@@ -87,9 +100,21 @@
           "alternatorWatts": {
             "type": "number",
             "title": "Alternator Output",
-            "description": "Expected alternator output when this engine runs (watts). 0 for electric drives or engines without an alternator — they are consumers and never recommended as generators",
+            "description": "Expected alternator output when this engine runs (watts). 0 for electric drives or engines without an alternator — they are consumers and never recommended as generators. When an alternator power path is configured but this is 0, the measured output stands in",
             "default": 0,
             "minimum": 0
+          },
+          "alternatorPowerPath": {
+            "type": "string",
+            "title": "Alternator Power Path",
+            "description": "Signal K path for measured alternator/DC-DC charger output (watts), e.g. electrical.chargers.alternator.power. A readable positive output marks the engine as running even without propulsion instrumentation, and when Alternator Output is 0 the measured watts model the ideal track",
+            "default": ""
+          },
+          "alternatorModePath": {
+            "type": "string",
+            "title": "Alternator Charging Mode Path",
+            "description": "Signal K path for the charger's charging mode (e.g. electrical.chargers.alternator.chargingMode — bulk/absorption/float/off). Any active mode marks the engine as running; unlike power, the mode stays truthful when the charger tapers in absorption or float while the engine still runs",
+            "default": ""
           },
           "enabled": {
             "type": "boolean",
