@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-09-17
+
 ### Added
 - **Configurable AC (inverter) power paths** (`acPowerPaths`):
   the AC consumption feeding the load profile's AC bins was read
