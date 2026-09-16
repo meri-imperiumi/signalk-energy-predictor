@@ -886,6 +886,7 @@ test.describe("recordings gap-fill", () => {
       );
       assert.deepStrictEqual(noon.arrays, { live: 1 });
     } finally {
+      store.close();
       await fs.rm(dataDir, { recursive: true, force: true });
     }
   });
@@ -948,6 +949,7 @@ test.describe("recordings gap-fill", () => {
         assert.strictEqual(s.awaRad, 0.9);
       }
     } finally {
+      store.close();
       await fs.rm(dataDir, { recursive: true, force: true });
     }
   });
@@ -1071,6 +1073,7 @@ test.describe("populateFromHistory", () => {
         "load-profile.json should contain learned bins",
       );
     } finally {
+      store.close();
       await fs.rm(dataDir, { recursive: true, force: true });
     }
   });
@@ -1165,6 +1168,7 @@ test.describe("populateFromHistory", () => {
       const secondVal = Object.values(secondRun.anchored)[0];
       assert.ok(Math.abs(firstVal - secondVal) < 0.001);
     } finally {
+      store.close();
       await fs.rm(dataDir, { recursive: true, force: true });
     }
   });
@@ -1567,6 +1571,7 @@ test.describe("populateFromHistory: wind protection", () => {
         "speed factors persisted",
       );
     } finally {
+      store.close();
       await fs.rm(dataDir, { recursive: true, force: true });
     }
   });
@@ -1632,6 +1637,7 @@ test.describe("populateFromHistory: wind protection", () => {
       });
       assert.strictEqual(result.windProtection, null);
     } finally {
+      store.close();
       await fs.rm(dataDir, { recursive: true, force: true });
     }
   });
@@ -1978,7 +1984,7 @@ test("fetchHistoricalWeatherTrack persists-as-you-go (resumable after rate-limit
 
 test("fetchHistoricalWeatherTrack without dataDir is pure fetch (no cache)", async () => {
   let calls = 0;
-  const fetchImpl = async () => {
+  const fetchImpl = async (url) => {
     calls++;
     return {
       ok: true,
