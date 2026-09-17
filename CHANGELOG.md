@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-09-18
+
 ### Fixed
 - **The drag-reduction advisory no longer fires at rest** (`plugin/prediction.js`,
   `plugin/advisory.js`, `plugin/advisory-recompute.js`): "Stow
