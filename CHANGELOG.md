@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **The drag-reduction advisory no longer fires at rest** (`plugin/prediction.js`,
+  `plugin/advisory.js`, `plugin/advisory-recompute.js`): "Stow
+  mechanical generators in Xh to reduce drag" was computed from the
+  ideal track's total mechanical yield, so at anchor a producing wind
+  generator (the only mechanical that can yield at rest) triggered a
+  drag advisory — but there is no drag at rest, and the hydrogenerator
+  was usually stowed anyway (at anchor its state is undetectable: no
+  flow, no power signal, only harm is algae growth). The opportunity now
+  only exists while **sailing**, only for a **deployable hydrogenerator
+  actually detected down** (unknown counts as deployed), never for wind
+  generators or fixed mounts, and the backfill recompute mirrors this
+  (hydro yield only). The notification message now reads "Stow
+  hydrogenerators in Xh to reduce drag".
+
+### Added
+- **Hydro-down-while-motoring violation alert** (`plugin/prediction.js`,
+  `plugin/advisory.js`, `plugin/index.js`): a deployable towed
+  hydrogenerator must only be down while sailing. When the detected
+  state is deployed (or unknown) while motoring, the stow recommendation
+  is now flagged as an actual violation — full urgency intensity, sound
+  + visual, immune to the flip cooldown — landing at the deployable cap
+  (warn) instead of a visual-only planning note. Live state seeding no
+  longer overwrites a producing hydrogenerator with "stowed" just
+  because the boat is motoring (prop wash spinning the impeller is
+  positive evidence it is down).
+
 ## [0.10.1] - 2026-09-17
 
 ### Added

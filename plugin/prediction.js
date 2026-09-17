@@ -2530,11 +2530,20 @@ class PredictionEngine {
         if (!isSailing) {
           // Hydro can only be deployed when sailing (not motoring)
           remember("stowed", "nav");
+          // A deployable hydro detected down (or unknown) while under
+          // power is an actual rule violation, not a planning verdict:
+          // a towed generator in the prop wash is pure drag and wear.
+          // Flagged so the advisory publisher treats it as an actual,
+          // full-intensity event that flips cooldowns cannot suppress.
+          const violation =
+            navState === "motoring" &&
+            detectedStates?.get(generator.id) !== "stowed";
           push(
             "stowed",
             underway
               ? `vessel ${navState}, hydro requires sailing`
               : "vessel not sailing",
+            violation ? { actualViolation: true } : {},
           );
         } else if (boatSpeedMs == null) {
           // No readable speed source: keep the last verdict rather than
@@ -3461,12 +3470,44 @@ class PredictionEngine {
   }
 
   /**
-   * Finds stowage opportunity when mechanical generators are active
-   * and remaining solar forecast is sufficient.
+   * Finds a stowage opportunity when a deployable hydrogenerator is
+   * down while sailing and the remaining solar forecast is sufficient
+   * to fill the bank anyway — lift it out at hour `i` and stop paying
+   * drag.
    *
+   * Drag only exists under way, and a towed hydrogenerator is only ever
+   * down while sailing: at anchor there is nothing in the water, so the
+   * advisory never fires at rest (the at-anchor equivalent — stowing a
+   * wind generator because solar will fill the bank — is a deployment
+   * recommendation instead). While motoring the hydro should not be down
+   * at all; that case is the motoring violation in the deployment
+   * recommendations, not an opportunity. Wind generators cause no
+   * hydrodynamic drag and fixed hydros cannot be stowed, so neither
+   * counts. A hydro whose detected state is "stowed" is already out of
+   * the water — there is no opportunity to take.
+   *
+   * @param {Map<string, string>|null} [detectedDeployStates] - Current
+   *        detected deploy states per generator id ("deployed"/
+   *        "stowed"). Unknown counts as deployed (worst case), matching
+   *        the state-confidence convention.
    * @returns {{hour: number, reason: string}|null} Stowage recommendation or null
    */
-  findStowageOpportunity() {
+  findStowageOpportunity(detectedDeployStates = null) {
+    // Sailing only: drag reduction means a towed hydrogenerator, and a
+    // deployable hydro is only down while sailing.
+    if (this.getNavState() !== "sailing") return null;
+
+    // Only a deployable hydro that is actually dragging through the
+    // water (detected deployed, or unknown — worst case) offers a
+    // stowage opportunity.
+    const hydroDragging = this.mechanicalGenerators.some(
+      (gen) =>
+        gen.type === "hydro" &&
+        gen.deployable &&
+        detectedDeployStates?.get(gen.id) !== "stowed",
+    );
+    if (!hydroDragging) return null;
+
     let cumulativeNet = 0;
     const deficit = this.getDeficit();
     let mechanicalActive = false;
@@ -3474,7 +3515,10 @@ class PredictionEngine {
     for (let i = 0; i < this.lastPrediction.length; i++) {
       const p = this.lastPrediction[i];
 
-      if (p.idealWindYieldWh > 0) {
+      // Hydro yield only — wind generators are stowed under way in the
+      // ideal track, so wind yield here would be a fixed mount that
+      // cannot be stowed at all.
+      if (p.idealHydroYieldWh > 0) {
         mechanicalActive = true;
       }
 

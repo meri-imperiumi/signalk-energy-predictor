@@ -16,6 +16,7 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 
 const { PredictionEngine, msFromKnots } = require("../plugin/prediction.js");
+const { AdvisoryPublisher } = require("../plugin/advisory.js");
 const { parseManufacturerCurve } = require("../plugin/schema.js");
 
 // --- Helpers --------------------------------------------------------------
@@ -278,5 +279,83 @@ test.describe("wind generator verdicts on a windless forecast tier", () => {
     const rec = recs.find((r) => r.id === "windgen");
     assert.strictEqual(rec.recommendedState, "stowed");
     assert.match(rec.reason, /forecast wind too low/);
+  });
+});
+
+// --- Hydro down while motoring (rule violation) ----------------------------
+
+test.describe("hydro down while motoring", () => {
+  test("detected deployed while motoring flags an actual violation", () => {
+    const engine = makeEngine({
+      navState: "motoring",
+      sustainedStwKn: 6,
+    });
+    const rec = hydroRec(engine, new Map([["hydro", "deployed"]]));
+    assert.strictEqual(rec.recommendedState, "stowed");
+    assert.strictEqual(rec.actualViolation, true);
+    assert.match(rec.reason, /hydro requires sailing/);
+  });
+
+  test("unknown detected state while motoring is treated as a violation", () => {
+    const engine = makeEngine({
+      navState: "motoring",
+      sustainedStwKn: 6,
+    });
+    const rec = hydroRec(engine, new Map());
+    assert.strictEqual(rec.actualViolation, true);
+  });
+
+  test("stowed while motoring is no violation", () => {
+    const engine = makeEngine({
+      navState: "motoring",
+      sustainedStwKn: 6,
+    });
+    const rec = hydroRec(engine, new Map([["hydro", "stowed"]]));
+    assert.strictEqual(rec.recommendedState, "stowed");
+    assert.notStrictEqual(rec.actualViolation, true);
+  });
+
+  test("at anchor there is no violation (undetectable, harmless)", () => {
+    const engine = makeEngine({
+      navState: "anchored",
+      gens: [HYDRO],
+    });
+    const rec = hydroRec(engine, new Map([["hydro", "deployed"]]));
+    assert.strictEqual(rec.recommendedState, "stowed");
+    assert.notStrictEqual(rec.actualViolation, true);
+  });
+
+  test("the violation publishes as a warn with sound, not a visual-only note", () => {
+    // A towed generator in the prop wash is an equipment-damage risk:
+    // urgency reads it like an actual over-limit event (full intensity,
+    // flip-cooldown carve-out), landing at the deployable cap (high).
+    const app = makeFakeApp();
+    const pub = new AdvisoryPublisher(app, "test");
+    pub.publishDeploymentStates(
+      [
+        {
+          id: "hydro",
+          name: "Hydrogenerator",
+          type: "hydro",
+          recommendedState: "stowed",
+          reason: "vessel motoring, hydro requires sailing",
+          actualViolation: true,
+        },
+      ],
+      new Map([["hydro", "deployed"]]),
+      { isUnderway: true },
+    );
+    const notif = app.handleMessageCalls
+      .flatMap((c) => c.msg.updates[0].values)
+      .find(
+        (v) =>
+          v.path === "notifications.electrical.energy.deploy_hydro" &&
+          v.value.state !== "normal",
+      );
+    assert.ok(notif, "expected a deploy_hydro notification");
+    assert.strictEqual(notif.value.state, "warn");
+    assert.ok(notif.value.method.includes("sound"));
+    assert.match(notif.value.message, /Stow now/);
+    assert.match(notif.value.message, /hydro requires sailing/);
   });
 });

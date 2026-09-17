@@ -244,9 +244,13 @@ function recomputeCombustion(forecast, engines, gensets, opts = {}) {
 }
 
 /**
- * Recomputes the stowage (drag-reduction) opportunity from a forecast track.
- * Mirrors {@link PredictionEngine#findStowageOpportunity}: mechanicals are
- * active and the deficit is covered with enough remaining solar.
+ * Recomputes the stowage (drag-reduction) opportunity from a forecast
+ * track. Mirrors {@link PredictionEngine#findStowageOpportunity}: a
+ * deployable hydrogenerator is down (nonzero ideal hydro yield implies
+ * boat speed, i.e. sailing), the deficit is covered, and enough solar
+ * remains. Wind yield does not count — there is no drag at rest, and
+ * fixed mounts cannot be stowed. (Detected deploy states are not in the
+ * recorded track, so the backfill mirrors the ideal side only.)
  *
  * @param {ForecastPoint[]} forecast - Hourly forecast points
  * @param {object} opts
@@ -268,7 +272,9 @@ function recomputeStowage(forecast, opts = {}) {
   let mechanicalActive = false;
   for (let i = 0; i < forecast.length; i++) {
     const p = forecast[i];
-    if (p.idealWindYieldWh > 0) mechanicalActive = true;
+    // Hydro yield only — nonzero hydro implies boat speed (under way);
+    // wind yield at rest was the old false "reduce drag" trigger.
+    if (p.idealHydroYieldWh > 0) mechanicalActive = true;
     cumulativeNet += p.idealNetWh;
     if (mechanicalActive && cumulativeNet >= deficit) {
       const remainingSolar = forecast
@@ -399,7 +405,7 @@ function recomputeAdvisories(forecast, opts) {
     advisories.push({
       type: "stow_soon",
       time: cycleTime.toISOString(),
-      message: `Stow mechanical generators in ${stowage.hour}h to reduce drag - ${stowage.reason}`,
+      message: `Stow hydrogenerators in ${stowage.hour}h to reduce drag - ${stowage.reason}`,
       inHours: stowage.hour,
       reason: stowage.reason,
     });

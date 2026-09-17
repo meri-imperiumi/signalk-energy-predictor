@@ -29,6 +29,7 @@ function track(points, now = Date.now()) {
     idealSoC: p.soc,
     idealSolarYieldWh: p.solar ?? 0,
     idealWindYieldWh: p.wind ?? 0,
+    idealHydroYieldWh: p.hydro ?? 0,
     idealNetWh: p.net,
     alternatorWh: p.alt ?? 0,
     houseLoadWh: p.load,
@@ -150,6 +151,41 @@ test("recomputeStowage: null when mechanicals never active", () => {
   const f = track([
     { soc: 0.5, solar: 300, net: 170, load: 130 },
     { soc: 0.7, solar: 400, net: 270, load: 130 },
+  ]);
+  assert.strictEqual(recomputeStowage(f, { ...BAT, currentSoC: 0.5 }), null);
+});
+
+test("recomputeStowage: fires when a deployable hydro is down and solar covers", () => {
+  // Deficit (1-0.5)*4800 = 2400 Wh; net 600 Wh/h covers it by hour 3
+  // (cumulative 2400) and the remaining 5h of sun (2500 Wh) clears the
+  // 80% gate (1920 Wh).
+  const f = track([
+    { soc: 0.5, solar: 500, hydro: 100, net: 600, load: 0 },
+    { soc: 0.56, solar: 500, hydro: 100, net: 600, load: 0 },
+    { soc: 0.62, solar: 500, hydro: 100, net: 600, load: 0 },
+    { soc: 0.68, solar: 500, hydro: 100, net: 600, load: 0 }, // covered
+    { soc: 0.74, solar: 500, net: 500, load: 0 },
+    { soc: 0.8, solar: 500, net: 500, load: 0 },
+    { soc: 0.86, solar: 500, net: 500, load: 0 },
+    { soc: 0.92, solar: 500, net: 500, load: 0 },
+  ]);
+  const res = recomputeStowage(f, { ...BAT, currentSoC: 0.5 });
+  assert.ok(res, "expected a stowage opportunity");
+  assert.strictEqual(res.hour, 3);
+  assert.match(res.reason, /Deficit covered by hour 3/);
+});
+
+test("recomputeStowage: null on wind-only yield (no drag at rest)", () => {
+  // The at-anchor false positive: a wind generator producing while the
+  // boat sits still must never produce a "reduce drag" advisory.
+  const f = track([
+    { soc: 0.5, solar: 500, wind: 200, net: 700, load: 0 },
+    { soc: 0.56, solar: 500, wind: 200, net: 700, load: 0 },
+    { soc: 0.62, solar: 500, wind: 200, net: 700, load: 0 },
+    { soc: 0.68, solar: 500, net: 500, load: 0 },
+    { soc: 0.74, solar: 500, net: 500, load: 0 },
+    { soc: 0.8, solar: 500, net: 500, load: 0 },
+    { soc: 0.86, solar: 500, net: 500, load: 0 },
   ]);
   assert.strictEqual(recomputeStowage(f, { ...BAT, currentSoC: 0.5 }), null);
 });

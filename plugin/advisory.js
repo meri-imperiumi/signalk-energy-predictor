@@ -134,6 +134,10 @@ function formatWindowTime(when, start, offsetMinutes = null) {
  * @returns {number|null}
  */
 function severityRatioFor(rec) {
+  // A binary rule violation (deployable hydro down while motoring) has
+  // no measured limit ratio — treat it as full intensity (log2(2) = 1)
+  // so the urgency model reads it like an actual over-limit event.
+  if (rec.actualViolation) return 2;
   const limit = rec.limitMs;
   if (limit == null || limit <= 0) return null;
   const current =
@@ -169,6 +173,7 @@ function hoursUntil(when) {
  * @returns {boolean}
  */
 function isActualCondition(rec) {
+  if (rec.actualViolation) return true;
   const ratio = severityRatioFor(rec);
   return ratio != null && ratio >= 1;
 }
@@ -903,11 +908,15 @@ class AdvisoryPublisher {
   }
 
   /**
-   * Publishes drag reduction advisory (stowage when sufficient solar forecast).
+   * Publishes drag reduction advisory (stowage when sufficient solar
+   * forecast) for a deployable hydrogenerator that is down while
+   * sailing: lift it out at the covered hour and stop paying drag.
    *
    * Urgency is time-driven (the stowage opportunity is hours away) and
-   * capped at `medium` — it's a fuel/drag saving opportunity, not a safety
-   * matter. At rest + night + low urgency it's held for the morning.
+   * capped at `medium` — it's a fuel/drag saving opportunity, not a
+   * safety matter. At rest + night + low urgency it's held for the
+   * morning (the opportunity itself never exists at rest; this covers a
+   * stale advisory from before anchoring).
    *
    * @param {{hour: number, reason: string}|null} opportunity - Stowage opportunity from prediction engine
    * @param {object} [opts]
@@ -920,7 +929,7 @@ class AdvisoryPublisher {
     const type = AdvisoryType.STOW_SOON;
 
     if (opportunity) {
-      const message = `Stow mechanical generators in ${opportunity.hour}h to reduce drag - ${opportunity.reason}`;
+      const message = `Stow hydrogenerators in ${opportunity.hour}h to reduce drag - ${opportunity.reason}`;
       let urgency = calculateUrgency({
         advisoryType: "opportunity",
         timeToActionHours: opportunity.hour,

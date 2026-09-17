@@ -71,7 +71,7 @@ test("buildCycleAdvisories: records surplus, engine-run (deficit) and stowage ad
       {
         type: "stow_soon",
         message:
-          "Stow mechanical generators in 3h to reduce drag - Deficit covered by hour 3, 800Wh solar remaining",
+          "Stow hydrogenerators in 3h to reduce drag - Deficit covered by hour 3, 800Wh solar remaining",
       },
     ],
   );

@@ -336,7 +336,7 @@ function buildCycleAdvisories({
     advisories.push({
       type: AdvisoryType.STOW_SOON,
       time: now,
-      message: `Stow mechanical generators in ${stowageOpportunity.hour}h to reduce drag - ${stowageOpportunity.reason}`,
+      message: `Stow hydrogenerators in ${stowageOpportunity.hour}h to reduce drag - ${stowageOpportunity.reason}`,
       inHours: stowageOpportunity.hour,
       reason: stowageOpportunity.reason,
     });
@@ -1687,10 +1687,20 @@ module.exports = (app) => {
             seededDeployStateIds.delete(gen.id);
           }
         }
-        // Hydro is stowed when not sailing
+        // Hydro is stowed when not sailing — unless it is producing
+        // power: a towed generator spinning in the prop wash while
+        // motoring IS down (a rule violation the deployment
+        // recommendation flags), not stowed.
         if (gen.deployable && gen.type === "hydro" && navState !== "sailing") {
-          currentDeployStates.set(gen.id, "stowed");
-          seededDeployStateIds.delete(gen.id);
+          const hydroPower =
+            gen.powerPath != null
+              ? (averagedPowerW(gen.powerPath) ??
+                toNumber(deltaState.get(gen.powerPath)))
+              : null;
+          if (!(hydroPower != null && hydroPower > 0)) {
+            currentDeployStates.set(gen.id, "stowed");
+            seededDeployStateIds.delete(gen.id);
+          }
         }
         // Hydro: if sailing above min speed but no power output, it is stowed.
         // Runs even when a seed is present (definite live reading wins). The
@@ -1748,7 +1758,8 @@ module.exports = (app) => {
       // Calculate advisories
       const timeToFull = predictionEngine.getTimeToFull();
       const timeToEmpty = predictionEngine.getTimeToEmpty();
-      const stowageOpportunity = predictionEngine.findStowageOpportunity();
+      const stowageOpportunity =
+        predictionEngine.findStowageOpportunity(currentDeployStates);
 
       // Combustion sources (#11): gensets + engine(s) as deployable
       // generators with tiered reluctance. Evolves the old
