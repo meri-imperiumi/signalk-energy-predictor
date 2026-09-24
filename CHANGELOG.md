@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Offline weather now serves the cached forecast hours that are still
+  ahead, instead of switching to Clear Sky** (`plugin/ingestion.js`):
+  the on-disk restore path gated the cache on *fetch age* (file mtime vs
+  `forecastCacheHours`), so a 48 h forecast fetched more than 24 h earlier
+  was discarded wholesale — hours still in the future included — and the
+  plugin fell to the Clear Sky baseline with no wind data (observed in the
+  wild: anchored, Internet down for 2 h, daily fetch cycle 22 h in → Clear
+  Sky at the 24 h boundary). The restore is now **coverage-based**: cached
+  hours are served (tagged `source: "forecast-cache"`, tier from the
+  cache) until their valid time passes, and hours beyond the cache's
+  coverage are filled with the stale hybrid (logbook oktas solar +
+  latest-known wind) so the horizon stays complete. Only when no cached
+  hour is left ahead does the full hybrid take over. This resolves work
+  doc #15 update #2's deferred question ("the clear-cut drop felt wrong
+  in practice").
+- **An exhausted in-memory forecast is no longer served as fresh**
+  (`plugin/ingestion.js`): `getForecast`'s cache hit now also requires
+  future hour coverage (±30 min, matching the prediction-hour matching
+  window), and the uplink cadence / offline-probe rate limits were moved
+  to gate only the *network* tiers inside `fetchForecast` — the local
+  ladder (disk restore + hybrid) always runs. Previously a rate-limited
+  cycle kept returning a past-only forecast until the next 24 h probe.
+- **A Signal K Weather provider answering from its own stale dataset is
+  no longer published as a fresh tier-2 forecast** (`plugin/ingestion.js`):
+  a provider response whose points are all in the past (stale provider
+  cache while offline) now fails tier acceptance — zero future coverage —
+  and the FSM falls through to the offline ladder instead of shadowing
+  the on-disk restore with an all-past "forecast".
+
 ## [0.10.2] - 2026-09-18
 
 ### Fixed

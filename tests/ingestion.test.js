@@ -357,15 +357,32 @@ test.describe("isDegenerateForecast", () => {
 });
 
 test.describe("Open-Meteo fetch error handling", () => {
-  const validPayload = {
-    hourly: {
-      time: ["2026-08-22T21:00", "2026-08-22T22:00"],
-      shortwave_radiation: [100, 50],
-      wind_speed_10m: [18, 16],
-      wind_gusts_10m: [27, 25],
-      wind_direction_10m: [90, 95],
-    },
-  };
+  /** Open-Meteo-shaped hour strings starting at the current UTC hour, so
+   * FSM-level tests feed a payload whose hours are still in the future
+   * (the tier acceptance rejects all-past datasets). */
+  function openMeteoTimes() {
+    const t0 = new Date();
+    t0.setUTCMinutes(0, 0, 0);
+    return [0, 1].map((i) =>
+      new Date(t0.getTime() + i * 3600000)
+        .toISOString()
+        .slice(0, 13)
+        .concat(":00"),
+    );
+  }
+
+  function validPayload() {
+    const time = openMeteoTimes();
+    return {
+      hourly: {
+        time,
+        shortwave_radiation: [100, 50],
+        wind_speed_10m: [18, 16],
+        wind_gusts_10m: [27, 25],
+        wind_direction_10m: [90, 95],
+      },
+    };
+  }
 
   function withFetch(impl, fn) {
     const origFetch = globalThis.fetch;
@@ -383,7 +400,7 @@ test.describe("Open-Meteo fetch error handling", () => {
         if (calls < 2) {
           throw new TypeError("fetch failed"); // fetch() rejects with TypeError on network errors
         }
-        return { ok: true, json: async () => validPayload };
+        return { ok: true, json: async () => validPayload() };
       },
       async () => {
         const points = await fetchOpenMeteo(60.17, 24.94, { retryDelayMs: 1 });
@@ -395,7 +412,7 @@ test.describe("Open-Meteo fetch error handling", () => {
         // Naive UTC timestamps parsed as UTC
         assert.strictEqual(
           points[0].time.toISOString(),
-          "2026-08-22T21:00:00.000Z",
+          `${openMeteoTimes()[0]}:00.000Z`,
         );
       },
     );
@@ -569,7 +586,7 @@ test.describe("Open-Meteo fetch error handling", () => {
         if (calls < 2) {
           throw new TypeError("fetch failed");
         }
-        return { ok: true, json: async () => validPayload };
+        return { ok: true, json: async () => validPayload() };
       }
       throw new Error("network down");
     };
@@ -613,22 +630,33 @@ test.describe("Offline forecast restore + staleness + uplink cadence", () => {
     };
   }
 
-  /** Seed the on-disk cache for a position with a tier-1 forecast hour. */
+  /** Seed the on-disk cache for a position with tier-1 forecast hours,
+   * grouped by each hour's own UTC date — the same layout cacheForecast()
+   * writes (one file per date), so multi-day seeds restore correctly. */
   async function seedCache(dataDir, lat, lon, hours, tier = 1, ageMs = 0) {
     const bucket = weatherPositionBucket(lat, lon);
     const date = new Date(Date.now() - ageMs);
-    const dateKey = `${date.getUTCFullYear()}-${String(date.getUTCMonth() + 1).padStart(2, "0")}-${String(date.getUTCDate()).padStart(2, "0")}`;
-    const points = hours.map((h) => ({
-      time: new Date(date.getTime() + h * 3600000),
-      ghi: 600,
-      cloudCover: 0.3,
-      windSpeedMs: 12,
-      gustSpeedMs: 18,
-      windDirectionDeg: 90,
-      tier,
-    }));
-    await writeWeatherCache(dataDir, dateKey, bucket, points, tier);
-    return dateKey;
+    const dateKeyOf = (d) =>
+      `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}-${String(d.getUTCDate()).padStart(2, "0")}`;
+    const byDate = new Map();
+    for (const h of hours) {
+      const time = new Date(date.getTime() + h * 3600000);
+      const key = dateKeyOf(time);
+      if (!byDate.has(key)) byDate.set(key, []);
+      byDate.get(key).push({
+        time,
+        ghi: 600,
+        cloudCover: 0.3,
+        windSpeedMs: 12,
+        gustSpeedMs: 18,
+        windDirectionDeg: 90,
+        tier,
+      });
+    }
+    for (const [key, points] of byDate) {
+      await writeWeatherCache(dataDir, key, bucket, points, tier);
+    }
+    return dateKeyOf(date);
   }
 
   test("network down + on-disk cache present → restores the real forecast instead of clear sky", async () => {
@@ -946,6 +974,124 @@ test.describe("Offline forecast restore + staleness + uplink cadence", () => {
         fetchCalls,
         before,
         "online cadence (1h) suppresses a refetch only 30 min after the last",
+      );
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  test("offline, cache fetched >24h ago but hours still ahead → serves the remaining real hours, hybrid fills the tail", async () => {
+    // The anchored-offline regression (work doc #15 update #2 follow-up):
+    // Internet dropped ~22h into a daily fetch cycle; at the 24h staleness
+    // boundary the old mtime gate discarded the on-disk forecast even
+    // though ~24h of its 48h hours were still ahead → Clear Sky, no wind.
+    // Coverage-based restore must serve the still-future cached hours.
+    const dir = await mkDataDir();
+    const fsm = fsmWithCache(makeApp(), dir);
+    // A 48h forecast fetched 30h ago: its last ~18h are still ahead of now.
+    await seedCache(
+      dir,
+      60.17,
+      24.94,
+      Array.from({ length: 48 }, (_, i) => i),
+      1,
+      30 * 3600000,
+    );
+    const origFetch = globalThis.fetch;
+    networkDown();
+    try {
+      const forecast = await fsm.fetchForecast();
+      assert.strictEqual(
+        fsm.currentTier,
+        Tier.OPEN_METEO,
+        "still-future cached hours remain a real forecast",
+      );
+      const nowMs = Date.now();
+      const cached = forecast.filter((p) => p.source === "forecast-cache");
+      assert.ok(cached.length > 0, "cached future hours are served");
+      assert.ok(
+        cached.every((p) => p.time.getTime() >= nowMs - 3600000),
+        "no already-past hours are served",
+      );
+      assert.ok(
+        cached.every((p) => p.windSpeedMs === 12),
+        "cached hours keep their forecast wind (not clear-sky nulls)",
+      );
+      // Hours beyond the cache's coverage are the honest hybrid, so the
+      // published horizon stays complete.
+      const tail = forecast.filter((p) => p.source !== "forecast-cache");
+      assert.ok(tail.length > 0, "hybrid tail beyond cache coverage");
+      assert.ok(
+        tail.every((p) => p.source === "clear-sky" || p.source === "logbook"),
+      );
+      assert.ok(
+        forecast.some((p) => p.time.getTime() > nowMs + 40 * 3600000),
+        "the horizon extends well past the cache coverage",
+      );
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  test("getForecast does not serve a restored forecast whose hours have all passed", async () => {
+    // End-of-offline-stretch dead zone: the in-memory forecast is inside
+    // its 24h window but exhausted (all hours past). It must not be served
+    // as fresh — the ladder rebuilds (here: offline probe rate-limits the
+    // network, no cache on disk → hybrid floor).
+    const dir = await mkDataDir();
+    const fsm = fsmWithCache(makeApp(), dir);
+    const origFetch = globalThis.fetch;
+    networkDown();
+    try {
+      const past = Array.from({ length: 3 }, (_, i) => ({
+        time: new Date(Date.now() - (3 - i) * 3600000),
+        ghi: 600,
+        cloudCover: 0.3,
+        windSpeedMs: 12,
+        gustSpeedMs: 18,
+        windDirectionDeg: 90,
+      }));
+      fsm.lastForecast = past;
+      fsm.lastFetchTime = new Date(); // inside the tier-1 window…
+      fsm.currentTier = Tier.OPEN_METEO;
+      fsm.uplinkOnline = false;
+      fsm.lastFetchAttempt = new Date(); // …and the offline probe is fresh
+      const served = await fsm.getForecast();
+      assert.notStrictEqual(
+        served,
+        past,
+        "an exhausted forecast must not be served from memory",
+      );
+      assert.ok(
+        served.some((p) => p.time.getTime() > Date.now()),
+        "the rebuild covers future hours",
+      );
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  test("Signal K Weather provider serving an all-past dataset is not a fresh tier-2 forecast", async () => {
+    // A provider plugin answering from its own stale cache returns points
+    // that are all in the past. Publishing that as a tier-2 "success"
+    // would shadow the on-disk restore with a forecast that has zero
+    // future coverage.
+    const dir = await mkDataDir();
+    const staleDataset = Array.from({ length: 6 }, (_, i) => ({
+      date: new Date(Date.now() - (30 - i) * 3600000).toISOString(),
+      type: "point",
+      outside: { cloudCover: 0.25 },
+      wind: { speedTrue: 6, directionTrue: Math.PI / 2, gust: 9 },
+    }));
+    const fsm = fsmWithCache(makeAppWithWeather(staleDataset), dir);
+    const origFetch = globalThis.fetch;
+    networkDown(); // tier 1 fails; the provider answers in-process
+    try {
+      const forecast = await fsm.fetchForecast();
+      assert.notStrictEqual(fsm.currentTier, Tier.SIGNAL_K_WEATHER);
+      assert.ok(
+        forecast.some((p) => p.time.getTime() > Date.now()),
+        "falls to the offline ladder, which covers future hours",
       );
     } finally {
       globalThis.fetch = origFetch;
