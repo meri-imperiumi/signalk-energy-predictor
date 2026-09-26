@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Deployable solar deploy/stow detection no longer flaps in low
+  irradiance** (`plugin/deploy-state.js`, `plugin/index.js`,
+  `plugin/history-backfill.js`): on a rainy overcast morning just after
+  sunrise a deployed FLINsail's output hovers around zero, flickering
+  between 0 W and fractions of a watt; the inference (any positive power
+  → deployed, 0 W with the sun up → stowed) read that quantization noise
+  as state changes, producing multiple deploy/stow detections. The shared
+  detector now applies a **hysteresis dead band**: only output above a
+  capacity-scaled confirm threshold (0.5% of `capacityWp`, clamped to
+  1–5 W) confirms a stowed→deployed transition, while sub-threshold
+  positive output holds the previous state. A solid 0 W reading with the
+  sun up still confirms stowed. The live prediction cycle additionally
+  reads the same 5-minute window-averaged power the generators use
+  (instantaneous reading as fallback) and gates the 0 W → stowed
+  inference on the shared ~5° sun-elevation constant instead of the bare
+  horizon, matching the recording and backfill paths. The per-sample
+  recording and both backfill passes thread the previous detected state
+  through the detector so the dead band holds across samples.
 ## [0.10.3] - 2026-09-24
 
 ### Fixed

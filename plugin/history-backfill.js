@@ -1806,6 +1806,10 @@ async function backfillSamples({
 
   let written = 0;
   const dataPoints = historyData.data || [];
+  // Last detected state per device, threaded bucket-to-bucket so the
+  // detector's hysteresis dead band (sub-threshold positive power holds
+  // the previous state) works across backfilled samples too.
+  const previousDeployStates = new Map();
   for (let i = 0; i < dataPoints.length; i++) {
     const point = dataPoints[i];
     const st = carriedState[i];
@@ -1870,8 +1874,12 @@ async function backfillSamples({
         powerW,
         sunUp,
         underway,
+        previousState: previousDeployStates.get(array.id) ?? null,
       });
-      if (state != null) deployStates[array.id] = state;
+      if (state != null) {
+        deployStates[array.id] = state;
+        previousDeployStates.set(array.id, state);
+      }
     }
     for (const gen of generators) {
       if (!gen.deployable) continue;
@@ -1944,6 +1952,10 @@ async function augmentSamplesDeployStates({
   const lastArrayPower = new Map();
   const lastGenPower = new Map();
   const computed = new Map(); // ts -> deployStates
+  // Last detected state per device, threaded sample-to-sample so the
+  // detector's hysteresis dead band (sub-threshold positive power holds
+  // the previous state) works across augmented samples too.
+  const previousDeployStates = new Map();
   for (const sample of samples) {
     const navState = sample.navState || lastNav || "unknown";
     if (sample.navState) lastNav = sample.navState;
@@ -1991,8 +2003,12 @@ async function augmentSamplesDeployStates({
         powerW,
         sunUp,
         underway,
+        previousState: previousDeployStates.get(array.id) ?? null,
       });
-      if (state != null) deployStates[array.id] = state;
+      if (state != null) {
+        deployStates[array.id] = state;
+        previousDeployStates.set(array.id, state);
+      }
     }
     for (const gen of generators) {
       if (!gen.deployable) continue;

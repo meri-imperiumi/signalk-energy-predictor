@@ -1558,53 +1558,47 @@ module.exports = (app) => {
           }
         }
       }
+      // Sun elevation gate for the solar 0 W → stowed inference, shared
+      // with the recording and backfill paths (below ~5° a deployed panel
+      // naturally produces ~0 W, so 0 W alone is not evidence of stowing —
+      // including the first minutes after sunrise).
+      let sunUp = false;
+      const livePos = unwrapPosition(
+        deltaState.get("navigation.position") ||
+          app.getSelfPath("navigation.position"),
+      );
+      if (livePos && livePos.latitude != null) {
+        sunUp =
+          sunPosition(new Date(), livePos.latitude, livePos.longitude ?? 0)
+            .altitude > STOW_INFERENCE_MIN_SUN_ALT_RAD;
+      }
       for (const array of getActiveSolarArrays(pluginConfig)) {
-        if (array.deployStatePath) {
-          const val = deltaState.get(array.deployStatePath);
-          const sensorState = normalizeDeployState(val);
-          if (sensorState != null) {
-            currentDeployStates.set(array.id, sensorState);
-            seededDeployStateIds.delete(array.id);
-          }
-        }
-        // For deployable solar arrays, infer from power output during daytime
-        if (array.type === "deployable" && array.powerPath) {
-          const powerVal = toNumber(deltaState.get(array.powerPath));
-          if (powerVal != null && powerVal > 0) {
-            currentDeployStates.set(array.id, "deployed");
-            seededDeployStateIds.delete(array.id);
-          }
-          // No solar output during daytime means array is stowed
-          if (powerVal != null && powerVal === 0) {
-            const pos = unwrapPosition(
-              deltaState.get("navigation.position") ||
-                app.getSelfPath("navigation.position"),
-            );
-            if (pos && pos.latitude != null) {
-              const { sunPosition } = require("./solar.js");
-              const sunPos = sunPosition(
-                new Date(),
-                pos.latitude,
-                pos.longitude ?? 0,
-              );
-              if (sunPos.altitude > 0) {
-                currentDeployStates.set(array.id, "stowed");
-                seededDeployStateIds.delete(array.id);
-              }
-            }
-          }
-        }
-        // FLINsail stowed when underway ONLY if not producing power.
-        // A deployable panel that is outputting watts IS deployed — the
-        // owner may motor 150 m to a fuel dock with panels up. Only when
-        // there is no power evidence do we infer stowed from being underway.
-        if (array.type === "deployable" && underway) {
+        // For deployable solar arrays, infer via the shared detector.
+        // Power evidence is window-averaged (the same 5-minute average
+        // the generators use): on an overcast morning an array's output
+        // hovers around zero, and the instantaneous reading flaps the
+        // detected state between deployed and stowed on every sample.
+        // The detector's dead band holds the previous state for
+        // sub-threshold positive output.
+        if (array.type === "deployable") {
           const powerVal =
             array.powerPath != null
-              ? toNumber(deltaState.get(array.powerPath))
+              ? (averagedPowerW(array.powerPath) ??
+                toNumber(deltaState.get(array.powerPath)))
               : null;
-          if (!(powerVal != null && powerVal > 0)) {
-            currentDeployStates.set(array.id, "stowed");
+          const state = detectSolarArrayState(array, {
+            powerW: powerVal,
+            deployStateRaw:
+              array.deployStatePath != null
+                ? deltaState.get(array.deployStatePath) ||
+                  app.getSelfPath(array.deployStatePath)
+                : null,
+            sunUp,
+            underway,
+            previousState: currentDeployStates.get(array.id) ?? null,
+          });
+          if (state != null) {
+            currentDeployStates.set(array.id, state);
             seededDeployStateIds.delete(array.id);
           }
         }
@@ -2826,6 +2820,7 @@ module.exports = (app) => {
         deployStateRaw,
         sunUp,
         underway,
+        previousState: lastKnownDeployStates.get(array.id) ?? null,
       });
       if (state != null) {
         deployStates[array.id] = state;

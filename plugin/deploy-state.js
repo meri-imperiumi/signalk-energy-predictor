@@ -3,9 +3,11 @@
  * generators.
  *
  * The state is inferred from power output and ambient conditions (wind,
- * sun, boat speed, nav state):
- *  - Deployable solar: power > 0 → deployed; 0 W in daytime → stowed;
- *    underway → stowed.
+ * sun, boat speed, nav state), with hysteresis on the power evidence:
+ *  - Deployable solar: power above a capacity-scaled confirm threshold →
+ *    deployed; sub-threshold positive power → hold the previous state
+ *    (quantization noise in low irradiance must not flap the state);
+ *    0 W in daytime → stowed; underway → stowed.
  *  - Wind generator: power > 0 → deployed; 0 W with wind ≥ startup → stowed;
  *    underway → stowed.
  *  - Hydro generator: not sailing → stowed; sailing ≥ minSpeed with 0 W →
@@ -27,6 +29,48 @@
  * so 0 W alone is not evidence of stowing. ~5°.
  */
 const STOW_INFERENCE_MIN_SUN_ALT_RAD = (5 * Math.PI) / 180;
+
+/**
+ * Fraction of an array's nameplate capacity that confirms deployment.
+ * See `deployConfirmThresholdW`.
+ */
+const DEPLOY_CONFIRM_FRACTION = 0.005;
+
+/** Lower/upper clamp (W) for the deploy-confirm threshold. */
+const DEPLOY_CONFIRM_MIN_W = 1;
+const DEPLOY_CONFIRM_MAX_W = 5;
+
+/**
+ * Power (W) that a deployable array must produce before a stowed→deployed
+ * transition is confirmed. Positive output below this threshold is treated
+ * as ambiguous (the dead band of the hysteresis): in low-irradiance
+ * conditions — overcast, rain, just after sunrise — a deployed panel's
+ * output hovers around zero, flickering between 0 W and fractions of a
+ * watt that differ only by quantization noise. Reading such flicker as
+ * "deployed" on every positive sample flaps the detected state (multiple
+ * deploy/stow detections over one rainy morning in the wild). The dead
+ * band holds the previous state instead; 0 W with the sun up still
+ * confirms stowed, and only real output above the threshold confirms
+ * deployed.
+ *
+ * The threshold scales with the array's nameplate capacity (0.5%, clamped
+ * to 1–5 W) so it stays noise-level for a small tilting panel and remains
+ * well under genuine dawn output for a large sail.
+ *
+ * @param {object} array - Solar array config (capacityWp optional)
+ * @returns {number} Confirm threshold in watts
+ */
+function deployConfirmThresholdW(array) {
+  const cap =
+    typeof array?.capacityWp === "number" && array.capacityWp > 0
+      ? array.capacityWp
+      : null;
+  if (cap == null) return DEPLOY_CONFIRM_MIN_W;
+  return Math.min(
+    DEPLOY_CONFIRM_MAX_W,
+    Math.max(DEPLOY_CONFIRM_MIN_W, cap * DEPLOY_CONFIRM_FRACTION),
+  );
+}
 
 /**
  * Normalises a raw deploy-state sensor value to "deployed"/"stowed"/null.
@@ -60,6 +104,9 @@ function normalizeDeployState(val) {
  *        low sun angles a deployed panel naturally produces ~0 W, so 0 W
  *        alone is not evidence of stowing.
  * @param {boolean} [ctx.underway] - Whether the vessel is under way
+ * @param {string|null} [ctx.previousState] - Last known state for this
+ *        array ("deployed"/"stowed"); sub-threshold positive power holds
+ *        it instead of flipping the state (hysteresis dead band)
  * @returns {"deployed"|"stowed"|null} Inferred state, or null if unknown
  */
 function detectSolarArrayState(array, ctx) {
@@ -67,12 +114,24 @@ function detectSolarArrayState(array, ctx) {
   const sensor = normalizeDeployState(ctx.deployStateRaw);
   if (sensor != null) return sensor;
   const { powerW, sunUp, underway } = ctx;
-  // Power output is ground truth: a panel producing watts IS deployed,
-  // regardless of nav state. The underway inference only applies when
-  // there is no power evidence (0 W) — then we assume the panel was
+  const previousState =
+    ctx.previousState === "deployed" || ctx.previousState === "stowed"
+      ? ctx.previousState
+      : null;
+  // Power output is ground truth: a panel producing real watts IS
+  // deployed, regardless of nav state. The underway inference only applies
+  // when there is no power evidence (0 W) — then we assume the panel was
   // stowed because the boat was moving and the owner would have stowed
   // it for the passage.
-  if (powerW != null && powerW > 0) return "deployed";
+  if (powerW != null && powerW > deployConfirmThresholdW(array)) {
+    return "deployed";
+  }
+  // Hysteresis dead band: positive but sub-threshold output is ambiguous
+  // in low irradiance (overcast dawn flicker around 0 W). Hold the last
+  // known state rather than flapping between deployed and stowed.
+  if (powerW != null && powerW > 0) {
+    return previousState;
+  }
   if (underway) return "stowed";
   // 0 W with the sun high enough to produce power means the panel is
   // stowed. At low sun angles (near sunrise/sunset) a deployed panel
@@ -162,5 +221,6 @@ module.exports = {
   detectSolarArrayState,
   detectGeneratorState,
   carryForwardStates,
+  deployConfirmThresholdW,
   STOW_INFERENCE_MIN_SUN_ALT_RAD,
 };
