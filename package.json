@@ -27,7 +27,7 @@
   "signalk-plugin-enabled-by-default": false,
   "signalk": {
     "displayName": "Energy Predictor",
-    "appIcon": "./icon.png",
+    "appIcon": "./icon-256.png",
     "screenshots": [
       "./doc/webapp-day.png",
       "./doc/webapp-future.png",
