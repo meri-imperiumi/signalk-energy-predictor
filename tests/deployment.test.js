@@ -2174,18 +2174,19 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
     }
   });
 
-  test("pointing reason renders sunrise in solar-local time, not UTC/host", () => {
+  test("pointing reason renders sunrise in ship's time, not UTC/host", () => {
     // Regression: the "sun rises HH:MM" in the pointing reason used to
     // render in the server's host timezone (toLocaleTimeString), which on
-    // a UTC-locked marine box shows UTC. It must render in solar-local
-    // time derived from the vessel's longitude, matching the surplus /
-    // engine-run notification windows.
+    // a UTC-locked marine box shows UTC. It must render in ship's time —
+    // the onboard timezone published as `environment.time.timezoneOffset`
+    // — matching the surplus / engine-run notification windows.
     const app = makeFakeApp();
-    // lon 18°E → solar offset round(18/15*60) = +72 min = +01:12
     app.setSelfPath("navigation.position", {
       latitude: 60,
       longitude: 18,
     });
+    // Onboard UTC+01:12 → (-)hhmm encoding 112 → +72 min
+    app.setSelfPath("environment.time.timezoneOffset", 112);
     app.setSelfPath("navigation.headingTrue", 5.28);
     app.setSelfPath("navigation.state", "anchored");
 
@@ -2222,11 +2223,11 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
       const recs = engine.getDeploymentRecommendations();
       const rec = recs.find((r) => r.id === "flinsail");
       assert.ok(rec, "deployable recommendation present");
-      // Resolve the sunrise the engine used and compute its solar-local
-      // rendering at lon 18°E (+72 min) and its host-timezone rendering.
+      // Resolve the sunrise the engine used and render it in ship's time
+      // at the published +72 min offset, and its host-timezone rendering.
       const sunrise = nextSunrise(now, 60, 18);
       assert.ok(sunrise, "sunrise resolves");
-      const offsetMin = Math.round((18 / 15) * 60);
+      const offsetMin = 72;
       const solarHHMM = new Date(sunrise.getTime() + offsetMin * 60 * 1000);
       const solar = `${String(solarHHMM.getUTCHours()).padStart(2, "0")}:${String(
         solarHHMM.getUTCMinutes(),
@@ -2236,13 +2237,13 @@ test.describe("FLINsail pointing recommendation (port/starboard)", () => {
         minute: "2-digit",
         hour12: false,
       });
-      // The reason must carry the solar-local sunrise time.
+      // The reason must carry the ship's-time sunrise time.
       assert.ok(
         rec.reason.includes(solar),
-        `reason "${rec.reason}" should contain solar-local sunrise ${solar}`,
+        `reason "${rec.reason}" should contain ship's-time sunrise ${solar}`,
       );
       // And it must NOT be the host-timezone rendering when the two differ
-      // (i.e. on a UTC-locked server the reason shows solar-local, not UTC).
+      // (i.e. on a UTC-locked server the reason shows ship's time, not UTC).
       if (host !== solar) {
         assert.ok(
           !rec.reason.includes(`${host}`),

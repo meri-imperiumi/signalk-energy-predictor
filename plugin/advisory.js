@@ -10,7 +10,6 @@
 
 const {
   formatWh,
-  solarOffsetMinutesFromLongitude,
   formatLocalHHMM,
   formatLocalMonthDay,
 } = require("./format.js");
@@ -64,10 +63,9 @@ const NOTIFICATIONS_BASE = "notifications.electrical.energy";
  */
 const DEBOUNCE_MS = 5 * 60 * 1000; // 5 minutes
 
-// solarOffsetMinutesFromLongitude, formatLocalHHMM and formatLocalMonthDay
-// live in ./format.js (shared with the prediction engine, which builds the
-// deployment reason strings that end up in these notifications). Re-exported
-// below for existing callers.
+// formatLocalHHMM and formatLocalMonthDay live in ./format.js (shared
+// with the prediction engine, which builds the deployment reason strings
+// that end up in these notifications).
 
 /**
  * Formats a surplus-window endpoint as `HH:MM`, adding a day marker when
@@ -76,12 +74,14 @@ const DEBOUNCE_MS = 5 * 60 * 1000; // 5 minutes
  * `14:46-16:46` (which reads as a 2h same-day span).
  *
  * When `offsetMinutes` is null the host's own timezone is used (legacy
- * behaviour); when provided, times render in solar-local time derived from
- * the vessel's longitude, independent of the server's clock setting.
+ * behaviour); when provided, times render in ship's time (the onboard
+ * timezone published as `environment.time.timezoneOffset` by
+ * @meri-imperiumi/signalk-ships-time), independent of the server's clock
+ * setting.
  *
  * @param {Date} when - Endpoint to format
  * @param {Date} [start] - Window start, to detect a day rollover
- * @param {number|null} [offsetMinutes=null] - Solar-local UTC offset in min
+ * @param {number|null} [offsetMinutes=null] - Ship's-time UTC offset in min
  * @returns {string}
  */
 function formatWindowTime(when, start, offsetMinutes = null) {
@@ -109,8 +109,8 @@ function formatWindowTime(when, start, offsetMinutes = null) {
   if (start == null) {
     return hm;
   }
-  // Compare local calendar days (not UTC) so a window crossing solar
-  // midnight is flagged regardless of the absolute longitude.
+  // Compare local calendar days (not UTC) so a window crossing local
+  // (ship's) midnight is flagged regardless of the offset.
   const startDay = formatLocalMonthDay(start, offsetMinutes);
   const whenDay = formatLocalMonthDay(when, offsetMinutes);
   if (whenDay === startDay) {
@@ -989,7 +989,7 @@ class AdvisoryPublisher {
    * @param {boolean} [opts.isUnderway=false] - Whether the vessel is
    *        under way (at-rest + night holds low-urgency "run the genset"
    *        suggestions for the morning; battery alarm/high always emit)
-   * @param {number|null} [opts.localOffsetMinutes=null] - Solar-local UTC
+   * @param {number|null} [opts.localOffsetMinutes=null] - Ship's-time UTC
    *        offset (min) for human-facing times; null uses host timezone
    * @param {object} [opts.urgencyConfig] - Urgency config override
    * @returns {void}
@@ -1140,7 +1140,7 @@ class AdvisoryPublisher {
    * @param {object} [opts]
    * @param {boolean} [opts.isNight=false] - Whether it is currently nighttime
    * @param {boolean} [opts.isUnderway=false] - Whether the vessel is under way
-   * @param {number|null} [opts.localOffsetMinutes=null] - Solar-local UTC
+   * @param {number|null} [opts.localOffsetMinutes=null] - Ship's-time UTC
    *        offset (min) for human-facing times; null uses host timezone
    * @param {object} [opts.urgencyConfig] - Urgency config override
    * @returns {void}
@@ -1225,7 +1225,7 @@ class AdvisoryPublisher {
    *        Baseline"), or null when no forecast is available
    * @param {number} [params.validHours=0] - Hours the current forecast
    *        actually covers (the prediction's effective horizon)
-   * @param {number|null} [params.localOffsetMinutes=null] - Solar-local UTC
+   * @param {number|null} [params.localOffsetMinutes=null] - Ship's-time UTC
    *        offset (min) for human-facing times; null uses host timezone
    * @param {object} [params.urgencyConfig] - Urgency config override
    * @returns {void}
@@ -1339,6 +1339,5 @@ module.exports = {
   severityRatioFor,
   hoursUntil,
   isActualCondition,
-  solarOffsetMinutesFromLongitude,
   formatWindowTime,
 };

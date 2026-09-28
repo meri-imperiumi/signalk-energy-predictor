@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **All user-facing times now render in ship's time from
+  `environment.time.timezoneOffset` instead of a longitude-derived
+  solar-local offset.** The new `@meri-imperiumi/signalk-ships-time`
+  plugin (added to `signalk.requires`) publishes the onboard timezone in
+  the `(-)hhmm` encoding of the Signal K `environment.json` schema, and
+  the energy predictor consumes it everywhere it previously derived a
+  stand-in offset from the vessel's longitude: advisory and recorded
+  notification window times (`formatWindowTime`), deployment pointing
+  reason sunrise times, the advisory dedup's local calendar day keying in
+  `/api/deploy-states`, and the webapp's window selector, chart axis,
+  tooltips and Events list. The longitude-derived calculations are
+  removed (`solarOffsetMinutesFromLongitude`, the recorded-samples
+  variant in the API, and the webapp's mirror of them); the webapp time
+  module is renamed `ep-ship-time.js` with `ship*` day arithmetic
+  helpers, `/api/vessel` now returns `timezoneOffsetMinutes`, and
+  `setSolarOffsetMinutes` becomes `setTimezoneOffsetMinutes`. When the
+  ships-time plugin is absent or has not published yet, behaviour falls
+  back as before: host timezone for notification text, browser timezone
+  for the webapp, UTC for the sunrise reason string.
+
 ### Fixed
 - **Deployable solar deploy/stow detection no longer flaps in low
   irradiance** (`plugin/deploy-state.js`, `plugin/index.js`,

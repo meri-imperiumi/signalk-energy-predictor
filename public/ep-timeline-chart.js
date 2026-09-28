@@ -9,9 +9,9 @@
  * Legend toggles and enabled-series state persist in localStorage.
  *
  * All user-facing times (axis labels, tooltip, day bucketing) render in
- * the vessel's solar-local frame (offset from `/api/vessel`) so the chart
+ * the vessel's ship's-time frame (offset from `/api/vessel`) so the chart
  * agrees with the window selector and the Events list — a surplus at
- * solar 14:12 shows as 14:12 everywhere, not shifted by the browser's
+ * ship's 14:12 shows as 14:12 everywhere, not shifted by the browser's
  * civil timezone.
  */
 
@@ -19,9 +19,9 @@ import {
   formatDayMonth,
   formatHHMM,
   formatShortDateTime,
-  solarDayKey,
-  solarDayStart,
-} from "./ep-solar-time.js";
+  shipDayKey,
+  shipDayStart,
+} from "./ep-ship-time.js";
 
 /** Chart drawing area size */
 const WIDTH = 1000;
@@ -188,31 +188,31 @@ const PERIOD_SERIES = [
 ];
 
 /**
- * Solar-local UTC offset (minutes, east positive) for rendering axis
+ * Ship's-time UTC offset (minutes, east positive) for rendering axis
  * labels, tooltips and day buckets in the crew's frame. Set by the app
  * from `/api/vessel`; null = use the browser timezone (fallback).
  */
-let solarOffsetMinutes = null;
+let timezoneOffsetMinutes = null;
 
 /**
- * Local calendar key (YYYY-MM-DD) for a timestamp — the solar-local
- * sun-day, used for daily bucketing and bar labels so a sun-day
- * straddling UTC midnight stays in one bucket.
+ * Local calendar key (YYYY-MM-DD) for a timestamp — the ship's-time
+ * day, used for daily bucketing and bar labels so a day straddling UTC
+ * midnight stays in one bucket.
  * @param {number} t - epoch ms
  * @returns {string}
  */
 function localDayKey(t) {
-  return solarDayKey(t, solarOffsetMinutes);
+  return shipDayKey(t, timezoneOffsetMinutes);
 }
 
 /**
- * Local midnight (epoch ms) for a YYYY-MM-DD key — solar-local midnight
+ * Local midnight (epoch ms) for a YYYY-MM-DD key — ship's-time midnight
  * when the offset is known, browser-local midnight otherwise.
  * @param {string} day
  * @returns {number}
  */
 function localDayStart(day) {
-  return solarDayStart(day, solarOffsetMinutes);
+  return shipDayStart(day, timezoneOffsetMinutes);
 }
 
 class EpTimelineChart extends HTMLElement {
@@ -250,14 +250,14 @@ class EpTimelineChart extends HTMLElement {
   }
 
   /**
-   * Sets the vessel's solar-local UTC offset (from `/api/vessel`) and
+   * Sets the vessel's ship's-time UTC offset (from `/api/vessel`) and
    * re-renders so axis labels, tooltips and day buckets move to the
-   * solar-local frame. No-op when unchanged.
+   * ship's-time frame. No-op when unchanged.
    * @param {number|null} offsetMinutes
    */
-  setSolarOffsetMinutes(offsetMinutes) {
-    if (offsetMinutes === solarOffsetMinutes) return;
-    solarOffsetMinutes = offsetMinutes;
+  setTimezoneOffsetMinutes(offsetMinutes) {
+    if (offsetMinutes === timezoneOffsetMinutes) return;
+    timezoneOffsetMinutes = offsetMinutes;
     if (this.isConnected) this.render();
   }
 
@@ -801,8 +801,8 @@ class EpTimelineChart extends HTMLElement {
         "text-anchor": "middle",
       });
       label.textContent = isDay
-        ? formatHHMM(t, solarOffsetMinutes)
-        : formatDayMonth(t, solarOffsetMinutes);
+        ? formatHHMM(t, timezoneOffsetMinutes)
+        : formatDayMonth(t, timezoneOffsetMinutes);
       svg.appendChild(label);
     }
 
@@ -1006,7 +1006,7 @@ class EpTimelineChart extends HTMLElement {
 
     const timeEl = document.createElement("div");
     timeEl.className = "time";
-    timeEl.textContent = formatShortDateTime(nearest.t, solarOffsetMinutes);
+    timeEl.textContent = formatShortDateTime(nearest.t, timezoneOffsetMinutes);
     this.tooltip.replaceChildren(timeEl);
     for (const d of this.seriesDefs) {
       if (!this.isEnabled(d.id)) continue;

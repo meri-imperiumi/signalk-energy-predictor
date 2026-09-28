@@ -207,10 +207,10 @@
       "Vessel": {
         "type": "object",
         "properties": {
-          "solarOffsetMinutes": {
+          "timezoneOffsetMinutes": {
             "type": "integer",
             "nullable": true,
-            "description": "Solar-local UTC offset in minutes (east positive), derived from the vessel's longitude. Null when the position is unknown."
+            "description": "Vessel onboard timezone (ship's time) UTC offset in minutes (east positive), from the `environment.time.timezoneOffset` path published by @meri-imperiumi/signalk-ships-time. Null when unpublished (ships-time plugin absent)."
           }
         }
       },

@@ -17,7 +17,7 @@
  *    surplus window or a needed engine run.
  */
 
-import { formatShortDateTime } from "./ep-solar-time.js";
+import { formatShortDateTime } from "./ep-ship-time.js";
 
 const API_BASE = "/plugins/signalk-energy-predictor";
 
@@ -50,18 +50,18 @@ class EpActionsList extends HTMLElement {
     super();
     /** @type {{detected: object[], recommendations: object[], advisories: object[]}|null} */
     this._data = null;
-    /** @type {number|null} Solar-local UTC offset (min, east positive)
+    /** @type {number|null} Ship's-time UTC offset (min, east positive)
      *  from `/api/vessel`; null = browser timezone (fallback). */
-    this.solarOffsetMinutes = null;
+    this.timezoneOffsetMinutes = null;
   }
 
   /**
-   * Sets the vessel's solar-local UTC offset (from `/api/vessel`) and
-   * re-renders so event times move to the solar-local frame.
+   * Sets the vessel's ship's-time UTC offset (from `/api/vessel`) and
+   * re-renders so event times move to the ship's-time frame.
    * @param {number|null} offsetMinutes
    */
-  setSolarOffsetMinutes(offsetMinutes) {
-    this.solarOffsetMinutes = offsetMinutes;
+  setTimezoneOffsetMinutes(offsetMinutes) {
+    this.timezoneOffsetMinutes = offsetMinutes;
     if (this.isConnected) this.render();
   }
 
@@ -139,7 +139,7 @@ class EpActionsList extends HTMLElement {
       const time = new Date(ev.time);
       const timeStr = formatShortDateTime(
         time.getTime(),
-        this.solarOffsetMinutes,
+        this.timezoneOffsetMinutes,
       );
       // Pseudo-console row: timestamp | message | status bracket
       const timeEl = document.createElement("span");
@@ -179,7 +179,7 @@ class EpActionsList extends HTMLElement {
         // read as a live current opportunity
         const fa = formatShortDateTime(
           new Date(ev.forecastAt).getTime(),
-          this.solarOffsetMinutes,
+          this.timezoneOffsetMinutes,
         );
         const note = document.createElement("span");
         note.className = "ep-action-reason";

@@ -5,33 +5,34 @@
  */
 
 /**
- * Derives a solar-local UTC offset (minutes, east positive) from a
- * longitude. The crew experiences time relative to the sun, not the
- * server's or browser's civil timezone, and a vessel's civil zone (if set
- * at all) can lag the sun by up to an hour on a schedule the predictor
- * doesn't control. Longitude-derived solar-local is used as a stand-in
- * until Signal K exposes a vessel timezone / ship's-time offset.
+ * Parses the `(-)hhmm` encoding the Signal K `environment.json` schema
+ * uses for `environment.time.timezoneOffset` into a UTC offset in
+ * minutes east of UTC: 200 -> 120, -930 -> -570, 0 -> 0. This is the
+ * ship's time published by `@meri-imperiumi/signalk-ships-time` — the
+ * timezone the crew's clocks aboard keep — not the server's or browser's
+ * civil zone.
  *
- * Rounded to the nearest whole minute so 25.0°E -> +01:40 exactly and a
- * vessel drifting a few hundred metres doesn't churn the rendered time.
- *
- * @param {number|null|undefined} longitude - Longitude in degrees, or
- *        null/NaN when the position is unknown
- * @returns {number|null} Offset in minutes, or null (no position)
+ * @param {number|string|null|undefined} hhmm - Offset in `(-)hhmm`
+ *        encoding, or null/NaN when unpublished
+ * @returns {number|null} Offset in minutes, or null (no value)
  */
-function solarOffsetMinutesFromLongitude(longitude) {
-  if (longitude == null || Number.isNaN(longitude)) return null;
-  return Math.round((longitude / 15) * 60);
+function offsetMinutesFromHhmm(hhmm) {
+  if (hhmm == null || hhmm === "") return null;
+  const encoded = Number(hhmm);
+  if (Number.isNaN(encoded)) return null;
+  const sign = encoded < 0 ? -1 : 1;
+  const abs = Math.abs(Math.round(encoded));
+  return sign * (Math.floor(abs / 100) * 60 + (abs % 100));
 }
 
 /**
- * Formats a `Date` as `HH:MM` (24h) in solar-local time given a UTC offset
- * in minutes, using UTC getters against the shifted instant. This avoids
- * any dependency on the host's `Intl` timezone database (which on a
- * UTC-locked marine server would otherwise render everything in UTC).
+ * Formats a `Date` as `HH:MM` (24h) in ship's time given a UTC offset in
+ * minutes, using UTC getters against the shifted instant. This avoids any
+ * dependency on the host's `Intl` timezone database (which on a UTC-locked
+ * marine server would otherwise render everything in UTC).
  *
  * @param {Date|number} when - Instant to format
- * @param {number} [offsetMinutes=0] - Solar-local offset from UTC in minutes
+ * @param {number} [offsetMinutes=0] - Ship's-time offset from UTC in minutes
  * @returns {string}
  */
 function formatLocalHHMM(when, offsetMinutes = 0) {
@@ -43,10 +44,10 @@ function formatLocalHHMM(when, offsetMinutes = 0) {
 }
 
 /**
- * Formats a `Date`'s local calendar day as `Mon D` in solar-local time.
+ * Formats a `Date`'s local calendar day as `Mon D` in ship's time.
  *
  * @param {Date|number} when - Instant to format
- * @param {number} [offsetMinutes=0] - Solar-local offset from UTC in minutes
+ * @param {number} [offsetMinutes=0] - Ship's-time offset from UTC in minutes
  * @returns {string}
  */
 function formatLocalMonthDay(when, offsetMinutes = 0) {
@@ -76,7 +77,7 @@ function formatWh(wh) {
 
 module.exports = {
   formatWh,
-  solarOffsetMinutesFromLongitude,
+  offsetMinutesFromHhmm,
   formatLocalHHMM,
   formatLocalMonthDay,
 };

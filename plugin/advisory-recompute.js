@@ -306,7 +306,7 @@ function recomputeStowage(forecast, opts = {}) {
  * @param {object} [opts.combustion={}] - Per-tier run-discipline settings
  * @param {{latitude: number, longitude: number}|null} [opts.position] - Vessel position
  * @param {boolean} [opts.underway=false] - Under way (disables surplus night gate)
- * @param {number|null} [opts.localOffsetMinutes=null] - Solar-local UTC offset
+ * @param {number|null} [opts.localOffsetMinutes=null] - Ship's-time UTC offset
  * @param {Array<{name: string, watts: number}>} [opts.opportunisticLoads=[]]
  * @returns {Array<object>} Advisories in the recorded shape
  */

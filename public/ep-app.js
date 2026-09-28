@@ -90,7 +90,7 @@ class EpApp extends HTMLElement {
     /** @type {HTMLElement} */
     this.selectorEl = selector;
     /** @type {number|null} */
-    this.solarOffsetMinutes = null;
+    this.timezoneOffsetMinutes = null;
 
     selector.addEventListener("ep-window-change", (e) => {
       this.onWindowChange(e.detail);
@@ -99,8 +99,8 @@ class EpApp extends HTMLElement {
     // Auto-refresh when a new prediction cycle is published; the same
     // stream drives day/night theme reactivity (environment.mode) and the
     // header's connection indicator. Each cycle also re-tracks the
-    // vessel's solar-local frame (see onLiveCycle): the offset follows
-    // the boat's longitude, and the live day window rolls over at solar
+    // vessel's ship's-time frame (see onLiveCycle): the offset follows the
+    // onboard timezone, and the live day window rolls over at ship's-time
     // midnight instead of showing yesterday on a long-lived session.
     this.stream = new SignalKStream({
       onCycle: () => this.onLiveCycle(),
@@ -109,12 +109,12 @@ class EpApp extends HTMLElement {
     });
     this.stream.connect();
 
-    // Initial load with selector defaults (restored prefs). The solar
+    // Initial load with selector defaults (restored prefs). The ship's-time
     // offset is fetched from /api/vessel and pushed to the selector (so the
-    // day/week/month window anchors on the vessel's solar-local midnight),
+    // day/week/month window anchors on the vessel's ship's-time midnight),
     // the chart (axis labels, tooltips, day buckets) and the Events list
     // (event times) — so every user-facing time renders in the crew's
-    // solar-local frame, agreeing with the advisory dedup's sun-day.
+    // ship's-time frame, agreeing with the advisory dedup's local day.
     const spec = selector.windowSpec();
     this.mode = spec.mode;
     this.lastSpec = spec;
@@ -158,13 +158,12 @@ class EpApp extends HTMLElement {
   /**
    * A prediction cycle landed on a live session. Besides refreshing the
    * current window, this is the hook that keeps the webapp in the crew's
-   * *current* solar-local frame:
+   * *current* ship's-time frame:
    *
-   * - the longitude-derived offset is re-fetched, so a date-line
-   *   crossing (offset flips ~24h, the crew's calendar date jumps a day)
-   *   moves the sun-day the window anchors on instead of leaving the
-   *   webapp rendering one day behind in the pre-crossing frame
-   * - the live day window rolls over at solar midnight
+   * - the onboard timezone offset is re-fetched, so a zone crossing or a
+   *   manual clock change moves the day the window anchors on instead of
+   *   leaving the webapp rendering in the previous frame
+   * - the live day window rolls over at ship's-time midnight
    *
    * When either re-anchoring fired, the selector re-emitted a window
    * change and the refresh already ran — skip the duplicate.
@@ -182,12 +181,13 @@ class EpApp extends HTMLElement {
   }
 
   /**
-   * Fetches the vessel meta (`/api/vessel`) and applies the solar-local
+   * Fetches the vessel meta (`/api/vessel`) and applies the ship's-time
    * UTC offset to the selector, chart and Events list. Called on load and
-   * on every prediction cycle — the offset tracks the vessel's longitude
-   * as it moves, so it must not be cached for the session. A failed fetch
-   * keeps the last known offset (or the browser-timezone fallback) and
-   * retries on the next cycle.
+   * on every prediction cycle — the offset follows the onboard timezone
+   * (updated by @meri-imperiumi/signalk-ships-time on zone crossings), so
+   * it must not be cached for the session. A failed fetch keeps the last
+   * known offset (or the browser-timezone fallback) and retries on the
+   * next cycle.
    * @returns {Promise<boolean>} whether the offset changed and was applied
    */
   async refreshVesselMeta() {
@@ -205,30 +205,30 @@ class EpApp extends HTMLElement {
       return false;
     }
     const offset =
-      body && typeof body.solarOffsetMinutes === "number"
-        ? body.solarOffsetMinutes
+      body && typeof body.timezoneOffsetMinutes === "number"
+        ? body.timezoneOffsetMinutes
         : null;
-    return this.applySolarOffset(offset);
+    return this.applyTimezoneOffset(offset);
   }
 
   /**
-   * Pushes the vessel's solar-local UTC offset (from `/api/vessel`) to
+   * Pushes the vessel's ship's-time UTC offset (from `/api/vessel`) to
    * the selector, chart and Events list so every user-facing time renders
-   * in the crew's solar-local frame. The selector re-emits a window-change
-   * (re-anchored on the vessel's solar-local midnight — or, when following
-   * the live day, on the sun-day containing now under the new offset),
+   * in the crew's ship's-time frame. The selector re-emits a window-change
+   * (re-anchored on the vessel's ship's-time midnight — or, when following
+   * the live day, on the day containing now under the new offset),
    * which triggers a refresh; the chart and Events list re-render with
    * the new offset. Stored so later refreshes (live cycle stream) keep
    * using it.
    * @param {number|null} offsetMinutes
    * @returns {boolean} whether the offset changed and was applied
    */
-  applySolarOffset(offsetMinutes) {
-    if (offsetMinutes === this.solarOffsetMinutes) return false;
-    this.solarOffsetMinutes = offsetMinutes;
-    this.chartEl.setSolarOffsetMinutes?.(offsetMinutes);
-    this.actionsEl.setSolarOffsetMinutes?.(offsetMinutes);
-    this.selectorEl.setSolarOffsetMinutes?.(offsetMinutes);
+  applyTimezoneOffset(offsetMinutes) {
+    if (offsetMinutes === this.timezoneOffsetMinutes) return false;
+    this.timezoneOffsetMinutes = offsetMinutes;
+    this.chartEl.setTimezoneOffsetMinutes?.(offsetMinutes);
+    this.actionsEl.setTimezoneOffsetMinutes?.(offsetMinutes);
+    this.selectorEl.setTimezoneOffsetMinutes?.(offsetMinutes);
     return true;
   }
 

@@ -620,6 +620,62 @@ test.describe("Signal K API interactions", () => {
     await plugin.stop();
   });
 
+  test("ships-time offset is read from the delta stream and the self path", async () => {
+    const app = new FakeSignalKApp();
+    const plugin = makePlugin(app);
+
+    const config = {
+      battery: {
+        capacityAh: 400,
+        systemVoltage: 12,
+        minSafeSoC: 0.2,
+      },
+      solarArrays: [
+        {
+          id: "cabin-roof",
+          type: "fixed",
+          capacityWp: 200,
+          enabled: true,
+        },
+      ],
+      mechanicalGenerators: [],
+      weather: {
+        openMeteoEnabled: false,
+        useLogbook: false,
+      },
+    };
+
+    app.dataPath = tempDir;
+    await plugin.start(config, () => {});
+
+    const internals = plugin.__getInternals();
+
+    // Nothing published yet (ships-time plugin absent): null → host-timezone
+    // fallback for human-facing times.
+    assert.strictEqual(internals.shipsTimeOffsetMinutes(), null);
+
+    // A wrapped value from the server's self path (no delta seen yet) is
+    // parsed from the (-)hhmm encoding: 200 = +02:00 → 120 min.
+    app.setSelfPath("environment.time.timezoneOffset", 200);
+    assert.strictEqual(internals.shipsTimeOffsetMinutes(), 120);
+
+    // The live delta stream wins over the self path once it delivers an
+    // update — including a sub-hour west zone: -930 = -09:30 → -570 min.
+    app.subscriptionmanager.subscriptions.forEach(({ deltaHandler }) => {
+      deltaHandler({
+        context: app.selfId,
+        updates: [
+          {
+            values: [{ path: "environment.time.timezoneOffset", value: -930 }],
+          },
+        ],
+      });
+    });
+    assert.strictEqual(internals.shipsTimeOffsetMinutes(), -570);
+
+    await plugin.stop();
+  });
+
   test("navigation.state carries forward across empty delta updates", async () => {
     // navigation.state is a sticky state: a later delta emitting an empty
     // value (some providers emit "" when the source drops out) must not

@@ -15,6 +15,8 @@
  * @file api.js
  */
 
+const { offsetMinutesFromHhmm } = require("./format.js");
+
 /**
  * Maximum query window length in days (bounds file scans).
  */
@@ -36,39 +38,21 @@ const MS_PER_HOUR = 3600000;
 /** Milliseconds per day */
 const MS_PER_DAY = 24 * MS_PER_HOUR;
 
-/** @returns {number} Solar-local UTC offset in minutes from a longitude. */
-const solarOffsetMinutesFromLongitude = (longitude) => {
-  if (longitude == null || Number.isNaN(longitude)) return null;
-  return Math.round((longitude / 15) * 60);
-};
-
 /**
- * Derives the vessel's solar-local UTC offset (minutes) from recorded
- * sample positions, taking the most recent in-window sample with a
- * usable longitude. Used to key advisory dedup on the solar-local calendar
- * day (sun-day) rather than UTC, so a surplus window straddling the UTC
- * midnight boundary doesn't split into two events.
- * @param {object[]} samples - Recorded sample records
- * @param {Date} from - Window start
- * @param {Date} to - Window end
- * @returns {number|null} offset in minutes, or null if no position
+ * Reads the vessel's onboard timezone offset (ship's time) as minutes
+ * east of UTC from the `environment.time.timezoneOffset` path published
+ * by @meri-imperiumi/signalk-ships-time (in `(-)hhmm` encoding, e.g.
+ * `200` = +02:00, `-930` = -09:30). Returns null when the ships-time
+ * plugin is absent or has not published yet — callers then fall back to
+ * the host timezone (server) or browser timezone (webapp).
+ *
+ * @param {ServerAPI} app - Signal K server API
+ * @returns {number|null} Offset in minutes, or null when unpublished
  */
-function offsetMinutesFromSamples(samples, from, to) {
-  let best = null;
-  let bestMs = -Infinity;
-  for (const s of samples) {
-    const tMs = new Date(s.timestamp).getTime();
-    if (Number.isNaN(tMs) || tMs < from.getTime() || tMs > to.getTime()) {
-      continue;
-    }
-    const lon = s.position?.longitude;
-    if (lon == null || Number.isNaN(lon)) continue;
-    if (tMs > bestMs) {
-      bestMs = tMs;
-      best = lon;
-    }
-  }
-  return solarOffsetMinutesFromLongitude(best);
+function shipsTimeOffsetMinutes(app) {
+  const raw = app.getSelfPath?.("environment.time.timezoneOffset");
+  const value = raw && typeof raw === "object" ? raw.value : raw;
+  return offsetMinutesFromHhmm(value);
 }
 
 /**
@@ -1068,31 +1052,18 @@ function registerApiRoutes(
     res.json(await build(records, sourceTypes, from, to));
   }
 
-  // Vessel meta the webapp needs to render user-facing times in the crew's
-  // solar-local frame (what they experience relative to the sun) rather than
-  // the server's or browser's civil timezone. The solar-local UTC offset is
-  // derived from the vessel's current longitude so the Events list and the
-  // window selector key on the same "sun-day" the advisory dedup uses —
-  // otherwise a surplus the crew lives through "this afternoon" can render
-  // under yesterday or tomorrow depending on the browser timezone. Returns
-  // null when the position is unknown so the client falls back to the
-  // browser timezone.
-  //
-  // Why solar-local and not a civil zone: there is currently no "ship's
-  // time" / on-board local-clock source exposed by Signal K, so longitude-
-  // derived solar-local is a stand-in. If Signal K later exposes a vessel
-  // timezone or an explicit ship's-time offset, this endpoint should return
-  // that instead — the webapp consumes only `solarOffsetMinutes`, so no
-  // client change is needed beyond sourcing the value differently.
+  // Vessel meta the webapp needs to render user-facing times in the
+  // crew's ship's-time frame (the onboard timezone published as
+  // `environment.time.timezoneOffset` by @meri-imperiumi/signalk-ships-time)
+  // rather than the server's or browser's civil timezone. The webapp's
+  // Events list and window selector key on the same ship's-time calendar
+  // day the advisory dedup uses — otherwise a surplus the crew lives
+  // through "this afternoon" can render under yesterday or tomorrow
+  // depending on the browser timezone. Returns null when the offset is
+  // unpublished (ships-time plugin absent) so the client falls back to
+  // the browser timezone.
   router.get("/api/vessel", (_req, res) => {
-    const pos = app.getSelfPath?.("navigation.position");
-    const longitude =
-      pos && typeof pos.value === "object" && pos.value != null
-        ? pos.value.longitude
-        : null;
-    res.json({
-      solarOffsetMinutes: solarOffsetMinutesFromLongitude(longitude),
-    });
+    res.json({ timezoneOffsetMinutes: shipsTimeOffsetMinutes(app) });
   });
 
   router.get("/api/predictions", (req, res) => {
@@ -1187,7 +1158,7 @@ function registerApiRoutes(
       .then(([allSamples, cycles]) =>
         res.json(
           buildDeployStates(allSamples, cycles, from, to, {
-            solarOffsetMinutes: offsetMinutesFromSamples(allSamples, from, to),
+            localOffsetMinutes: shipsTimeOffsetMinutes(app),
           }),
         ),
       )
@@ -1520,14 +1491,17 @@ function buildWindProtectionHistory(records, from, to) {
  * @param {Date} from - Window start
  * @param {Date} to - Window end
  * @param {object} [opts]
- * @param {number|null} [opts.solarOffsetMinutes=null] - Vessel solar-local
- *        UTC offset in minutes; when known, advisory dedup keys on the
- *        solar-local calendar day (sun-day) rather than UTC, so a surplus
- *        window straddling UTC midnight doesn't split into two events.
+ * @param {number|null} [opts.localOffsetMinutes=null] - Vessel ship's-time
+ *        UTC offset in minutes (from `environment.time.timezoneOffset`);
+ *        when known, advisory dedup keys on the ship's-time calendar day
+ *        rather than UTC, so a surplus window straddling UTC midnight
+ *        doesn't split into two events. The current offset is applied to
+ *        the whole window — the ships-time plugin publishes no history,
+ *        so a zone crossing inside the window is not reconstructed.
  * @returns {{window: {from: string, to: string}, detected: object[], recommendations: object[], advisories: object[]}}
  */
 function buildDeployStates(samples, cycles, from, to, opts = {}) {
-  const { solarOffsetMinutes = null } = opts;
+  const { localOffsetMinutes = null } = opts;
   // Detected transitions: carry forward last known state per device across
   // unknown (null/absent) gaps, then emit only state changes. Samples before
   // the window establish the prior state so the first in-window sample doesn't
@@ -1732,7 +1706,7 @@ function buildDeployStates(samples, cycles, from, to, opts = {}) {
   // action time falls within [from, to] are emitted.
   //
   // Staleness: the dedup keeps the newest surviving advisory for its
-  // sun-day, but a later cycle may have run since whose forecast still
+  // local day, but a later cycle may have run since whose forecast still
   // covers that day yet produced no advisory of this type — i.e. the
   // latest forecast overtook it (the crew acted on the surplus and ran
   // loads, the weather changed, …). We keep the historical event — it's
@@ -1744,34 +1718,33 @@ function buildDeployStates(samples, cycles, from, to, opts = {}) {
   // wins; if it covers the day but has no advisory of this type, the
   // prior advisory is marked stale rather than dropped.
   //
-  // The dedup key is the solar-local calendar day of the advisory's
-  // action time (a "sun-day"). There is at most one surplus and one
-  // deficit event per sun-day (the bank hits full-and-curtails once per
-  // charging phase; a deficit advisory is the day's low point), so keying
-  // on the local date collapses the near-duplicates that flood the Events
-  // list otherwise: each cycle's forecast is anchored at its own run
-  // timestamp, so the window start drifts by minutes between consecutive
-  // cycles even though it is the *same* logical event, and a window
-  // straddling UTC midnight would otherwise split into two. Using the
-  // solar-local day (shifted by the vessel's longitude-derived offset)
-  // keeps a single charging phase in one bucket. The newest cycle's
-  // version (cyclesIndexed is oldest→newest, so the last `.set` wins) is
-  // the most accurate forecast.
-  const offsetMs = (solarOffsetMinutes || 0) * 60 * 1000;
-  /** Solar-local sun-day (local-midnight ms) of an advisory action time. */
-  const sunDayOf = (tMs) => new Date(tMs + offsetMs).setUTCHours(0, 0, 0, 0);
-  // typesByDay: sun-day -> Set of advisory types the newest covering cycle
-  // produced for that day. A cycle "covers" a sun-day when its forecast
+  // The dedup key is the ship's-time calendar day of the advisory's
+  // action time. There is at most one surplus and one deficit event per
+  // local day (the bank hits full-and-curtails once per charging phase; a
+  // deficit advisory is the day's low point), so keying on the local date
+  // collapses the near-duplicates that flood the Events list otherwise:
+  // each cycle's forecast is anchored at its own run timestamp, so the
+  // window start drifts by minutes between consecutive cycles even though
+  // it is the *same* logical event, and a window straddling UTC midnight
+  // would otherwise split into two. Using the ship's-time day (shifted by
+  // the onboard timezone offset) keeps a single charging phase in one
+  // bucket. The newest cycle's version (cyclesIndexed is oldest→newest, so
+  // the last `.set` wins) is the most accurate forecast.
+  const offsetMs = (localOffsetMinutes || 0) * 60 * 1000;
+  /** Ship's-time local-midnight ms of an advisory action time. */
+  const localDayOf = (tMs) => new Date(tMs + offsetMs).setUTCHours(0, 0, 0, 0);
+  // typesByDay: local day -> Set of advisory types the newest covering
+  // cycle produced for that day. A cycle "covers" a day when its forecast
   // span [startMs, endMs] intersects that local calendar day.
   /** @param {{startMs: number, endMs: number}} c @param {number} localDateMs */
   const cycleCoversDay = (c, localDateMs) => {
-    // localDateMs is local-midnight start of the sun-day. In UTC ms the
+    // localDateMs is local-midnight start of the day. In UTC ms the
     // day spans [localDateMs - offsetMs, localDateMs + MS_PER_DAY - offsetMs).
     const dayStartUtc = localDateMs - offsetMs;
     const dayEndUtc = dayStartUtc + MS_PER_DAY;
     return c.endMs >= dayStartUtc && c.startMs < dayEndUtc;
   };
-  /** Newest cycle covering a sun-day, or null. cyclesIndexed is oldest→newest. */
+  /** Newest cycle covering a local day, or null. cyclesIndexed is oldest→newest. */
   const newestCoveringDay = (localDateMs) => {
     for (let i = cyclesIndexed.length - 1; i >= 0; i--) {
       if (cycleCoversDay(cyclesIndexed[i], localDateMs))
@@ -1784,7 +1757,7 @@ function buildDeployStates(samples, cycles, from, to, opts = {}) {
     for (const adv of c.advisories || []) {
       const tMs = new Date(adv.time).getTime();
       if (Number.isNaN(tMs)) continue;
-      const localDateMs = sunDayOf(tMs);
+      const localDateMs = localDayOf(tMs);
       const newest = newestCoveringDay(localDateMs);
       // Only the newest covering cycle's types count for staleness; older
       // cycles that also covered the day are superseded.
@@ -1799,7 +1772,7 @@ function buildDeployStates(samples, cycles, from, to, opts = {}) {
     for (const adv of cycle.advisories || []) {
       const tMs = new Date(adv.time).getTime();
       if (Number.isNaN(tMs)) continue;
-      const localDateMs = sunDayOf(tMs);
+      const localDateMs = localDayOf(tMs);
       const key = `${adv.type}|${localDateMs}`;
       advisoriesByKey.set(key, adv);
       forecastAtByKey.set(key, cycle.ts);
@@ -1811,7 +1784,7 @@ function buildDeployStates(samples, cycles, from, to, opts = {}) {
       if (t < fromMs || t > toMs) return null;
       const cycleTs = forecastAtByKey.get(key);
       const localDateMs = Number(key.slice(adv.type.length + 1));
-      // Stale if a newer cycle covers this sun-day but didn't emit this
+      // Stale if a newer cycle covers this local day but didn't emit this
       // advisory type for it — the latest forecast overtook it.
       let stale = false;
       const newest = newestCoveringDay(localDateMs);
@@ -1858,5 +1831,4 @@ module.exports = {
   loadDeployCycles,
   attachForecasts,
   DEFAULT_CYCLE_HORIZON_HOURS,
-  offsetMinutesFromSamples,
 };

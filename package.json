@@ -35,7 +35,8 @@
     ],
     "requires": [
       "@meri-imperiumi/signalk-autostate",
-      "@meri-imperiumi/signalk-internet"
+      "@meri-imperiumi/signalk-internet",
+      "@meri-imperiumi/signalk-ships-time"
     ],
     "recommends": [
       "signalk-venus-plugin",

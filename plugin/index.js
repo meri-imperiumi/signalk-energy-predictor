@@ -35,9 +35,9 @@ const {
 const {
   AdvisoryPublisher,
   AdvisoryType,
-  solarOffsetMinutesFromLongitude,
   formatWindowTime,
 } = require("./advisory.js");
+const { offsetMinutesFromHhmm } = require("./format.js");
 const { StateConfidence } = require("./urgency.js");
 const {
   buildPluginSchema,
@@ -230,7 +230,7 @@ function isInSurplusWindow(window, now = new Date()) {
  * @param {((load: object) => boolean)|null} [opts.isLoadRunning=null] -
  *        Predicate from `AdvisoryPublisher.isLoadRunning`; null treats
  *        all loads as not-running (always suggested)
- * @param {number|null} [opts.localOffsetMinutes=null] - Solar-local UTC
+ * @param {number|null} [opts.localOffsetMinutes=null] - Ship's-time UTC
  *        offset (min) for human-facing times; null uses host timezone
  * @returns {Array<{type: string, time: string, message: string}>}
  */
@@ -385,6 +385,10 @@ const DEFAULT_CONFIG = {
 const SUBSCRIPTION_PATHS = [
   "navigation.state",
   "navigation.position",
+  // Ship's time (onboard timezone offset, (-)hhmm encoding) published by
+  // @meri-imperiumi/signalk-ships-time. Human-facing notification times
+  // and the advisory dedup's local calendar day key on this.
+  "environment.time.timezoneOffset",
   "navigation.headingTrue",
   "navigation.speedThroughWater",
   "navigation.courseOverGroundTrue",
@@ -1449,6 +1453,25 @@ module.exports = (app) => {
   }
 
   /**
+   * Reads the vessel's onboard timezone offset (ship's time) as minutes
+   * east of UTC from the `environment.time.timezoneOffset` path published
+   * by @meri-imperiumi/signalk-ships-time (in `(-)hhmm` encoding, e.g.
+   * `200` = +02:00, `-930` = -09:30). Prefers the live delta stream and
+   * falls back to the server's self path. Returns null when the ships-time
+   * plugin is absent or has not published yet — callers then fall back to
+   * the host timezone for human-facing times.
+   *
+   * @returns {number|null} Offset in minutes, or null when unpublished
+   */
+  function shipsTimeOffsetMinutes() {
+    const raw =
+      deltaState.get("environment.time.timezoneOffset") ??
+      app.getSelfPath("environment.time.timezoneOffset");
+    const value = raw && typeof raw === "object" ? raw.value : raw;
+    return offsetMinutesFromHhmm(value);
+  }
+
+  /**
    * Schedules a background prediction cycle (interval tick, initial delay,
    * GPS/uplink edge triggers) and tracks it so `stop()` can wait for
    * in-flight cycles. Without tracking, a cycle still inside its forecast
@@ -1829,14 +1852,13 @@ module.exports = (app) => {
 
       // Publish all advisories
       app.debug("Publishing advisories...");
-      // Render human-facing notification times in solar-local time
-      // derived from the vessel's longitude, so a UTC-locked server still
-      // surfaces crew-local clock times. Falls back to the host timezone
-      // when longitude is unknown. Reused for the recorded advisory
-      // messages below.
-      const solarOffsetMinutes = solarOffsetMinutesFromLongitude(
-        ingestionFSM.position.longitude,
-      );
+      // Render human-facing notification times in ship's time (the
+      // onboard timezone published as `environment.time.timezoneOffset`
+      // by @meri-imperiumi/signalk-ships-time), so a UTC-locked server
+      // still surfaces crew-local clock times. Falls back to the host
+      // timezone when the offset is unpublished. Reused for the recorded
+      // advisory messages below.
+      const localOffsetMinutes = shipsTimeOffsetMinutes();
       // Forecast status: which tier the current prediction is built on and
       // how many hours it actually covers (the effective horizon, which can
       // be shorter than the configured one when a tier returns fewer hours
@@ -1885,7 +1907,7 @@ module.exports = (app) => {
         solarWh24h: validHours > 0 ? solarWh24h : null,
         consumptionWh24h: validHours > 0 ? consumptionWh24h : null,
         windGustMs: currentWindGustMs(),
-        localOffsetMinutes: solarOffsetMinutes,
+        localOffsetMinutes,
         urgencyConfig: pluginConfig.notification?.urgency,
       });
       app.debug(`Advisories published successfully`);
@@ -1907,7 +1929,7 @@ module.exports = (app) => {
           stowageOpportunity,
           opportunisticLoads: surplusConfig.opportunisticLoads || [],
           isLoadRunning: (load) => advisoryPublisher.isLoadRunning(load),
-          localOffsetMinutes: solarOffsetMinutes,
+          localOffsetMinutes,
         }),
       });
 
@@ -3376,6 +3398,7 @@ module.exports = (app) => {
     resolveWindProtectionContext,
     publishWindProtection,
     runWindProtectionLearning,
+    shipsTimeOffsetMinutes,
     get wpfState() {
       return wpfState;
     },

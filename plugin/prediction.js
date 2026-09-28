@@ -17,7 +17,7 @@ const {
   resolveTierSettings,
 } = require("./combustion.js");
 const { theoreticalPower } = require("./learning.js");
-const { formatWh, solarOffsetMinutesFromLongitude, formatLocalHHMM } =
+const { formatWh, offsetMinutesFromHhmm, formatLocalHHMM } =
   require("./format.js");
 const { getAcPowerPaths } = require("./schema.js");
 const SunCalc = require("suncalc");
@@ -1365,6 +1365,20 @@ class PredictionEngine {
   }
 
   /**
+   * Gets the vessel's onboard timezone offset (ship's time) in minutes
+   * east of UTC, from the `environment.time.timezoneOffset` path
+   * published by @meri-imperiumi/signalk-ships-time in `(-)hhmm`
+   * encoding (e.g. `200` = +02:00, `-930` = -09:30). Returns null when
+   * the ships-time plugin is absent or has not published yet.
+   * @returns {number|null}
+   */
+  shipsTimeOffsetMinutes() {
+    const raw = this.getSelfPath("environment.time.timezoneOffset");
+    const v = raw && typeof raw === "object" ? raw.value : raw;
+    return offsetMinutesFromHhmm(v);
+  }
+
+  /**
    * Determines if the vessel is under way (sailing, motoring, or under way).
    * @returns {boolean}
    */
@@ -1774,11 +1788,13 @@ class PredictionEngine {
         reason: "No sunrise in near future",
       };
     }
-    // Render the sunrise instant in solar-local time (the crew's clock),
-    // not the server's host timezone or UTC. We have lon in scope here.
+    // Render the sunrise instant in ship's time (the crew's clock, the
+    // onboard timezone published as `environment.time.timezoneOffset` by
+    // @meri-imperiumi/signalk-ships-time), not the server's host timezone
+    // or UTC. Falls back to UTC rendering when unpublished.
     const sunriseLocal = formatLocalHHMM(
       sunrise,
-      solarOffsetMinutesFromLongitude(lon),
+      this.shipsTimeOffsetMinutes() ?? 0,
     );
     const sunrisePos = sunPosition(sunrise, lat, lon);
 

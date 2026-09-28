@@ -31,7 +31,6 @@ const {
   loadCycles: loadCyclesFromStore,
   resolveNavState,
   MAX_WINDOW_DAYS,
-  offsetMinutesFromSamples,
 } = require("../plugin/api.js");
 const openApiSpec = require("../schema/openapi.json");
 
@@ -735,17 +734,18 @@ test.describe("route registration", () => {
     });
   });
 
-  test("GET /api/vessel returns the solar-local offset from the live position", async () => {
+  test("GET /api/vessel returns the ship's-time offset from environment.time.timezoneOffset", async () => {
     await withFixtures(async (dataDir, store) => {
       const router = makeRouter();
-      // 30°E → +120 minutes solar-local offset
+      // environment.time.timezoneOffset 200 = +02:00 → 120 minutes
       registerApiRoutes(router, {
         app: {
           debug() {},
           error() {},
-          getSelfPath: () => ({
-            value: { latitude: 0, longitude: 30 },
-          }),
+          getSelfPath: (path) =>
+            path === "environment.time.timezoneOffset"
+              ? { value: 200, timestamp: "2026-08-23T08:00:00.000Z" }
+              : null,
         },
         getConfig: () => CONFIG,
         store,
@@ -754,11 +754,31 @@ test.describe("route registration", () => {
       const res = makeRes();
       await router.routes.get("/api/vessel")({}, res);
       assert.strictEqual(res.statusCode, null);
-      assert.strictEqual(res.body.solarOffsetMinutes, 120);
+      assert.strictEqual(res.body.timezoneOffsetMinutes, 120);
     });
   });
 
-  test("GET /api/vessel returns null offset when the position is unknown", async () => {
+  test("GET /api/vessel accepts a sub-hour (-)hhmm offset (-930 → -570 min)", async () => {
+    await withFixtures(async (dataDir, store) => {
+      const router = makeRouter();
+      registerApiRoutes(router, {
+        app: {
+          debug() {},
+          error() {},
+          getSelfPath: (path) =>
+            path === "environment.time.timezoneOffset" ? { value: -930 } : null,
+        },
+        getConfig: () => CONFIG,
+        store,
+        dataDir,
+      });
+      const res = makeRes();
+      await router.routes.get("/api/vessel")({}, res);
+      assert.strictEqual(res.body.timezoneOffsetMinutes, -570);
+    });
+  });
+
+  test("GET /api/vessel returns null offset when the timezone is unpublished", async () => {
     await withFixtures(async (dataDir, store) => {
       const router = makeRouter();
       registerApiRoutes(router, {
@@ -770,7 +790,7 @@ test.describe("route registration", () => {
       const res = makeRes();
       await router.routes.get("/api/vessel")({}, res);
       assert.strictEqual(res.statusCode, null);
-      assert.strictEqual(res.body.solarOffsetMinutes, null);
+      assert.strictEqual(res.body.timezoneOffsetMinutes, null);
     });
   });
 
@@ -1090,11 +1110,11 @@ test("buildDeployStates: advisories from recorded cycles, deduped + window-filte
   assert.deepStrictEqual(res.recommendations, []);
 });
 
-test("buildDeployStates: advisory dedup keys on solar-local sun-day, not UTC", () => {
+test("buildDeployStates: advisory dedup keys on the ship's-time day, not UTC", () => {
   // Two cycles forecast the same local-day surplus, but their window
   // starts straddle UTC midnight (UTC-10 offset): 13:46 local = 23:46 UTC
   // on Aug 23, and 14:05 local = 00:05 UTC on Aug 24. Keying on UTC date
-  // would split them into two events; keying on the solar-local sun-day
+  // would split them into two events; keying on the ship's-time day
   // collapses them to one, keeping the newest cycle's version.
   const from = new Date("2026-08-23T00:00:00Z");
   const to = new Date("2026-08-25T00:00:00Z");
@@ -1123,38 +1143,10 @@ test("buildDeployStates: advisory dedup keys on solar-local sun-day, not UTC", (
     },
   ];
   const res = buildDeployStates([], cycles, from, to, {
-    solarOffsetMinutes: -10 * 60, // UTC-10
+    localOffsetMinutes: -10 * 60, // UTC-10
   });
   assert.strictEqual(res.advisories.length, 1);
   assert.strictEqual(res.advisories[0].surplusWh, 1600); // newest wins
-});
-
-test("offsetMinutesFromSamples: derives solar offset from most recent in-window sample", () => {
-  // Longitude 150°E → +600 minutes (UTC+10). Older in-window sample at a
-  // different longitude must NOT win over the most recent one.
-  const from = new Date("2026-08-23T00:00:00Z");
-  const to = new Date("2026-08-23T23:59:00Z");
-  const samples = [
-    {
-      timestamp: "2026-08-23T06:00:00Z",
-      position: { latitude: 0, longitude: 0 }, // would be 0 min
-    },
-    {
-      timestamp: "2026-08-23T18:00:00Z",
-      position: { latitude: 0, longitude: 150 }, // UTC+10
-    },
-  ];
-  assert.strictEqual(offsetMinutesFromSamples(samples, from, to), 600);
-});
-
-test("offsetMinutesFromSamples: returns null when no in-window sample has position", () => {
-  const from = new Date("2026-08-23T00:00:00Z");
-  const to = new Date("2026-08-23T23:59:00Z");
-  const samples = [
-    { timestamp: "2026-08-23T06:00:00Z", position: null },
-    { timestamp: "2026-08-23T18:00:00Z" }, // no position field
-  ];
-  assert.strictEqual(offsetMinutesFromSamples(samples, from, to), null);
 });
 
 test("buildDeployStates: advisories dedupe by calendar day across minute-drift between cycles", () => {
