@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.0] - 2026-09-29
+
 ### Changed
 - **All user-facing times now render in ship's time from
   `environment.time.timezoneOffset` instead of a longitude-derived
