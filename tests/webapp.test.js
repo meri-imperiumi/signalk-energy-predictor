@@ -38,8 +38,9 @@ test("index.html loads all modules and the stylesheet", () => {
   // top-level <script> sources.
   const libraries = new Set(["ep-ship-time.js"]);
   for (const file of readdirSync(PUBLIC_DIR)) {
-    // icon.png is for the server's webapp list, not the page itself
-    if (file === "index.html" || file === "icon.png") continue;
+    // icon files are for the server's webapp list, not the page itself
+    if (file === "index.html" || file === "icon.png" || file === "icon-256.png")
+      continue;
     if (libraries.has(file)) continue;
     assert.ok(html.includes(`./${file}`), `index.html must reference ${file}`);
   }
