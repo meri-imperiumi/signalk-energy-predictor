@@ -12,6 +12,8 @@ const {
   detectGeneratorState,
   carryForwardStates,
   deployConfirmThresholdW,
+  windStowConfirmKnots,
+  hydroStowConfirmKnots,
 } = require("../plugin/deploy-state.js");
 
 test("normalizeDeployState: maps sensor strings", () => {
@@ -245,6 +247,140 @@ test("detectGeneratorState: wind stowed when 0 W with wind above startup", () =>
     detectGeneratorState(gen, { powerW: 0, windKnots: 15, underway: false }),
     "stowed",
   );
+});
+
+test("detectGeneratorState: wind 0 W in marginal gusty wind holds the previous state", () => {
+  const gen = {
+    id: "superwind",
+    type: "wind",
+    deployable: true,
+    startupSpeedKnots: 5,
+  };
+  // Confirm threshold is 5 kn * 1.5 = 7.5 kn; 6 kn is marginal. A
+  // deployed wind generator's high starting reluctance keeps it still
+  // through lulls in gusty conditions — 0 W there is not stow evidence.
+  assert.strictEqual(
+    detectGeneratorState(gen, {
+      powerW: 0,
+      windKnots: 6,
+      underway: false,
+      previousState: "deployed",
+    }),
+    "deployed",
+  );
+  assert.strictEqual(
+    detectGeneratorState(gen, {
+      powerW: 0,
+      windKnots: 6,
+      underway: false,
+      previousState: "stowed",
+    }),
+    "stowed",
+  );
+  // No previous state: marginal evidence stays unknown (carry-forward)
+  assert.strictEqual(
+    detectGeneratorState(gen, { powerW: 0, windKnots: 6, underway: false }),
+    null,
+  );
+});
+
+test("detectGeneratorState: wind 0 W only confirms stowed clearly above startup", () => {
+  const gen = {
+    id: "superwind",
+    type: "wind",
+    deployable: true,
+    startupSpeedKnots: 5,
+  };
+  assert.strictEqual(
+    detectGeneratorState(gen, {
+      powerW: 0,
+      windKnots: 8,
+      underway: false,
+      previousState: "deployed",
+    }),
+    "stowed",
+  );
+});
+
+test("detectGeneratorState: gusty lull sequence does not flap the wind state", () => {
+  const gen = {
+    id: "superwind",
+    type: "wind",
+    deployable: true,
+    startupSpeedKnots: 5,
+  };
+  // The observed wild case: gusts spin the unit up (positive samples →
+  // "deployed"), lulls read 0 W with the average wind still at/above
+  // startup → pre-hysteresis "stowed" five minutes later. Now the
+  // marginal lulls hold the state.
+  let state = null;
+  const flips = [];
+  const sequence = [
+    [0, 6],
+    [20, 7],
+    [0, 6],
+    [0, 6.5],
+    [15, 7],
+    [0, 6],
+    [0, 5.5],
+  ];
+  for (const [powerW, windKnots] of sequence) {
+    const next = detectGeneratorState(gen, {
+      powerW,
+      windKnots,
+      underway: false,
+      previousState: state,
+    });
+    if (next != null && next !== state) flips.push(next);
+    if (next != null) state = next;
+  }
+  assert.deepStrictEqual(flips, ["deployed"]);
+  assert.strictEqual(state, "deployed");
+});
+
+test("detectGeneratorState: hydro marginal speed holds previous; clear speed stows", () => {
+  const gen = {
+    id: "hydrogen",
+    type: "hydro",
+    deployable: true,
+    minSpeedKnots: 3,
+  };
+  // Confirm threshold is 3 kn * 1.25 = 3.75 kn
+  assert.strictEqual(
+    detectGeneratorState(gen, {
+      powerW: 0,
+      stwKnots: 3.4,
+      navState: "sailing",
+      previousState: "deployed",
+    }),
+    "deployed",
+  );
+  assert.strictEqual(
+    detectGeneratorState(gen, {
+      powerW: 0,
+      stwKnots: 4,
+      navState: "sailing",
+      previousState: "deployed",
+    }),
+    "stowed",
+  );
+  assert.strictEqual(
+    detectGeneratorState(gen, { powerW: 0, stwKnots: 3.4, navState: "sailing" }),
+    null,
+  );
+});
+
+test("windStowConfirmKnots / hydroStowConfirmKnots: scale with configured speeds", () => {
+  assert.strictEqual(
+    windStowConfirmKnots({ type: "wind", startupSpeedKnots: 5 }),
+    7.5,
+  );
+  assert.strictEqual(windStowConfirmKnots({ type: "wind" }), 7.5); // default 5 kn
+  assert.strictEqual(
+    hydroStowConfirmKnots({ type: "hydro", minSpeedKnots: 4 }),
+    5,
+  );
+  assert.strictEqual(hydroStowConfirmKnots({ type: "hydro" }), 3.75); // default 3 kn
 });
 
 test("detectGeneratorState: wind unknown when 0 W but calm (no evidence)", () => {

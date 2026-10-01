@@ -8,10 +8,18 @@
  *    deployed; sub-threshold positive power → hold the previous state
  *    (quantization noise in low irradiance must not flap the state);
  *    0 W in daytime → stowed; underway → stowed.
- *  - Wind generator: power > 0 → deployed; 0 W with wind ≥ startup → stowed;
- *    underway → stowed.
- *  - Hydro generator: not sailing → stowed; sailing ≥ minSpeed with 0 W →
- *    stowed; power > 0 → deployed.
+ *  - Wind generator: power > 0 → deployed (immediate); 0 W with wind
+ *    clearly above startup (≥ 1.5×) → stowed; 0 W in the marginal band
+ *    around startup → hold the previous state (a deployed unit's high
+ *    starting reluctance keeps it still through lulls in gusty
+ *    conditions); underway → stowed.
+ *  - Hydro generator: not sailing → stowed; power > 0 → deployed;
+ *    0 W sailing clearly above min speed (≥ 1.25×) → stowed; marginal
+ *    speed → hold the previous state.
+ *
+ * The state detection is deliberately asymmetric: deployment is confirmed
+ * immediately by any positive power, while stowage needs conditions that
+ * leave no doubt a deployed generator would be producing.
  *
  * A sensor-provided deployStatePath, when present, always wins over the
  * inference.
@@ -39,6 +47,24 @@ const DEPLOY_CONFIRM_FRACTION = 0.005;
 /** Lower/upper clamp (W) for the deploy-confirm threshold. */
 const DEPLOY_CONFIRM_MIN_W = 1;
 const DEPLOY_CONFIRM_MAX_W = 5;
+
+/**
+ * Multiplier on a wind generator's startup speed for the 0 W → stowed
+ * inference. Wind generators have high starting reluctance (cogging
+ * torque): in gusty winds around cut-in a deployed unit only spins up in
+ * the gusts and sits still through the lulls, so 0 W at barely-startup
+ * wind is not stow evidence. See `windStowConfirmKnots`.
+ */
+const WIND_STOW_CONFIRM_FACTOR = 1.5;
+
+/**
+ * Multiplier on a hydro generator's minimum speed for the 0 W → stowed
+ * inference. Water is ~800× denser than air, so a towed generator is far
+ * more deterministic at its cut-in than a wind one; the margin is smaller
+ * but the same lull protection applies while speed hovers around minimum.
+ * See `hydroStowConfirmKnots`.
+ */
+const HYDRO_STOW_CONFIRM_FACTOR = 1.25;
 
 /**
  * Power (W) that a deployable array must produce before a stowed→deployed
@@ -70,6 +96,32 @@ function deployConfirmThresholdW(array) {
     DEPLOY_CONFIRM_MAX_W,
     Math.max(DEPLOY_CONFIRM_MIN_W, cap * DEPLOY_CONFIRM_FRACTION),
   );
+}
+
+/**
+ * Sustained wind speed (knots) above which 0 W confirms a wind generator
+ * is stowed. At or above this a deployed unit produces — its high
+ * starting reluctance only matters around cut-in. Between the startup
+ * speed and this threshold conditions are marginal: 0 W is ambiguous and
+ * the previous state is held (assume still deployed).
+ *
+ * @param {object} gen - Wind generator config (startupSpeedKnots optional)
+ * @returns {number} Stow-confirm wind speed in knots
+ */
+function windStowConfirmKnots(gen) {
+  return (gen.startupSpeedKnots ?? 5) * WIND_STOW_CONFIRM_FACTOR;
+}
+
+/**
+ * Sustained speed through water (knots) above which 0 W confirms a hydro
+ * generator is stowed. Between the minimum speed and this threshold
+ * conditions are marginal: 0 W holds the previous state.
+ *
+ * @param {object} gen - Hydro generator config (minSpeedKnots optional)
+ * @returns {number} Stow-confirm speed in knots
+ */
+function hydroStowConfirmKnots(gen) {
+  return (gen.minSpeedKnots ?? 3) * HYDRO_STOW_CONFIRM_FACTOR;
 }
 
 /**
@@ -155,6 +207,12 @@ function detectSolarArrayState(array, ctx) {
  * @param {number|null} [ctx.stwKnots] - Speed through water in knots
  * @param {string|null} [ctx.navState] - Navigation state
  * @param {boolean} [ctx.underway] - Whether the vessel is under way
+ * @param {string|null} [ctx.previousState] - Last known state for this
+ *        generator ("deployed"/"stowed"); in marginal conditions (wind or
+ *        boat speed in the band between the generator's startup/minimum
+ *        speed and its stow-confirm threshold) 0 W holds it instead of
+ *        flipping to stowed — a deployed unit's starting reluctance keeps
+ *        it still through lulls in gusty conditions
  * @returns {"deployed"|"stowed"|null} Inferred state, or null if unknown
  */
 function detectGeneratorState(gen, ctx) {
@@ -162,30 +220,34 @@ function detectGeneratorState(gen, ctx) {
   const sensor = normalizeDeployState(ctx.deployStateRaw);
   if (sensor != null) return sensor;
   const { powerW, windKnots, stwKnots, navState, underway } = ctx;
+  const previousState =
+    ctx.previousState === "deployed" || ctx.previousState === "stowed"
+      ? ctx.previousState
+      : null;
+  // Power output is ground truth and confirms deployment immediately: a
+  // generator producing watts IS deployed, whatever the conditions.
   if (powerW != null && powerW > 0) return "deployed";
   if (gen.type === "wind") {
     if (underway) return "stowed";
-    const startupSpeed = gen.startupSpeedKnots ?? 5;
-    if (
-      powerW != null &&
-      powerW === 0 &&
-      windKnots != null &&
-      windKnots >= startupSpeed
-    ) {
-      return "stowed";
+    if (powerW != null && powerW === 0 && windKnots != null) {
+      // Stowage detection is deliberately slow: 0 W is only stow evidence
+      // when the wind is clearly above the startup speed. In gusty,
+      // marginal winds around cut-in a deployed unit sits still through
+      // the lulls and only spins up in gusts — assume it is still
+      // deployed and hold the previous state.
+      if (windKnots >= windStowConfirmKnots(gen)) return "stowed";
+      if (windKnots >= (gen.startupSpeedKnots ?? 5)) return previousState;
     }
     return null;
   }
   if (gen.type === "hydro") {
     if (navState !== "sailing") return "stowed";
-    const minSpeed = gen.minSpeedKnots ?? 3;
-    if (
-      powerW != null &&
-      powerW === 0 &&
-      stwKnots != null &&
-      stwKnots >= minSpeed
-    ) {
-      return "stowed";
+    if (powerW != null && powerW === 0 && stwKnots != null) {
+      // Same asymmetric hysteresis as wind: clear speed above minimum
+      // confirms stowed; marginal speed around the minimum holds the
+      // previous state.
+      if (stwKnots >= hydroStowConfirmKnots(gen)) return "stowed";
+      if (stwKnots >= (gen.minSpeedKnots ?? 3)) return previousState;
     }
     return null;
   }
@@ -222,5 +284,7 @@ module.exports = {
   detectGeneratorState,
   carryForwardStates,
   deployConfirmThresholdW,
+  windStowConfirmKnots,
+  hydroStowConfirmKnots,
   STOW_INFERENCE_MIN_SUN_ALT_RAD,
 };

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Wind generator deploy/stow detection no longer flaps in gusty
+  marginal conditions** (`plugin/deploy-state.js`, `plugin/index.js`,
+  `plugin/history-backfill.js`): with wind hovering around cut-in, a
+  deployed wind generator only spins up in gusts and sits still through
+  lulls — the detection read each producing sample as "deployed" and each
+  quiet five-minute sample as "stowed" (observed in the wild: deployed at
+  00:52, stowed at 00:57). The detection is now deliberately asymmetric:
+  deployment is confirmed immediately by any positive power, while stowage
+  requires 0 W **and** sustained wind clearly above startup (≥ 1.5× the
+  configured `startupSpeedKnots`); in the marginal band between startup
+  and the confirm threshold, 0 W holds the previous state (a deployed
+  unit's high starting reluctance keeps it still through lulls — assume
+  still deployed). Hydro generators get the same asymmetry at 1.25×
+  `minSpeedKnots`. The live cycle and the per-sample recording use the
+  window-averaged wind (new shared `averagedWindKnots` helper) and — for
+  the stow side — window-averaged power, while a positive instantaneous
+  reading still confirms deployment at once. The recording and both
+  backfill passes thread the previous detected state through the
+  detector.
 ## [0.11.1] - 2026-09-29
 
 ## [0.11.0] - 2026-09-29

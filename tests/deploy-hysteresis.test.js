@@ -110,6 +110,8 @@ function lastDetectedState(app, deviceId) {
 }
 
 const FLINSAIL_POWER = "electrical.solar.flinsail.panelPower";
+const WIND_POWER = "electrical.wind.superwind.power";
+const WIND_SPEED = "environment.wind.speedApparent";
 const SOC_PATH = "electrical.batteries.house.capacity.stateOfCharge";
 
 function baseConfig() {
@@ -135,6 +137,24 @@ function baseConfig() {
     updateIntervalMinutes: 9999, // disable the scheduled cycle
     learning: { enabled: false },
   };
+}
+
+function windConfig() {
+  const config = baseConfig();
+  config.solarArrays = [];
+  config.mechanicalGenerators = [
+    {
+      id: "superwind",
+      type: "wind",
+      deployable: true,
+      maxWindKnots: 30,
+      startupSpeedKnots: 5, // stow-confirm threshold: 5 kn * 1.5 = 7.5 kn
+      powerPath: WIND_POWER,
+      manufacturerCurve: "5,10,10,50,15,100,20,150,25,200,30,250",
+      enabled: true,
+    },
+  ];
+  return config;
 }
 
 /** Injects a minimal forecast (night solar, steady wind) into the FSM. */
@@ -300,6 +320,145 @@ test.describe("deploy-state hysteresis in the live cycle", () => {
       lastDetectedState(app, "flinsail"),
       "deployed",
       "output above the confirm threshold must confirm deployed",
+    );
+
+    await plugin.stop();
+    await rm(testDir, { recursive: true, force: true });
+  });
+});
+
+test.describe("wind generator detection hysteresis", () => {
+  /** Emits a wind speed sample in m/s (Signal K unit); spacing ≥ 30 s so each lands in history. */
+  const emitWind = (app, knots, iso) => {
+    const ms = knots / 1.943844;
+    app.setSelfPath(WIND_SPEED, ms);
+    emit(app, [{ path: WIND_SPEED, value: ms }], iso);
+  };
+  const later = (min) => new Date(Date.now() + min * 60000).toISOString();
+
+  test("gusty marginal wind does not flap the live detected state", async () => {
+    const app = new FakeSignalKApp();
+    const plugin = makePlugin(app);
+    const testDir = await mkdtemp(join(tmpdir(), "hysteresis-wind-"));
+
+    app.dataPath = testDir;
+    await plugin.start(windConfig(), () => {});
+
+    app.setSelfPath("navigation.position", { latitude: 0, longitude: 0 });
+    emit(app, [
+      { path: "navigation.position", value: { latitude: 0, longitude: 0 } },
+    ]);
+    app.setSelfPath("navigation.state", "anchored");
+    emit(app, [{ path: "navigation.state", value: "anchored" }]);
+    app.setSelfPath(SOC_PATH, 0.6);
+    emit(app, [{ path: SOC_PATH, value: 0.6 }]);
+
+    // Last known state: deployed (a gust was producing earlier)
+    const recorder = plugin.__getInternals().recorder;
+    await recorder.recordSample({
+      timestamp: new Date(),
+      arrays: {},
+      generators: { superwind: 20 },
+      soc: 0.6,
+      houseLoadW: 100,
+      windSpeedKnots: 7,
+      navState: "anchored",
+      position: { latitude: 0, longitude: 0 },
+      stwKnots: null,
+      deployStates: { superwind: "deployed" },
+      controllerModes: {},
+      awaRad: null,
+    });
+
+    injectForecast(plugin);
+    const cycle = () => plugin.__getInternals().runPredictionCycle();
+
+    // Gusty marginal night: average wind 6 kn (≥ 5 kn startup, below the
+    // 7.5 kn stow-confirm), generator silent in the lulls. Pre-hysteresis
+    // this published "stowed" within five minutes.
+    app.setSelfPath(WIND_POWER, 0);
+    emit(app, [{ path: WIND_POWER, value: 0 }]);
+    emitWind(app, 6);
+    emitWind(app, 6, later(0.7));
+    emitWind(app, 6, later(1.4));
+    await cycle();
+    assert.strictEqual(
+      lastDetectedState(app, "superwind"),
+      "deployed",
+      "0 W in marginal gusty wind must hold the deployed state",
+    );
+
+    // Sustained clear wind well above the confirm threshold: a deployed
+    // unit would produce — 0 W now confirms stowed
+    emitWind(app, 12, later(6));
+    emitWind(app, 12, later(6.7));
+    await cycle();
+    assert.strictEqual(
+      lastDetectedState(app, "superwind"),
+      "stowed",
+      "sustained wind clearly above startup with 0 W must confirm stowed",
+    );
+
+    // A single producing gust re-confirms deployment immediately
+    app.setSelfPath(WIND_POWER, 20);
+    emit(app, [{ path: WIND_POWER, value: 20 }], later(7));
+    await cycle();
+    assert.strictEqual(
+      lastDetectedState(app, "superwind"),
+      "deployed",
+      "positive power must confirm deployment immediately",
+    );
+
+    await plugin.stop();
+    await rm(testDir, { recursive: true, force: true });
+  });
+
+  test("recording: gusty marginal wind keeps the recorded state deployed", async () => {
+    const app = new FakeSignalKApp();
+    const plugin = makePlugin(app);
+    const testDir = await mkdtemp(join(tmpdir(), "hysteresis-wind-rec-"));
+
+    app.dataPath = testDir;
+    await plugin.start(windConfig(), () => {});
+
+    app.setSelfPath("navigation.position", { latitude: 0, longitude: 0 });
+    emit(app, [
+      { path: "navigation.position", value: { latitude: 0, longitude: 0 } },
+    ]);
+    app.setSelfPath("navigation.state", "anchored");
+    emit(app, [{ path: "navigation.state", value: "anchored" }]);
+    app.setSelfPath(SOC_PATH, 0.6);
+    emit(app, [{ path: SOC_PATH, value: 0.6 }]);
+
+    const recorder = plugin.__getInternals().recorder;
+
+    // 00:52 — a gust spins the unit up: the sample records "deployed"
+    app.setSelfPath(WIND_POWER, 20);
+    emit(app, [{ path: WIND_POWER, value: 20 }]);
+    emitWind(app, 7);
+    await plugin.__getInternals().recordSample();
+
+    // 00:57 — five minutes later the sample lands in a lull (0 W) with
+    // gusty average wind at 6 kn: above startup, below the 7.5 kn
+    // stow-confirm. Pre-hysteresis this recorded "stowed".
+    app.setSelfPath(WIND_POWER, 0);
+    emit(app, [{ path: WIND_POWER, value: 0 }]);
+    emitWind(app, 6, later(0.7));
+    emitWind(app, 6, later(1.4));
+    emitWind(app, 6, later(2.1));
+
+    await plugin.__getInternals().recordSample();
+
+    const samples = await recorder.getRecords(
+      "sample",
+      new Date(Date.now() - 3600000),
+      new Date(Date.now() + 60000),
+    );
+    const newest = samples[samples.length - 1];
+    assert.strictEqual(
+      newest.deployStates?.superwind,
+      "deployed",
+      "a lull sample in marginal gusty wind must record the held state",
     );
 
     await plugin.stop();

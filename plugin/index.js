@@ -60,6 +60,8 @@ const { loadActivePolarModel } = require("./polar.js");
 const {
   detectSolarArrayState,
   detectGeneratorState,
+  windStowConfirmKnots,
+  hydroStowConfirmKnots,
   STOW_INFERENCE_MIN_SUN_ALT_RAD,
 } = require("./deploy-state.js");
 const { registerApiRoutes } = require("./api.js");
@@ -700,6 +702,46 @@ module.exports = (app) => {
     );
     if (recent.length === 0) return null;
     return recent.reduce((sum, s) => sum + s.value, 0) / recent.length;
+  }
+
+  /**
+   * Window-averaged wind speed (knots) across all tracked wind paths — the
+   * sustained-wind basis for wind generator deploy/stow verdicts, so a
+   * single gust or lull cannot push the reading across a threshold on one
+   * sample. The current instantaneous reading is included as the newest
+   * sample. The window's reference time is the newest history sample, so
+   * tests can "time travel" via delta timestamps.
+   *
+   * @param {number|null} currentWindKnots - Latest instantaneous reading
+   * @returns {{avgWindKnots: number|null, recentCount: number}} Average
+   *          knots over the window (null when no samples exist) and the
+   *          number of history samples it is based on
+   */
+  function averagedWindKnots(currentWindKnots) {
+    const allWindHistory = [
+      ...(windHistory.get("environment.wind.speedApparent") || []),
+      ...(windHistory.get("environment.wind.speedOverGround") || []),
+      ...(windHistory.get("environment.wind.speedTrue") || []),
+    ];
+    if (allWindHistory.length === 0 && currentWindKnots == null) {
+      return { avgWindKnots: null, recentCount: 0 };
+    }
+    const refTime =
+      allWindHistory.length > 0
+        ? Math.max(...allWindHistory.map((s) => s.time))
+        : Date.now();
+    const recentWind = allWindHistory.filter(
+      (s) => s.time >= refTime - WIND_HISTORY_MS,
+    );
+    const samples =
+      currentWindKnots != null
+        ? [...recentWind, { speed: currentWindKnots }]
+        : recentWind;
+    const avgWindKnots =
+      samples.length > 0
+        ? samples.reduce((sum, s) => sum + s.speed, 0) / samples.length
+        : null;
+    return { avgWindKnots, recentCount: recentWind.length };
   }
 
   /**
@@ -1648,17 +1690,18 @@ module.exports = (app) => {
             seededDeployStateIds.delete(gen.id);
           }
         }
-        // Wind generator: if there is wind but no power output, it is stowed.
-        // Runs even when a seed is present: a definite live "stowed" reading
-        // overwrites the carried-forward state; no wind evidence leaves the
-        // seed in place.
+        // Wind generator: 0 W is only stow evidence when the sustained
+        // wind is clearly above the startup speed (1.5×). In gusty,
+        // marginal winds around cut-in a deployed unit sits still through
+        // the lulls and only spins up in gusts — hold the previous state
+        // instead. Runs even when a seed is present: a definite live
+        // "stowed" reading overwrites the carried-forward state; marginal
+        // or missing wind evidence leaves the seed in place.
         if (gen.deployable && gen.type === "wind") {
           const powerVal =
             averagedPowerW(gen.powerPath) ??
             toNumber(deltaState.get(gen.powerPath));
-          const startupSpeed = gen.startupSpeedKnots ?? 5;
-          // Use average wind speed over recent history to avoid false positives
-          // from brief gusts - wind generators need sustained wind to spin up
+          const confirmSpeed = windStowConfirmKnots(gen);
           const currentWind = toKnots(
             deltaState.get("environment.wind.speedApparent") ||
               deltaState.get("environment.wind.speedOverGround") ||
@@ -1667,38 +1710,17 @@ module.exports = (app) => {
               app.getSelfPath("environment.wind.speedOverGround") ||
               app.getSelfPath("environment.wind.speedTrue"),
           );
-          const allWindHistory = [
-            ...(windHistory.get("environment.wind.speedApparent") || []),
-            ...(windHistory.get("environment.wind.speedOverGround") || []),
-            ...(windHistory.get("environment.wind.speedTrue") || []),
-          ];
-          // Use the most recent sample time as reference, falling back to Date.now()
-          // This allows tests to "time travel" via delta timestamps
-          const refTime =
-            allWindHistory.length > 0
-              ? Math.max(...allWindHistory.map((s) => s.time))
-              : Date.now();
-          const recentWind = allWindHistory.filter(
-            (s) => s.time >= refTime - WIND_HISTORY_MS,
-          );
-          // Include current reading as an additional sample
-          const samples =
-            currentWind != null
-              ? [...recentWind, { speed: currentWind }]
-              : recentWind;
-          const avgWind =
-            samples.length > 0
-              ? samples.reduce((sum, s) => sum + s.speed, 0) / samples.length
-              : null;
+          const { avgWindKnots: avgWind, recentCount } =
+            averagedWindKnots(currentWind);
           app.debug(
-            `Wind gen ${gen.id}: avgWind=${avgWind?.toFixed(1) ?? "null"}kn (${recentWind.length} samples), powerVal=${powerVal}, startupSpeed=${startupSpeed}kn`,
+            `Wind gen ${gen.id}: avgWind=${avgWind?.toFixed(1) ?? "null"}kn (${recentCount} samples), powerVal=${powerVal}, confirmSpeed=${confirmSpeed.toFixed(1)}kn`,
           );
           if (
             powerVal != null &&
             powerVal === 0 &&
             avgWind != null &&
-            avgWind >= startupSpeed &&
-            recentWind.length >= 2
+            avgWind >= confirmSpeed &&
+            recentCount >= 2
           ) {
             currentDeployStates.set(gen.id, "stowed");
             seededDeployStateIds.delete(gen.id);
@@ -1719,11 +1741,12 @@ module.exports = (app) => {
             seededDeployStateIds.delete(gen.id);
           }
         }
-        // Hydro: if sailing above min speed but no power output, it is stowed.
-        // Runs even when a seed is present (definite live reading wins). The
-        // power read is the window average (flicker-proof) and the speed the
-        // sustained STW average — marginal-production conditions must not
-        // flap the state.
+        // Hydro: if sailing clearly above the minimum speed but no power
+        // output, it is stowed. Runs even when a seed is present (definite
+        // live reading wins). The power read is the window average
+        // (flicker-proof) and the speed the sustained STW average —
+        // marginal-production conditions hold the previous state instead
+        // of flapping it.
         if (gen.deployable && gen.type === "hydro") {
           const powerVal =
             averagedPowerW(gen.powerPath) ??
@@ -1733,12 +1756,11 @@ module.exports = (app) => {
             sustainedMs != null
               ? toKnots(sustainedMs)
               : toKnots(deltaState.get("navigation.speedThroughWater"));
-          const minSpeed = gen.minSpeedKnots ?? 3;
           if (
             powerVal != null &&
             powerVal === 0 &&
             speed != null &&
-            speed >= minSpeed
+            speed >= hydroStowConfirmKnots(gen)
           ) {
             currentDeployStates.set(gen.id, "stowed");
             seededDeployStateIds.delete(gen.id);
@@ -2823,15 +2845,22 @@ module.exports = (app) => {
           .altitude > STOW_INFERENCE_MIN_SUN_ALT_RAD;
     }
     const deployStates = {};
+    // Power evidence for deploy-state detection is a blend: a positive
+    // instantaneous reading wins (deployment is confirmed immediately by
+    // any producing sample), otherwise the 5-minute window average stands
+    // in (stowage is only confirmed by sustained zero, so a single
+    // quiet sample in flickery conditions cannot flip the state).
+    const detectionPowerW = (powerPath) => {
+      if (powerPath == null) return null;
+      const inst = toNumber(
+        deltaState.get(powerPath) || app.getSelfPath(powerPath),
+      );
+      if (inst != null && inst > 0) return inst;
+      return averagedPowerW(powerPath) ?? inst;
+    };
     for (const array of getActiveSolarArrays(pluginConfig)) {
       if (array.type !== "deployable") continue;
-      const powerW =
-        array.powerPath != null
-          ? toNumber(
-              deltaState.get(array.powerPath) ||
-                app.getSelfPath(array.powerPath),
-            )
-          : null;
+      const powerW = detectionPowerW(array.powerPath);
       const deployStateRaw =
         array.deployStatePath != null
           ? deltaState.get(array.deployStatePath) ||
@@ -2853,24 +2882,29 @@ module.exports = (app) => {
     }
     for (const gen of getActiveGenerators(pluginConfig)) {
       if (!gen.deployable) continue;
-      const powerW =
-        gen.powerPath != null
-          ? toNumber(
-              deltaState.get(gen.powerPath) || app.getSelfPath(gen.powerPath),
-            )
-          : null;
+      const powerW = detectionPowerW(gen.powerPath);
       const deployStateRaw =
         gen.deployStatePath != null
           ? deltaState.get(gen.deployStatePath) ||
             app.getSelfPath(gen.deployStatePath)
           : null;
+      // Wind evidence is the window average (like the live cycle): a
+      // gusty instantaneous reading must not push the marginal band over
+      // the stow-confirm threshold on a single sample. Falls back to the
+      // instantaneous reading when no history exists.
+      const { avgWindKnots } = averagedWindKnots(windSpeedKnots);
+      const sustainedStwKnots = (() => {
+        const sustainedMs = observedStwMs();
+        return sustainedMs != null ? toKnots(sustainedMs) : stwKnots;
+      })();
       const state = detectGeneratorState(gen, {
         powerW,
         deployStateRaw,
-        windKnots: windSpeedKnots,
-        stwKnots,
+        windKnots: avgWindKnots ?? windSpeedKnots,
+        stwKnots: sustainedStwKnots,
         navState,
         underway,
+        previousState: lastKnownDeployStates.get(gen.id) ?? null,
       });
       if (state != null) {
         deployStates[gen.id] = state;

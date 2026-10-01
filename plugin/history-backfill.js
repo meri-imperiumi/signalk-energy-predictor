@@ -1890,8 +1890,12 @@ async function backfillSamples({
         stwKnots: sample.stwKnots,
         navState: sample.navState,
         underway,
+        previousState: previousDeployStates.get(gen.id) ?? null,
       });
-      if (state != null) deployStates[gen.id] = state;
+      if (state != null) {
+        deployStates[gen.id] = state;
+        previousDeployStates.set(gen.id, state);
+      }
     }
     sample.deployStates = deployStates;
 
@@ -2019,8 +2023,12 @@ async function augmentSamplesDeployStates({
         stwKnots,
         navState,
         underway,
+        previousState: previousDeployStates.get(gen.id) ?? null,
       });
-      if (state != null) deployStates[gen.id] = state;
+      if (state != null) {
+        deployStates[gen.id] = state;
+        previousDeployStates.set(gen.id, state);
+      }
     }
     computed.set(new Date(sample.timestamp).getTime(), deployStates);
   }
