@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.2] - 2026-10-03
+
 ### Fixed
 - **A Signal K Weather provider without cloud cover no longer silently
   kills solar predictions** (`plugin/ingestion.js`): tier 2 exists to feed
