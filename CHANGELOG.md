@@ -8,6 +8,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **A Signal K Weather provider without cloud cover no longer silently
+  kills solar predictions** (`plugin/ingestion.js`): tier 2 exists to feed
+  the Kasten-Czeplak irradiance synthesis, but a provider answering points
+  without any `outside.cloudCover` (e.g. one serving only wind and
+  pressure, such as an ECMWF open-data source without the cloud field)
+  used to count as a successful tier — every forecast point then carried
+  `GHI = null` while the logbook and clear-sky fallbacks below were never
+  consulted. Such a response (and an empty one) now fails the tier so the
+  FSM degrades to the next source instead of publishing a solar-less
+  forecast. Cloud cover 0 (clear sky) remains a valid reading.
 - **Wind generator deploy/stow detection no longer flaps in gusty
   marginal conditions** (`plugin/deploy-state.js`, `plugin/index.js`,
   `plugin/history-backfill.js`): with wind hovering around cut-in, a

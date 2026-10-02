@@ -13,6 +13,7 @@ const {
   IngestionFSM,
   Tier,
   fetchOpenMeteo,
+  fetchSignalKWeather,
   fetchLogbookCloudCover,
   isDegenerateForecast,
   OPEN_METEO_MAX_ATTEMPTS,
@@ -207,6 +208,72 @@ test.describe("Ingestion fallback chain", () => {
     } finally {
       globalThis.fetch = origFetch;
     }
+  });
+
+  test("Signal K Weather provider without cloud cover in any point fails the tier", async () => {
+    // A provider answering only wind/pressure (e.g. ECMWF open data without
+    // a cloud field) must not count as a tier-2 success — the solar pipeline
+    // would silently publish GHI=null for every point and shadow the
+    // logbook/clear-sky fallbacks.
+    const app = makeAppWithWeather([
+      {
+        date: new Date(Date.now() + 3600000).toISOString(),
+        type: "point",
+        wind: { speedTrue: 10, directionTrue: Math.PI, gust: 15 },
+        outside: { pressure: 101300, temperature: 291 },
+      },
+      {
+        date: new Date(Date.now() + 7200000).toISOString(),
+        type: "point",
+        wind: { speedTrue: 5 },
+      },
+    ]);
+    await assert.rejects(
+      fetchSignalKWeather(app, 60.17, 24.94),
+      /no cloud cover/,
+    );
+
+    // End to end: the FSM must degrade past tier 2 (no logbook store here,
+    // so Clear Sky) instead of stopping at it
+    const fsm = new IngestionFSM(app);
+    fsm.position = { latitude: 60.17, longitude: 24.94 };
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      if (String(url).includes("open-meteo")) throw new Error("network down");
+      throw new Error("network down");
+    };
+
+    try {
+      const forecast = await fsm.fetchForecast();
+      assert.notStrictEqual(fsm.currentTier, Tier.SIGNAL_K_WEATHER);
+      assert.strictEqual(fsm.currentTier, Tier.CLEAR_SKY);
+      assert.ok(forecast.some((p) => (p.ghi ?? 0) > 0));
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  test("Signal K Weather provider response with no dated points fails the tier", async () => {
+    const app = makeAppWithWeather([
+      { type: "point", outside: { cloudCover: 0.5 } },
+    ]);
+    await assert.rejects(
+      fetchSignalKWeather(app, 60.17, 24.94),
+      /no dated forecast points/,
+    );
+  });
+
+  test("cloud cover 0 is a valid reading, not missing data", async () => {
+    const app = makeAppWithWeather([
+      {
+        date: new Date(Date.now() + 3600000).toISOString(),
+        type: "point",
+        outside: { cloudCover: 0 },
+      },
+    ]);
+    const points = await fetchSignalKWeather(app, 60.17, 24.94);
+    assert.strictEqual(points.length, 1);
+    assert.strictEqual(points[0].cloudCover, 0);
   });
 
   test("logbook without observations falls through to Clear Sky", async () => {

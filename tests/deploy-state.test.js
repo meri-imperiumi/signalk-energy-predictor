@@ -365,7 +365,11 @@ test("detectGeneratorState: hydro marginal speed holds previous; clear speed sto
     "stowed",
   );
   assert.strictEqual(
-    detectGeneratorState(gen, { powerW: 0, stwKnots: 3.4, navState: "sailing" }),
+    detectGeneratorState(gen, {
+      powerW: 0,
+      stwKnots: 3.4,
+      navState: "sailing",
+    }),
     null,
   );
 });

@@ -429,6 +429,13 @@ async function fetchOpenMeteo(
  * without HTTP, auth tokens or port guessing. On servers without the
  * Weather API this throws and the FSM falls through to the next tier.
  *
+ * A response the solar pipeline cannot use also throws: tier 2 exists
+ * (SPEC §3) to feed the Kasten-Czeplak synthesis, so a provider answering
+ * points without any `outside.cloudCover` (e.g. one that serves only wind
+ * and pressure) must not masquerade as a successful tier and shadow the
+ * logbook/clear-sky fallbacks below — the FSM degrades to them instead of
+ * publishing a solar-less forecast.
+ *
  * @param {ServerAPI} app - Signal K server API
  * @param {number} latitude - Latitude in degrees
  * @param {number} longitude - Longitude in degrees
@@ -454,19 +461,30 @@ async function fetchSignalKWeather(app, latitude, longitude, { hours } = {}) {
     throw new Error("Signal K Weather API response is not an array");
   }
 
-  return data
-    .filter((point) => point.date != null)
-    .map((point) => ({
-      time: new Date(point.date),
-      ghi: null,
-      cloudCover: point.outside?.cloudCover ?? null,
-      gustSpeedMs: point.wind?.gust != null ? point.wind.gust : null,
-      windSpeedMs: point.wind?.speedTrue != null ? point.wind.speedTrue : null,
-      windDirectionDeg:
-        point.wind?.directionTrue != null
-          ? (point.wind.directionTrue * 180) / Math.PI // radians to degrees
-          : null,
-    }));
+  const points = data.filter((point) => point.date != null);
+  if (points.length === 0) {
+    throw new Error("Signal K Weather API returned no dated forecast points");
+  }
+
+  // Cloud cover 0 (clear sky) is a valid reading; only null/undefined mean
+  // "the provider does not carry a cloud field".
+  if (!points.some((point) => point.outside?.cloudCover != null)) {
+    throw new Error(
+      "Signal K Weather provider returned no cloud cover in any forecast point",
+    );
+  }
+
+  return points.map((point) => ({
+    time: new Date(point.date),
+    ghi: null,
+    cloudCover: point.outside?.cloudCover ?? null,
+    gustSpeedMs: point.wind?.gust != null ? point.wind.gust : null,
+    windSpeedMs: point.wind?.speedTrue != null ? point.wind.speedTrue : null,
+    windDirectionDeg:
+      point.wind?.directionTrue != null
+        ? (point.wind.directionTrue * 180) / Math.PI // radians to degrees
+        : null,
+  }));
 }
 
 /**
