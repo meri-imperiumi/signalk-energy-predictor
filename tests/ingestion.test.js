@@ -23,7 +23,6 @@ const {
   writeWeatherCache,
   weatherPositionBucket,
 } = require("../plugin/weather-cache.js");
-const { stringify: stringifyYaml } = require("yaml");
 
 function makeApp() {
   return {
@@ -55,32 +54,52 @@ function makeAppWithWeather(points) {
 }
 
 /**
- * App whose server plugin data directory holds signalk-logbook YAML day
- * files (the logbook's on-disk store), built from `{ day: entries }`.
+ * App with an in-process logentries resource API — the Signal K v2 resource
+ * contract signalk-logbook serves (`app.resourcesApi`). Built from an entry
+ * list in resource shape (`{ id, datetime, telemetry: [...] }`), or an
+ * `Error` to make `listResources` reject (no logentries provider). The
+ * issued window is recorded on the app as `lastLogentriesQuery` for
+ * assertions.
  */
-async function makeAppWithLogbook(days) {
-  const configPath = await fs.mkdtemp(path.join(os.tmpdir(), "ep-logbook-"));
-  const dir = path.join(configPath, "plugin-config-data", "signalk-logbook");
-  await fs.mkdir(dir, { recursive: true });
-  for (const [day, entries] of Object.entries(days)) {
-    await fs.writeFile(
-      path.join(dir, `${day}.yml`),
-      stringifyYaml(entries),
-      "utf-8",
-    );
-  }
-  return { ...makeApp(), config: { configPath } };
+function makeAppWithLogentries(entries) {
+  const app = {
+    ...makeApp(),
+    lastLogentriesQuery: null,
+    resourcesApi: {
+      listResources: async (type, query) => {
+        app.lastLogentriesQuery = { type, query };
+        assert.strictEqual(type, "logentries");
+        assert.ok(
+          typeof query.from === "string" && typeof query.to === "string",
+          "listing must carry a from/to window",
+        );
+        if (entries instanceof Error) {
+          throw entries;
+        }
+        const map = {};
+        for (const entry of entries) {
+          map[entry.id] = entry;
+        }
+        return map;
+      },
+    },
+  };
+  return app;
 }
 
-/** Writes one logbook day file directly (e.g. corrupt content). */
-async function writeLogbookDay(app, day, content) {
-  const dir = path.join(
-    app.config.configPath,
-    "plugin-config-data",
-    "signalk-logbook",
-  );
-  await fs.mkdir(dir, { recursive: true });
-  await fs.writeFile(path.join(dir, `${day}.yml`), content, "utf-8");
+/** Wraps a cloud-cover ratio (0-1) into a logentries resource entry. */
+function logentriesEntry(id, datetime, cloudCover) {
+  const entry = {
+    id,
+    datetime,
+    text: "Weather observation",
+  };
+  if (cloudCover != null) {
+    entry.telemetry = [
+      { path: "environment.outside.cloudCover", value: cloudCover },
+    ];
+  }
+  return entry;
 }
 
 test.describe("Ingestion fallback chain", () => {
@@ -127,17 +146,14 @@ test.describe("Ingestion fallback chain", () => {
   });
 
   test("logbook cloud observations generate a forecast with attenuated GHI", async () => {
-    // Use today's date so the day is always within the 48h lookback window
-    const today = new Date().toISOString().split("T")[0];
-    // Open-Meteo down, logbook has one entry with 4 oktas (0.5) cloud cover
-    const app = await makeAppWithLogbook({
-      [today]: [
-        {
-          datetime: new Date(Date.now() - 3600000).toISOString(),
-          observations: { cloudCoverage: 4 },
-        },
-      ],
-    });
+    // Open-Meteo down, logbook has one entry with 0.5 cloud cover (4 oktas)
+    const app = makeAppWithLogentries([
+      logentriesEntry(
+        "9f8c9d2e-1a2b-4c3d-8e4f-0a1b2c3d4e5f",
+        new Date(Date.now() - 3600000).toISOString(),
+        0.5,
+      ),
+    ]);
     const fsm = new IngestionFSM(app);
     fsm.position = { latitude: 60.17, longitude: 24.94 };
     const origFetch = globalThis.fetch;
@@ -277,16 +293,14 @@ test.describe("Ingestion fallback chain", () => {
   });
 
   test("logbook without observations falls through to Clear Sky", async () => {
-    const today = new Date().toISOString().split("T")[0];
-    // Day file exists but carries no cloud observations
-    const app = await makeAppWithLogbook({
-      [today]: [
-        {
-          datetime: new Date(Date.now() - 3600000).toISOString(),
-          text: "No weather observed",
-        },
-      ],
-    });
+    // Entry exists but carries no cloud-cover telemetry
+    const app = makeAppWithLogentries([
+      logentriesEntry(
+        "0b1c2d3e-4f5a-4b6c-8d7e-9f0a1b2c3d4e",
+        new Date(Date.now() - 3600000).toISOString(),
+        null,
+      ),
+    ]);
     const fsm = new IngestionFSM(app);
     fsm.position = { latitude: 60.17, longitude: 24.94 };
     const origFetch = globalThis.fetch;
@@ -1167,16 +1181,14 @@ test.describe("Offline forecast restore + staleness + uplink cadence", () => {
 
   test("stale-boundary hybrid: cache older than forecastCacheHours → logbook solar + latest-known wind", async () => {
     const dir = await mkDataDir();
-    // Open-Meteo down; logbook has one observation with 4 oktas.
-    const today = new Date().toISOString().split("T")[0];
-    const app = await makeAppWithLogbook({
-      [today]: [
-        {
-          datetime: new Date(Date.now() - 3600000).toISOString(),
-          observations: { cloudCoverage: 4 },
-        },
-      ],
-    });
+    // Open-Meteo down; logbook has one observation with 0.5 cloud cover.
+    const app = makeAppWithLogentries([
+      logentriesEntry(
+        "7c6b5a4e-3d2c-4b1a-9f8e-7d6c5b4a3f2e",
+        new Date(Date.now() - 3600000).toISOString(),
+        0.5,
+      ),
+    ]);
     // Live SK wind available for the nowcast.
     app.getSelfPath = (p) =>
       p === "environment.wind.speedTrue"
@@ -1220,7 +1232,6 @@ test.describe("Offline forecast restore + staleness + uplink cadence", () => {
 
 test.describe("In-process same-server reads", () => {
   const realFetch = globalThis.fetch;
-  const today = new Date().toISOString().split("T")[0];
 
   test("weather read goes through app.weatherApi without any HTTP", async () => {
     // Offshore regression: the plugin must never loop back over HTTP to its
@@ -1285,30 +1296,25 @@ test.describe("In-process same-server reads", () => {
     }
   });
 
-  test("logbook day files are read from the server's plugin data directory", async () => {
-    const app = await makeAppWithLogbook({
-      "2020-01-01": [
-        // Outside the 48 h lookback window — ignored even though valid
-        {
-          datetime: "2020-01-01T12:00:00.000Z",
-          observations: { cloudCoverage: 2 },
-        },
-      ],
-      [today]: [
-        {
-          datetime: new Date(Date.now() - 3 * 3600000).toISOString(),
-          observations: { cloudCoverage: 4 }, // 0.5
-        },
-        {
-          datetime: new Date(Date.now() - 2 * 3600000).toISOString(),
-          text: "No weather observed",
-        },
-        {
-          datetime: new Date(Date.now() - 3600000).toISOString(),
-          observations: { cloudCoverage: 6 }, // 0.75
-        },
-      ],
-    });
+  test("logbook entries are listed through the logentries resource API", async () => {
+    const app = makeAppWithLogentries([
+      // Only entries with a cloud-cover pathvalue count
+      logentriesEntry(
+        "e1a2b3c4-d5e6-4f7a-8b9c-0d1e2f3a4b5c",
+        new Date(Date.now() - 3 * 3600000).toISOString(),
+        0.5,
+      ),
+      logentriesEntry(
+        "f2b3c4d5-e6f7-4a8b-9c0d-1e2f3a4b5c6d",
+        new Date(Date.now() - 2 * 3600000).toISOString(),
+        null,
+      ),
+      logentriesEntry(
+        "a3c4d5e6-f7a8-4b9c-0d1e-2f3a4b5c6d7e",
+        new Date(Date.now() - 3600000).toISOString(),
+        0.75,
+      ),
+    ]);
     const readings = await fetchLogbookCloudCover(app, 48);
     assert.deepStrictEqual(
       readings.map((r) => r.cloudCover),
@@ -1318,28 +1324,43 @@ test.describe("In-process same-server reads", () => {
       readings.every((r) => r.time instanceof Date),
       "reading times must be Dates",
     );
+    // The listing carries the 48 h window ending now
+    const { query } = app.lastLogentriesQuery;
+    const windowHours =
+      (new Date(query.to).getTime() - new Date(query.from).getTime()) / 3600000;
+    assert.ok(
+      Math.abs(windowHours - 48) < 0.01,
+      `window must span 48 h, got ${windowHours}`,
+    );
+    assert.ok(
+      Math.abs(new Date(query.to).getTime() - Date.now()) < 60000,
+      "window must end at the current time",
+    );
   });
 
-  test("corrupt logbook day file is skipped, healthy days still read", async () => {
-    const app = await makeAppWithLogbook({});
-    await writeLogbookDay(
-      app,
-      today,
-      "- datetime: 'not: a: valid: mapping\n  ::", // malformed YAML
-    );
-    const yesterday = new Date(Date.now() - 24 * 3600000)
-      .toISOString()
-      .split("T")[0];
-    await writeLogbookDay(
-      app,
-      yesterday,
-      stringifyYaml([
-        {
-          datetime: new Date(Date.now() - 23 * 3600000).toISOString(),
-          observations: { cloudCoverage: 1 },
-        },
-      ]),
-    );
+  test("entries without usable datetime or out-of-range cloud cover are ignored", async () => {
+    const app = makeAppWithLogentries([
+      {
+        id: "b4d5e6f7-a8b9-4c0d-1e2f-3a4b5c6d7e8f",
+        datetime: "not-a-timestamp",
+        telemetry: [{ path: "environment.outside.cloudCover", value: 0.5 }],
+      },
+      {
+        id: "c5e6f7a8-b9c0-4d1e-2f3a-4b5c6d7e8f9a",
+        datetime: new Date(Date.now() - 3600000).toISOString(),
+        telemetry: [
+          { path: "environment.outside.cloudCover", value: "overcast" },
+          { path: "environment.outside.cloudCover", value: 1.5 },
+          { path: "environment.wind.speedOverGround", value: 5 },
+        ],
+      },
+      // Valid entry mixed in among the noise
+      logentriesEntry(
+        "d6f7a8b9-c0d1-4e2f-3a4b-5c6d7e8f9a0b",
+        new Date(Date.now() - 2 * 3600000).toISOString(),
+        0.125,
+      ),
+    ]);
     const readings = await fetchLogbookCloudCover(app, 48);
     assert.deepStrictEqual(
       readings.map((r) => r.cloudCover),
@@ -1347,9 +1368,46 @@ test.describe("In-process same-server reads", () => {
     );
   });
 
-  test("missing logbook store rejects so the tier falls through", async () => {
-    const configPath = await fs.mkdtemp(path.join(os.tmpdir(), "ep-empty-"));
-    const app = { ...makeApp(), config: { configPath } };
-    await assert.rejects(() => fetchLogbookCloudCover(app, 48), /ENOENT/);
+  test("multiple cloud-cover pathvalues keep the first", async () => {
+    const app = makeAppWithLogentries([
+      {
+        id: "e7a8b9c0-d1e2-4f3a-4b5c-6d7e8f9a0b1c",
+        datetime: new Date(Date.now() - 3600000).toISOString(),
+        telemetry: [
+          {
+            path: "environment.outside.cloudCover",
+            value: 0.25,
+            $source: "signalk-logbook",
+          },
+          {
+            path: "environment.outside.cloudCover",
+            value: 0.5,
+            $source: "crew-estimate",
+          },
+        ],
+      },
+    ]);
+    const readings = await fetchLogbookCloudCover(app, 48);
+    assert.deepStrictEqual(
+      readings.map((r) => r.cloudCover),
+      [0.25],
+    );
+  });
+
+  test("missing resources API rejects so the tier falls through", async () => {
+    const app = makeApp();
+    await assert.rejects(
+      () => fetchLogbookCloudCover(app, 48),
+      /resources API/,
+    );
+  });
+
+  test("missing logentries provider rejects so the tier falls through", async () => {
+    // Logbook not installed, or too old to register the provider
+    const app = makeAppWithLogentries(new Error("Unknown resource type"));
+    await assert.rejects(
+      () => fetchLogbookCloudCover(app, 48),
+      /Unknown resource type/,
+    );
   });
 });

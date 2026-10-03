@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Logbook cloud-cover reads go through the Signal K v2 logentries resource API** (`plugin/ingestion.js`): tier 3 now calls `app.resourcesApi.listResources('logentries', { from, to })` in-process instead of parsing signalk-logbook's YAML day files off disk, dropping the coupling to the logbook's storage layout and the `yaml` dependency. Cloud cover arrives as a ratio 0-1 on the `environment.outside.cloudCover` telemetry pathvalue (the upstream meteo-proposal path), so the okta conversion is gone and `oktasToFraction` is removed from `plugin/solar.js`. Failure semantics are unchanged: a missing resources API, no logentries provider (logbook not installed or older than the resource API release), or a rejected listing throws so the FSM degrades to Clear Sky as before. Requires signalk-logbook with the logentries resource provider.
 ## [0.11.2] - 2026-10-03
 
 ### Fixed

@@ -1435,7 +1435,7 @@ class PredictionEngine {
 
   /**
    * Whether the current prediction's forecast carries any wind data at
-   * all. Tiers 3/4 of the weather ladder (logbook oktas, clear sky) have
+   * all. Tiers 3/4 of the weather ladder (logbook observations, clear sky) have
    * no wind — every hour reads null — which must not be collapsed into
    * a fabricated calm ("forecast wind 0kn < startup 5kn" stowed a wind
    * generator while a gale was blowing; the same no-fabrication rule the

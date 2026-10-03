@@ -86,16 +86,6 @@ function irradianceFromCloudCover(altitudeRad, cloudCover) {
 }
 
 /**
- * Converts cloud cover from oktas (0-8) to fraction (0-1).
- *
- * @param {number} oktas - Cloud cover in oktas (0-8)
- * @returns {number} Cloud cover fraction (0-1)
- */
-function oktasToFraction(oktas) {
-  return Math.max(0, Math.min(8, oktas)) / 8;
-}
-
-/**
  * Calculates the next sunrise time after the given date.
  *
  * @param {Date} date - Starting date (typically now or sunset)
@@ -168,7 +158,6 @@ module.exports = {
   lastSunset,
   maxIrradiance,
   irradianceFromCloudCover,
-  oktasToFraction,
   SOLAR_CONSTANT,
   CLEAR_SKY_TRANSMITTANCE,
 };

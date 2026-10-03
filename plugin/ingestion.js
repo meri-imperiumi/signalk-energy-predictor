@@ -4,13 +4,15 @@
  * Tiers:
  * 1. Direct NWP (Open-Meteo REST API) - shortwave_radiation
  * 2. Signal K Weather API (in-process) - cloudCover (0-1)
- * 3. Logbook (on-disk YAML store) - cloudCover (oktas 0-8)
+ * 3. Logbook (logentries resource API) - cloudCover (ratio 0-1)
  * 4. Clear Sky Baseline - theoretical max from sun position
  *
  * Tiers 2-3 always talk to the Signal K server the plugin runs inside:
  * tier 2 calls `app.weatherApi.getForecasts()` directly (the same object
  * the server's `/signalk/v2/api/weather` REST routes wrap) and tier 3 reads
- * signalk-logbook's YAML day files from the server's plugin data directory.
+ * signalk-logbook's entries through the Signal K v2 logentries resource API
+ * (`app.resourcesApi`, the contract documented in signalk-logbook's
+ * docs/logentries-resource.md).
  * No loopback HTTP, ports, auth tokens or TLS involved (the previous
  * localhost-HTTP reader guessed the listen port and failed silently against
  * an unrelated service, degrading a whole offshore passage to Clear Sky).
@@ -26,12 +28,8 @@ const {
   sunPosition,
   maxIrradiance,
   irradianceFromCloudCover,
-  oktasToFraction,
 } = require("./solar.js");
 const weatherCache = require("./weather-cache.js");
-const fs = require("node:fs/promises");
-const path = require("node:path");
-const { parse: parseYaml } = require("yaml");
 
 /**
  * Unwraps a Signal K path value to a number, handling both the bare number
@@ -135,7 +133,7 @@ const MAX_FORECAST_HOURS = 168;
 const DEFAULT_FORECAST_CACHE_HOURS = 24;
 
 /**
- * Reuse window for low-quality tiers (logbook oktas, clear sky). Short: they
+ * Reuse window for low-quality tiers (logbook observations, clear sky). Short: they
  * are cheap to regenerate and carry no forward-looking wind, so there is no
  * value in caching them long. In minutes to match `getForecast`'s units.
  */
@@ -488,59 +486,52 @@ async function fetchSignalKWeather(app, latitude, longitude, { hours } = {}) {
 }
 
 /**
- * Reads recent cloud coverage from signalk-logbook's on-disk store,
- * in-process. The logbook keeps one YAML file per UTC day at
- * `<configPath>/plugin-config-data/signalk-logbook/<YYYY-MM-DD>.yml`
- * (parsed with the same `yaml` package the logbook itself writes with), so
- * this reads the very data the logbook's REST routes would serve — minus
- * HTTP, auth tokens and port guessing. Only entries with valid
- * cloudCoverage observations are used; a corrupt day file is skipped, not
- * fatal. A missing store (logbook not installed) rejects so the caller can
- * fall through the same way it did on a 404.
+ * Reads recent cloud coverage from signalk-logbook via the Signal K v2
+ * logentries resource API, in-process. The logbook registers a resource
+ * provider for the `logentries` type, so `app.resourcesApi.listResources`
+ * serves the entries between two RFC 3339 datetimes without HTTP, auth
+ * tokens or knowledge of the logbook's on-disk storage. Cloud cover rides
+ * the `environment.outside.cloudCover` telemetry pathvalue as a ratio 0-1
+ * (the upstream meteo-proposal path and unit). Only entries carrying a
+ * valid cloud-cover pathvalue are used. A missing resourcesApi (older
+ * server), a missing logentries provider (logbook not installed or too old
+ * to expose one) or a rejected listing rejects so the caller can fall
+ * through the same way it did on an absent on-disk store.
  *
  * @param {ServerAPI} app - Signal K server API
  * @param {number} hoursBack - Hours to look back for logbook entries
  * @returns {Promise<Array<{time: Date, cloudCover: number}>>} Cloud coverage readings
  */
 async function fetchLogbookCloudCover(app, hoursBack = 48) {
-  const configPath = app.config?.configPath;
-  if (!configPath) {
-    throw new Error("Cannot locate the server's plugin data directory");
+  const resourcesApi = app.resourcesApi;
+  if (!resourcesApi?.listResources) {
+    throw new Error("Server does not expose the resources API");
   }
-  const dir = path.join(configPath, "plugin-config-data", "signalk-logbook");
 
-  const days = await fs.readdir(dir); // ENOENT: logbook absent, tier fails
-  const dayRe = /^\d{4}-([0]\d|1[0-2])-([0-2]\d|3[01])\.yml$/;
-  const cutoff = new Date(Date.now() - hoursBack * 3600000);
+  const to = new Date();
+  const from = new Date(to.getTime() - hoursBack * 3600000);
+  // Rejects when no provider serves logentries (logbook absent/too old)
+  const resources = await resourcesApi.listResources("logentries", {
+    from: from.toISOString(),
+    to: to.toISOString(),
+  });
+
   const entries = [];
-
-  for (const file of days.filter((f) => dayRe.test(f)).sort()) {
-    const day = file.slice(0, 10);
-    const dayStart = new Date(`${day}T00:00:00.000Z`);
-    if (dayStart < cutoff) {
-      continue; // Day entirely before the lookback window
+  for (const entry of Object.values(resources ?? {})) {
+    const entryTime = new Date(entry?.datetime);
+    if (Number.isNaN(entryTime.getTime())) {
+      continue; // Entry without a usable datetime
     }
-
-    let dayEntries;
-    try {
-      const content = await fs.readFile(path.join(dir, file), "utf-8");
-      dayEntries = content ? parseYaml(content) : [];
-    } catch (error) {
-      app.debug?.(`Logbook: skipping unreadable day ${day}: ${error.message}`);
-      continue;
-    }
-    if (!Array.isArray(dayEntries)) {
-      continue;
-    }
-
-    for (const entry of dayEntries) {
-      const entryTime = new Date(entry.datetime);
-      if (entryTime >= cutoff && entry.observations?.cloudCoverage != null) {
-        entries.push({
-          time: entryTime,
-          cloudCover: oktasToFraction(entry.observations.cloudCoverage),
-        });
-      }
+    const pathvalue = (entry.telemetry ?? []).find(
+      (pv) =>
+        pv?.path === "environment.outside.cloudCover" &&
+        typeof pv.value === "number" &&
+        Number.isFinite(pv.value) &&
+        pv.value >= 0 &&
+        pv.value <= 1,
+    );
+    if (pathvalue) {
+      entries.push({ time: entryTime, cloudCover: pathvalue.value });
     }
   }
 
@@ -715,7 +706,7 @@ class IngestionFSM {
    * Returns the in-memory reuse window (ms) for the current tier.
    *
    * Tier 1/2 (real forecasts, incl. restored-from-disk) stay usable for
-   * `forecastCacheHours`; tier 3/4 (logbook oktas, clear sky) keep the short
+   * `forecastCacheHours`; tier 3/4 (logbook observations, clear sky) keep the short
    * window — cheap to regenerate and carry no forward-looking wind.
    *
    * @returns {number} max age in ms
@@ -1056,7 +1047,7 @@ class IngestionFSM {
     //      long ago it was fetched). Hours beyond the cache's coverage are
     //      filled with the hybrid so the horizon stays complete.
     //   2. No future coverage on disk → the stale-boundary hybrid in full:
-    //      solar from logbook oktas, wind from latest-known live SK. Runs
+    //      solar from logbook cloud observations, wind from latest-known live SK. Runs
     //      even with no on-disk cache (logbook doesn't need it); it falls
     //      to Clear Sky internally when logbook has no observations.
     //   3. If even logbook is empty, the hybrid produces Clear Sky (the floor).
@@ -1322,7 +1313,7 @@ class IngestionFSM {
     this.announcedStaleServe = false;
     this.announcedCacheHit = false;
     this.app.debug(
-      `Stale hybrid: ${points.length} points (solar: ${cloudCover != null ? "logbook oktas" : "clear sky"}, wind: latest-known ${points[0]?.windSpeedMs ?? "?"}m/s)`,
+      `Stale hybrid: ${points.length} points (solar: ${cloudCover != null ? "logbook observations" : "clear sky"}, wind: latest-known ${points[0]?.windSpeedMs ?? "?"}m/s)`,
     );
     return this.lastForecast;
   }

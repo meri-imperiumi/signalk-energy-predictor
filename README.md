@@ -31,12 +31,7 @@ Configure via Signal K Admin UI under the "Energy Predictor" plugin section:
 
 ### Signal K Weather Sources
 
-The plugin always talks to the Signal K server it runs inside: tier 2 calls
-the server's Weather API (`app.weatherApi`) **in-process** — answering any
-registered weather provider such as a local GRIB download — and tier 3 reads
-`signalk-logbook` entries directly from the server's plugin data directory.
-No HTTP, ports, or access tokens are involved; there is nothing to
-configure for these tiers.
+The plugin always talks to the Signal K server it runs inside: tier 2 calls the server's Weather API (`app.weatherApi`) **in-process** — answering any registered weather provider such as a local GRIB download — and tier 3 reads cloud-cover observations from `signalk-logbook` through the Signal K v2 `logentries` resource API (`app.resourcesApi`) **in-process**. No HTTP, ports, or access tokens are involved; there is nothing to configure for these tiers. Tier 3 requires a signalk-logbook version that registers the `logentries` resource provider; on older logbook versions the plugin simply degrades to the clear-sky baseline.
 
 ### Battery Configuration
 

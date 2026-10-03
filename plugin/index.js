@@ -783,7 +783,7 @@ module.exports = (app) => {
   /**
    * Current measured wind as a nowcast basis for the wind-protection
    * deltas when the active forecast tier carries no wind (tiers 3/4:
-   * logbook oktas, clear sky).
+   * logbook observations, clear sky).
    *
    * Speed prefers true wind, then over-ground, then apparent (the same
    * chain the WPF learning uses); gust reuses currentWindGustMs() (recent
@@ -1058,7 +1058,7 @@ module.exports = (app) => {
       const sunPos = sunPosition(now, pos.latitude, pos.longitude);
       // Wind basis for the corrected paths: the current forecast hour's
       // wind when the active tier carries one; otherwise the current
-      // MEASURED wind as a nowcast. Tiers 3/4 (logbook oktas, clear sky)
+      // MEASURED wind as a nowcast. Tiers 3/4 (logbook observations, clear sky)
       // carry no wind, which used to leave correctedSpeed/correctedGust
       // null — the instrument panel lost wind entirely on forecast-
       // degraded days. The measured basis flows through the same WPF
