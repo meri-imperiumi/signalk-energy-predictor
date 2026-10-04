@@ -560,6 +560,35 @@ test.describe("resolvePlace (anchorage matching)", () => {
     assert.strictEqual(store.resolvePlace(NaN, NaN, 500), null);
   });
 
+  test("an anchorage straddling the antimeridian stays one place with a sane centroid", () => {
+    // The classic seam trap: dropping the hook right at 180° — samples
+    // east and west of the seam are meters apart, but naive longitude
+    // averaging treats them as a world apart and drags the centroid to
+    // 0°. The wrapped-delta running mean must keep the centroid near
+    // the seam, and every swing observation must resolve to the same
+    // anchorage.
+    const store = new WindProtectionStore({ alpha: 0.5, maxPlaces: 10 });
+    const drop = store.resolvePlace(-14.2, 179.9995, 500);
+    const r = 80 / 111320; // ~80 m in latitude degrees
+    for (let i = 0; i < 16; i++) {
+      const a = (i / 16) * 2 * Math.PI;
+      // Positions arrive wrapped to [-180, 180] like real GPS data:
+      // the east half of the swing crosses the seam and reads as
+      // -179.99xx, the west half stays +179.99xx
+      let swingLon = 179.9995 + Math.sin(a) * r;
+      if (swingLon > 180) swingLon -= 360;
+      const k = store.resolvePlace(-14.2 + Math.cos(a) * r, swingLon, 500);
+      assert.strictEqual(k, drop, `swing observation ${i} fragmented`);
+    }
+    // The centroid stayed at the seam (either side), not at 0°
+    const c = store.anchorages.get(drop);
+    assert.ok(
+      Math.abs(c.lon) > 170,
+      `centroid longitude drifted to ${c.lon.toFixed(3)}°`,
+    );
+    assert.ok(Math.abs(c.lon) <= 180, "centroid stays in [-180, 180]");
+  });
+
   test("real marina relocation: 143 m move and 144 m return stay one anchorage", () => {
     // Recorded data from 2026-08-17..22: the boat moored at a slip, then
     // relocated ~143 m to another slip within the same marina (state stayed

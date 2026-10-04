@@ -454,11 +454,17 @@ class WindProtectionStore {
       }
     }
     if (bestKey != null && bestDist <= matchRadiusM) {
-      // Nudge the centroid toward the new observation (running mean)
+      // Nudge the centroid toward the new observation (running mean).
+      // Longitude averages the wrapped delta so an anchorage near the
+      // antimeridian doesn't drift toward 0° when observations straddle
+      // the seam (179.9E and 179.9W are meters apart, not a world apart)
       const c = this.anchorages.get(bestKey);
       const n = c.count + 1;
+      const dLon = ((lon - c.lon + 540) % 360) - 180;
       c.lat = (c.lat * c.count + lat) / n;
-      c.lon = (c.lon * c.count + lon) / n;
+      c.lon = c.lon + dLon / n;
+      if (c.lon > 180) c.lon -= 360;
+      if (c.lon < -180) c.lon += 360;
       c.count = n;
       return bestKey;
     }

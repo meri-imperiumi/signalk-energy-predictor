@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Anchorage centroids near the antimeridian no longer drift toward 0°** (`plugin/wind-protection.js`): the learned place centroid's running mean averaged raw longitudes, so a boat anchored at 180° with samples straddling the seam (179.99°E and 179.99°W — meters apart on the water) produced a longitude average near 0°, poisoning every subsequent distance comparison for that anchorage. The mean now averages the wrapped ±180° longitude delta, keeping the centroid at the seam and wrapped into [-180, 180]
 - **Logbook cloud-cover reads go through the Signal K v2 logentries resource API** (`plugin/ingestion.js`): tier 3 now calls `app.resourcesApi.listResources('logentries', { from, to })` in-process instead of parsing signalk-logbook's YAML day files off disk, dropping the coupling to the logbook's storage layout and the `yaml` dependency. Cloud cover arrives as a ratio 0-1 on the `environment.outside.cloudCover` telemetry pathvalue (the upstream meteo-proposal path), so the okta conversion is gone and `oktasToFraction` is removed from `plugin/solar.js`. Failure semantics are unchanged: a missing resources API, no logentries provider (logbook not installed or older than the resource API release), or a rejected listing throws so the FSM degrades to Clear Sky as before. Requires signalk-logbook with the logentries resource provider.
 ## [0.11.2] - 2026-10-03
 
