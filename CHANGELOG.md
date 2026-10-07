@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Webapp no longer flashes back to "Loading…" right after the initial
+  load** (`public/ep-app.js`): on open the app fetched the day window
+  anchored on the browser timezone while `/api/vessel` was still in
+  flight; when the vessel's ship's-time offset landed it re-anchored the
+  selector and re-ran `refresh()`, which blanked the chart first — so
+  today's data rendered for a moment and then went back to Loading for a
+  second, near-identical fetch. The initial load now resolves the
+  ship's-time offset first and fetches the window once with correct
+  bounds (refreshing directly only when the offset did not apply), and
+  `refresh()` keeps the already-rendered data on screen while re-fetching
+  the same window (live prediction cycles, the stream replaying the
+  current cycle after connect) instead of flashing Loading over it — a
+  different window (mode switch, navigation, re-anchor) still blanks up
+  front. A monotonic sequence guard also discards responses from
+  superseded refreshes so a slow out-of-order reply can't overwrite the
+  newer window's data or clobber its error banner.
+
 ## [0.11.3] - 2026-10-05
 
 ### Changed

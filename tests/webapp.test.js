@@ -128,11 +128,40 @@ test("app clears the chart and events list together on window change", () => {
     path.join(PUBLIC_DIR, "ep-app.js"),
     "utf8",
   ).replace(/\r\n/g, "\n");
-  // refresh() nulls both the chart and the actions (events) list up front so
-  // the previous window's data doesn't linger while the new fetch is in flight
+  // refresh() nulls both the chart and the actions (events) list together
+  // when the fetched window differs from the rendered one, so the previous
+  // window's data doesn't linger while the new fetch is in flight
+  const clearBlock = source.match(
+    /if \(!sameWindow\) \{\n\s*this\.chartEl\.data = null;\n\s*this\.actionsEl\.data = null;\n\s*\}/,
+  );
+  assert.ok(clearBlock, "refresh() must null chart and actions together");
+  // Re-fetching the window already on screen (live prediction cycles, the
+  // stream replaying the current cycle right after connect) must NOT blank
+  // the chart first — that flashed "Loading…" over good data on every
+  // cycle, and sent the webapp back to Loading right after the initial
+  // load rendered. renderedSpec tracks the window of the data on screen.
+  assert.match(source, /this\.renderedSpec = null;/);
   assert.match(
     source,
-    /this\.chartEl\.data = null;\n\s*this\.actionsEl\.data = null;/,
+    /rendered\.mode === spec\.mode &&\n\s*rendered\.from === spec\.from &&\n\s*rendered\.to === spec\.to/,
+  );
+  // The marker is set only when data actually lands (not on error), so a
+  // failed refresh never tricks the next one into keeping stale data
+  const tryBlock = source.match(
+    /this\.renderedSpec = spec;[\s\S]*?\} catch \(error\) \{[\s\S]*?this\.renderedSpec = null;/,
+  );
+  assert.ok(
+    tryBlock,
+    "renderedSpec must update on success and reset on failure",
+  );
+  // A slow response from a superseded refresh (window switched mid-flight,
+  // cycle re-anchor) must not overwrite the newer window's data: only the
+  // latest refresh() call applies its result or error
+  assert.match(source, /const seq = \+\+this\.refreshSeq;/);
+  assert.strictEqual(
+    (source.match(/seq !== this\.refreshSeq/g) || []).length,
+    2,
+    "success and error paths must both discard superseded results",
   );
 });
 
@@ -530,8 +559,33 @@ test("app tracks the vessel timezone offset on every live cycle, not only at loa
   // before refreshing data, and rolls the live day over ship's-time midnight
   assert.match(source, /await this\.refreshVesselMeta\(\)/);
   assert.match(source, /this\.selectorEl\.followToday\(\)/);
-  // Load path uses the same meta fetch
-  assert.match(source, /this\.refreshVesselMeta\(\);\n {2}\}/);
+  // Load path uses the same meta fetch, and only refreshes itself when the
+  // offset did not apply (the selector's re-emit already refreshed)
+  assert.match(
+    source,
+    /this\.refreshVesselMeta\(\)\.then\(\(applied\) => \{[\s\S]*?\n {4}\}\);\n {2}\}/,
+  );
+});
+
+test("initial load resolves the ship's-time offset before the first window fetch", () => {
+  const source = readFileSync(path.join(PUBLIC_DIR, "ep-app.js"), "utf8");
+  // Refreshing with selector defaults while /api/vessel was still in
+  // flight fetched the browser-timezone window, then the offset landed,
+  // re-anchored the selector and blanked the chart back to "Loading…"
+  // for a second fetch: on open the data showed for a moment and went
+  // back to Loading. The load path must chain the window refresh on the
+  // vessel meta result instead of racing it, and skip the extra refresh
+  // when applying the offset already re-emitted a window change.
+  const load = source.match(
+    /const spec = selector\.windowSpec\(\);[\s\S]*?\n {2}\}/,
+  );
+  assert.ok(load, "initial load block must exist in connectedCallback");
+  assert.doesNotMatch(
+    load[0],
+    /this\.refresh\(spec\);\n\s*this\.refreshVesselMeta/,
+  );
+  assert.match(load[0], /refreshVesselMeta\(\)\.then/);
+  assert.match(load[0], /if \(!applied\) \{[\s\S]*?this\.refresh\(spec\);/);
 });
 
 test("selector follows the live day across offset jumps and ship's-time midnight", () => {

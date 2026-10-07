@@ -91,6 +91,17 @@ class EpApp extends HTMLElement {
     this.selectorEl = selector;
     /** @type {number|null} */
     this.timezoneOffsetMinutes = null;
+    /** @type {{mode: string, from: string, to: string}|null} Window spec
+     *  of the data currently rendered by the chart/actions (null = none,
+     *  e.g. after a failed refresh): refresh() keeps the rendered data
+     *  visible when re-fetching the same window instead of flashing
+     *  "Loading…" over it. */
+    this.renderedSpec = null;
+    /** @type {number} Monotonic counter for refresh() calls: only the
+     *  latest call may apply its result, so a slow response from a
+     *  superseded window can't overwrite newer data (or its error banner
+     *  clobber the fresher state). */
+    this.refreshSeq = 0;
 
     selector.addEventListener("ep-window-change", (e) => {
       this.onWindowChange(e.detail);
@@ -115,11 +126,23 @@ class EpApp extends HTMLElement {
     // the chart (axis labels, tooltips, day buckets) and the Events list
     // (event times) — so every user-facing time renders in the crew's
     // ship's-time frame, agreeing with the advisory dedup's local day.
+    //
+    // The offset resolves BEFORE the first window fetch: refreshing in
+    // parallel fetched the browser-timezone window, then the offset landed,
+    // re-anchored the selector and blanked the chart back to "Loading…"
+    // for a second fetch — data flashed for a moment and went back to
+    // Loading on every open. When the offset applies, the selector re-emits
+    // a window change and that (correctly anchored) refresh is already in
+    // flight; only refresh here when it was not — vessel meta unavailable
+    // (kept fallback) or the offset already matched.
     const spec = selector.windowSpec();
     this.mode = spec.mode;
     this.lastSpec = spec;
-    this.refresh(spec);
-    this.refreshVesselMeta();
+    this.refreshVesselMeta().then((applied) => {
+      if (!applied) {
+        this.refresh(spec);
+      }
+    });
   }
 
   disconnectedCallback() {
@@ -265,9 +288,24 @@ class EpApp extends HTMLElement {
    * @param {{mode: string, from: string, to: string}} spec
    */
   async refresh(spec) {
+    const seq = ++this.refreshSeq;
     this.errorEl.textContent = "";
-    this.chartEl.data = null;
-    this.actionsEl.data = null;
+    // Re-fetching the window already on screen (a live prediction cycle,
+    // or the stream replaying the current cycle right after connect) keeps
+    // the rendered data visible while the fresh copy loads: blanking first
+    // flashed "Loading…" over good data on every cycle. A different window
+    // (mode switch, navigation, re-anchor) still blanks up front so the
+    // previous window's data never lingers under the new one.
+    const rendered = this.renderedSpec;
+    const sameWindow =
+      rendered !== null &&
+      rendered.mode === spec.mode &&
+      rendered.from === spec.from &&
+      rendered.to === spec.to;
+    if (!sameWindow) {
+      this.chartEl.data = null;
+      this.actionsEl.data = null;
+    }
     try {
       const [summary, actuals, predictions, retroPredicted, deployStates] =
         await Promise.all([
@@ -281,6 +319,11 @@ class EpApp extends HTMLElement {
             () => null,
           ),
         ]);
+      // A newer refresh (window switch, cycle re-anchor) superseded this
+      // one: its response is stale, discard it instead of overwriting the
+      // newer window's data
+      if (seq !== this.refreshSeq) return;
+      this.renderedSpec = spec;
       this.figuresEl.data = summary;
       this.chartEl.data = {
         mode: spec.mode,
@@ -290,6 +333,8 @@ class EpApp extends HTMLElement {
       };
       this.actionsEl.data = deployStates;
     } catch (error) {
+      if (seq !== this.refreshSeq) return;
+      this.renderedSpec = null;
       this.errorEl.textContent = `Failed to load data: ${error.message}`;
       this.figuresEl.data = null;
       this.chartEl.data = {
