@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.11.4] - 2026-10-08
+
 ### Changed
 - **Periodic work runs far less often to stop the plugin from swamping small servers** (`plugin/index.js`, `plugin/schema.js`, `config.json`): the forecast recalculation cycle now defaults to every 60 minutes (was 15 — the forecast itself is hourly-resolution data, so the extra cycles were pure CPU burn), and learning-state persistence defaults to every 120 minutes (was 15 in `DEFAULT_CONFIG` despite the schema advertising 60 — the two now agree). Graceful shutdowns still save everything, so only a power loss can lose up to two hours of EMA learning, which re-learns quickly.
 
