@@ -350,7 +350,9 @@ function buildCycleAdvisories({
  * Default configuration values.
  */
 const DEFAULT_CONFIG = {
-  updateIntervalMinutes: 15,
+  // Hourly: the forecast itself is hourly-resolution data, so recalculating
+  // more often burns server CPU without sharpening the predictions
+  updateIntervalMinutes: 60,
   battery: {
     capacityAh: 400,
     systemVoltage: 12,
@@ -368,7 +370,9 @@ const DEFAULT_CONFIG = {
   gensets: [],
   learning: {
     enabled: true,
-    saveIntervalMinutes: 15,
+    // Infrequent: saves are pure persistence (EMAs re-learn quickly) and
+    // each one serializes every matrix + store to flash
+    saveIntervalMinutes: 120,
     emaAlpha: 0.05,
     defaultEfficiency: 0.7,
   },

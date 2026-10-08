@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Periodic work runs far less often to stop the plugin from swamping small servers** (`plugin/index.js`, `plugin/schema.js`, `config.json`): the forecast recalculation cycle now defaults to every 60 minutes (was 15 — the forecast itself is hourly-resolution data, so the extra cycles were pure CPU burn), and learning-state persistence defaults to every 120 minutes (was 15 in `DEFAULT_CONFIG` despite the schema advertising 60 — the two now agree). Graceful shutdowns still save everything, so only a power loss can lose up to two hours of EMA learning, which re-learns quickly.
+
 ### Fixed
 - **A corrupted learning-matrix file no longer crash-loops the whole Signal K server at startup** (`plugin/matrix.js`, `plugin/index.js`): matrix/load-profile/wind-protection JSON files were written non-atomically, so a power loss during a periodic save (every 15 minutes by default) could leave a truncated file, and the next plugin start then threw `Unexpected end of JSON input` out of `start()`, taking the server process down in a restart loop. Writes are now atomic (temp file + fsync + rename, uniquely named per write so overlapping saves can't interleave), startup reads tolerate invalid JSON by moving the unreadable file aside as `<name>.corrupt-<timestamp>` (kept for inspection) and starting fresh, and `initializeMatrices` catches load failures instead of propagating them. Explicit backup restores still surface errors.
 - **Webapp no longer flashes back to "Loading…" right after the initial

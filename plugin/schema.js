@@ -108,7 +108,7 @@ function buildPluginSchema() {
         type: "number",
         title: "Update Interval",
         description: "How often to recalculate forecasts (minutes)",
-        default: 15,
+        default: 60,
         minimum: 5,
         maximum: 60,
       },
@@ -553,7 +553,7 @@ function buildPluginSchema() {
             title: "Save Interval",
             description:
               "How often to save learning matrices to disk (minutes)",
-            default: 60,
+            default: 120,
             minimum: 10,
             maximum: 1440,
           },
