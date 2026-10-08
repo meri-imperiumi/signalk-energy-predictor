@@ -6,7 +6,8 @@
  * @file matrix.js
  */
 
-const { readFile, writeFile, mkdir } = require("node:fs/promises");
+const { open, readFile, rename, mkdir } = require("node:fs/promises");
+const { randomBytes } = require("node:crypto");
 const { dirname, join } = require("node:path");
 
 /**
@@ -28,8 +29,48 @@ async function readJsonFile(path) {
 }
 
 /**
+ * Reads and parses a JSON file, tolerating a corrupted file.
+ *
+ * A file left truncated by a power loss (or otherwise invalid JSON) is
+ * moved aside with a `.corrupt-<timestamp>` suffix so it remains available
+ * for inspection, and null is returned so callers start fresh instead of
+ * crashing the server at startup.
+ *
+ * @param {string} path - File path
+ * @returns {Promise<object|null>} Parsed object, or null if file doesn't exist or is corrupt
+ */
+async function readJsonFileSafe(path) {
+  try {
+    const content = await readFile(path, "utf-8");
+    return JSON.parse(content);
+  } catch (error) {
+    if (error.code === "ENOENT") {
+      return null;
+    }
+    if (error instanceof SyntaxError) {
+      const quarantine = `${path}.corrupt-${new Date()
+        .toISOString()
+        .replace(/[:.]/g, "-")}`;
+      try {
+        await rename(path, quarantine);
+      } catch (_renameError) {
+        // Best effort; if the rename fails we still start fresh
+      }
+      return null;
+    }
+    throw error;
+  }
+}
+
+/**
  * Writes an object as JSON to a file.
  * Creates parent directories if needed.
+ *
+ * The write is atomic: data is written to a uniquely named temp file in
+ * the target directory, flushed to disk, then renamed over the target.
+ * rename(2) is atomic, so a crash or power loss mid-write can never leave
+ * a truncated or partial JSON file at the target path — the plugin either
+ * sees the previous complete file or the new complete file.
  *
  * @param {string} path - File path
  * @param {object} data - Data to write
@@ -38,7 +79,17 @@ async function readJsonFile(path) {
 async function writeJsonFile(path, data) {
   const dir = dirname(path);
   await mkdir(dir, { recursive: true });
-  await writeFile(path, JSON.stringify(data, null, 2), "utf-8");
+  // Unique temp name so overlapping writers (periodic save cycle racing a
+  // save on stop) can never interleave into a shared temp file
+  const tmpPath = `${path}.${process.pid}-${randomBytes(6).toString("hex")}.tmp`;
+  const handle = await open(tmpPath, "w");
+  try {
+    await handle.writeFile(JSON.stringify(data, null, 2), "utf-8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  await rename(tmpPath, path);
 }
 
 /**
@@ -62,7 +113,7 @@ function matrixFilename(arrayId) {
  */
 async function loadMatrix(dataDir, arrayId) {
   const path = join(dataDir, matrixFilename(arrayId));
-  return await readJsonFile(path);
+  return await readJsonFileSafe(path);
 }
 
 /**
@@ -84,19 +135,8 @@ async function saveMatrix(dataDir, matrixData) {
  * @returns {Promise<string[]>} Array of array IDs
  */
 async function listSavedMatrices(dataDir) {
-  try {
-    const content = await readFile(
-      join(dataDir, ".matrices-manifest"),
-      "utf-8",
-    );
-    const manifest = JSON.parse(content);
-    return manifest.arrays || [];
-  } catch (error) {
-    if (error.code === "ENOENT") {
-      return [];
-    }
-    throw error;
-  }
+  const manifest = await readJsonFileSafe(join(dataDir, ".matrices-manifest"));
+  return manifest?.arrays || [];
 }
 
 /**
@@ -244,7 +284,7 @@ function loadProfilePath(dataDir) {
  */
 async function loadLoadProfile(dataDir, loadProfile) {
   const path = loadProfilePath(dataDir);
-  const data = await readJsonFile(path);
+  const data = await readJsonFileSafe(path);
 
   if (data) {
     loadProfile.fromJSON(data);
@@ -283,7 +323,7 @@ function windProtectionPath(dataDir) {
  */
 async function loadWindProtection(dataDir) {
   const path = windProtectionPath(dataDir);
-  return await readJsonFile(path);
+  return await readJsonFileSafe(path);
 }
 
 /**

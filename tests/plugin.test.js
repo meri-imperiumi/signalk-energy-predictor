@@ -5,7 +5,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mkdtemp, rm } = require("node:fs/promises");
+const { mkdtemp, rm, writeFile, readdir } = require("node:fs/promises");
 const { join } = require("node:path");
 const { tmpdir } = require("node:os");
 const { EventEmitter } = require("node:events");
@@ -1161,5 +1161,74 @@ test.describe("Solar learning regression", () => {
     );
 
     await plugin.stop();
+  });
+});
+
+test.describe("Plugin startup resilience", () => {
+  test("a truncated matrix file does not crash start()", async () => {
+    // Simulates a power loss mid-save: the plugin must start fresh instead
+    // of throwing out of start(), which crashes the whole Signal K server
+    const dir = await mkdtemp(join(tmpdir(), "energy-corrupt-"));
+    try {
+      await writeFile(
+        join(dir, ".matrices-manifest"),
+        JSON.stringify({ version: 1, arrays: ["cabin-roof"] }),
+      );
+      await writeFile(
+        join(dir, "solar-matrix-cabin-roof.json"),
+        '{"arrayId":"cabin-roof","version":1,"anchored":{"12-180":{"sam',
+      );
+
+      const app = new FakeSignalKApp();
+      const plugin = makePlugin(app);
+      const config = {
+        battery: {
+          capacityAh: 400,
+          systemVoltage: 12,
+          minSafeSoC: 0.2,
+          socPath: "electrical.batteries.house.capacity.stateOfCharge",
+          engineAlternatorWatts: 100,
+        },
+        solarArrays: [
+          {
+            id: "cabin-roof",
+            type: "fixed",
+            capacityWp: 200,
+            enabled: true,
+          },
+        ],
+        mechanicalGenerators: [],
+        learning: {
+          enabled: true,
+          saveIntervalMinutes: 60,
+          emaAlpha: 0.05,
+          defaultEfficiency: 0.7,
+        },
+        weather: {
+          openMeteoEnabled: false,
+          useLogbook: false,
+          forecastHours: 24,
+        },
+      };
+
+      app.dataPath = dir;
+      await plugin.start(config, () => {});
+
+      const matrix = plugin.__getInternals().solarMatrices.get("cabin-roof");
+      assert.ok(matrix, "fresh matrix created despite corrupt file");
+      assert.strictEqual(matrix.anchored.size, 0, "fresh matrix starts empty");
+      const quarantined = (await readdir(dir)).filter((f) =>
+        f.includes(".corrupt-"),
+      );
+      assert.strictEqual(
+        quarantined.length,
+        1,
+        "corrupt file quarantined for inspection",
+      );
+
+      await plugin.stop();
+    } finally {
+      await rm(dir, { recursive: true, force: true });
+    }
   });
 });

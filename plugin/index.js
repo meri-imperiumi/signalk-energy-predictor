@@ -1132,8 +1132,17 @@ module.exports = (app) => {
     const arrays = getActiveSolarArrays(config);
     const dataDir = app.getDataDirPath();
 
-    // Load existing matrices
-    const existing = await deps.loadMatrices(dataDir);
+    // Load existing matrices. Failures here (e.g. storage errors) must not
+    // propagate: a throw during start() takes down the whole Signal K server
+    // process and turns one bad file into a boot crash loop.
+    let existing = [];
+    try {
+      existing = await deps.loadMatrices(dataDir);
+    } catch (error) {
+      app.error(
+        `Failed to load saved solar matrices, starting fresh: ${error.message}`,
+      );
+    }
 
     // Create matrix instances
     for (const array of arrays) {

@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Fixed
+- **A corrupted learning-matrix file no longer crash-loops the whole Signal K server at startup** (`plugin/matrix.js`, `plugin/index.js`): matrix/load-profile/wind-protection JSON files were written non-atomically, so a power loss during a periodic save (every 15 minutes by default) could leave a truncated file, and the next plugin start then threw `Unexpected end of JSON input` out of `start()`, taking the server process down in a restart loop. Writes are now atomic (temp file + fsync + rename, uniquely named per write so overlapping saves can't interleave), startup reads tolerate invalid JSON by moving the unreadable file aside as `<name>.corrupt-<timestamp>` (kept for inspection) and starting fresh, and `initializeMatrices` catches load failures instead of propagating them. Explicit backup restores still surface errors.
 - **Webapp no longer flashes back to "Loading…" right after the initial
   load** (`public/ep-app.js`): on open the app fetched the day window
   anchored on the browser timezone while `/api/vessel` was still in
