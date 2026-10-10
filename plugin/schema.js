@@ -646,6 +646,15 @@ function buildPluginSchema() {
             minimum: 1,
             maximum: 168,
           },
+          meteredRefreshHours: {
+            type: "number",
+            title: "Metered Uplink Forecast Refresh (hours)",
+            description:
+              "While the uplink is metered (volume-billed: satellite, roaming LTE), the forecast normally comes only from the Signal K Weather provider. With a value of 1 or more, one direct Open-Meteo download (~3 kB) per this many hours is allowed when the provider yields nothing. 0 keeps the default behaviour of never downloading Open-Meteo on a metered link. One Open-Meteo request is ~2.6 kB plus TLS overhead; 6 or 12 suits a tighter data budget",
+            default: 0,
+            minimum: 0,
+            maximum: 168,
+          },
         },
       },
       recording: {

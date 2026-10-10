@@ -20,6 +20,7 @@ In addition to forecasting, the plugin tries to identify and notify user of sign
 * Energy deficit detection with tiered run recommendations — a genset (if configured) is suggested before the propulsion engine, with sustained-violation thresholds, minimum-run batching, cooldowns, and an overnight hold for the engine so sunrise can recover the bank
 * Data sanitization: pauses the learning model when the engine is running or solar chargers are in float/absorption, preventing skewed efficiency data
 * Automatic forecast download when Starlink goes online
+* Metered-uplink awareness: on a volume-billed uplink (satellite, roaming LTE) the forecast prefers the Signal K Weather provider; without a provider installed it falls back to the cached forecast and the offline ladder, unless the `Metered Uplink Forecast Refresh` setting allows periodic direct Open-Meteo downloads (~3 kB each)
 
 ## Status
 

@@ -993,6 +993,164 @@ test.describe("Offline forecast restore + staleness + uplink cadence", () => {
     }
   });
 
+  test("meteredRefreshHours defaults to 0 (never download Open-Meteo while metered)", () => {
+    const fsm = makeFSM();
+    assert.strictEqual(fsm.meteredRefreshHours, 0);
+    assert.strictEqual(fsm.meteredRefreshMs, 0);
+    assert.strictEqual(fsm.meteredRefreshDue(Date.now()), false);
+  });
+
+  test("meteredRefreshHours defers Open-Meteo until the Weather provider yields nothing", async () => {
+    // Tier 2 gets first shot; only when it yields nothing is one WAN
+    // download bought per the configured cadence (GitHub #5)
+    const fsm = new IngestionFSM(makeApp(), { meteredRefreshHours: 6 });
+    fsm.position = { latitude: 60.17, longitude: 24.94 };
+    fsm.setUplinkStatus({ internet: "metered" });
+    const origFetch = globalThis.fetch;
+    const wanUrls = [];
+    const t0 = new Date();
+    t0.setUTCMinutes(0, 0, 0);
+    const time = [0, 1].map((i) =>
+      new Date(t0.getTime() + i * 3600000)
+        .toISOString()
+        .slice(0, 13)
+        .concat(":00"),
+    );
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u.includes("open-meteo")) {
+        wanUrls.push(u);
+        return {
+          ok: true,
+          json: async () => ({
+            hourly: {
+              time,
+              shortwave_radiation: [100, 50],
+              wind_speed_10m: [18, 16],
+              wind_gusts_10m: [27, 25],
+              wind_direction_10m: [90, 95],
+            },
+          }),
+        };
+      }
+      // Weather API and logbook unreachable
+      throw new Error("connection refused");
+    };
+
+    try {
+      const forecast = await fsm.fetchForecast();
+      assert.strictEqual(wanUrls.length, 1);
+      assert.strictEqual(fsm.currentTier, Tier.OPEN_METEO);
+      assert.ok(
+        fsm.lastMeteredOpenMeteoFetch,
+        "metered download must be stamped",
+      );
+      assert.ok(forecast.length > 0);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  test("meteredRefreshHours keeps the Weather provider preferred while it answers", async () => {
+    const fsm = new IngestionFSM(
+      makeAppWithWeather([
+        {
+          date: new Date(Date.now() + 3600000).toISOString(),
+          type: "point",
+          outside: { cloudCover: 0.25 },
+          wind: { speedTrue: 6, directionTrue: Math.PI / 2, gust: 9 },
+        },
+      ]),
+      { meteredRefreshHours: 6 },
+    );
+    fsm.position = { latitude: 60.17, longitude: 24.94 };
+    fsm.setUplinkStatus({ internet: "metered" });
+    const origFetch = globalThis.fetch;
+    const wanUrls = [];
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u.includes("open-meteo")) {
+        wanUrls.push(u);
+        throw new Error("Open-Meteo must not be called while tier 2 answers");
+      }
+      throw new Error(`unexpected fetch: ${u}`);
+    };
+
+    try {
+      const forecast = await fsm.fetchForecast();
+      assert.strictEqual(
+        wanUrls.length,
+        0,
+        "no WAN download may be bought while the Weather provider serves",
+      );
+      assert.strictEqual(fsm.currentTier, Tier.SIGNAL_K_WEATHER);
+      assert.strictEqual(forecast.length, 1);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
+  test("meteredRefreshHours cadence gates repeat downloads", async () => {
+    const fsm = new IngestionFSM(makeApp(), { meteredRefreshHours: 6 });
+    fsm.position = { latitude: 60.17, longitude: 24.94 };
+    fsm.setUplinkStatus({ internet: "metered" });
+    const origFetch = globalThis.fetch;
+    let wanCalls = 0;
+    const t0 = new Date();
+    t0.setUTCMinutes(0, 0, 0);
+    const time = [0, 1].map((i) =>
+      new Date(t0.getTime() + i * 3600000)
+        .toISOString()
+        .slice(0, 13)
+        .concat(":00"),
+    );
+    const payload = {
+      hourly: {
+        time,
+        shortwave_radiation: [100, 50],
+        wind_speed_10m: [18, 16],
+        wind_gusts_10m: [27, 25],
+        wind_direction_10m: [90, 95],
+      },
+    };
+    globalThis.fetch = async (url) => {
+      if (String(url).includes("open-meteo")) {
+        wanCalls++;
+        return { ok: true, json: async () => payload };
+      }
+      throw new Error("connection refused");
+    };
+
+    try {
+      await fsm.fetchForecast();
+      assert.strictEqual(wanCalls, 1);
+
+      // Immediate refetch: both the 1 h online cadence and the 6 h metered
+      // cadence suppress a second download
+      fsm.lastOnlineFetchAttempt = Date.now() - 2 * 3600000;
+      await fsm.fetchForecast();
+      assert.strictEqual(wanCalls, 1);
+
+      // Online cadence due again, but only 5 h of the 6 h metered cadence
+      // have elapsed: still no download, offline ladder serves instead
+      fsm.lastOnlineFetchAttempt = Date.now() - 2 * 3600000;
+      fsm.lastMeteredOpenMeteoFetch = new Date(Date.now() - 5 * 3600000);
+      await fsm.fetchForecast();
+      assert.strictEqual(wanCalls, 1);
+      assert.strictEqual(fsm.currentTier, Tier.CLEAR_SKY);
+
+      // Cadence due: one more download is bought (the 60 s failure floor
+      // between raw network attempts is also rewound)
+      fsm.lastOnlineFetchAttempt = Date.now() - 2 * 3600000;
+      fsm.lastFetchAttempt = new Date(Date.now() - 2 * 3600000);
+      fsm.lastMeteredOpenMeteoFetch = new Date(Date.now() - 7 * 3600000);
+      await fsm.fetchForecast();
+      assert.strictEqual(wanCalls, 2);
+    } finally {
+      globalThis.fetch = origFetch;
+    }
+  });
+
   test("unmetered online uplink still fetches Open-Meteo first", async () => {
     const fsm = makeFSM();
     fsm.setUplinkStatus({ internet: "online" });

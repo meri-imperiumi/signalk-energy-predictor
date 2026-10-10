@@ -3099,6 +3099,7 @@ module.exports = (app) => {
       ingestionFSM = new deps.IngestionFSM(app, {
         forecastHours: config.weather?.forecastHours,
         forecastCacheHours: config.weather?.forecastCacheHours,
+        meteredRefreshHours: config.weather?.meteredRefreshHours,
         dataDir: app.getDataDirPath(),
       });
       advisoryPublisher = new deps.AdvisoryPublisher(app, plugin.id);

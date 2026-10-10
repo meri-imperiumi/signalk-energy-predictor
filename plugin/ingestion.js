@@ -19,7 +19,10 @@
  *
  * On a metered uplink (`network.internet.state` = `metered`) tier 1 is
  * skipped in favor of tier 2: an in-process provider read instead of a
- * volume-billed WAN download (work doc #19).
+ * volume-billed WAN download (work doc #19). The `weather.meteredRefreshHours`
+ * setting relaxes this: with a value ≥ 1, tier 2 is still preferred, but one
+ * tier-1 download per the configured interval is allowed when tier 2 yields
+ * nothing (GitHub #5).
  *
  * @file ingestion.js
  */
@@ -602,8 +605,16 @@ class IngestionFSM {
    *        them offline (same store/format as the historical backfill cache),
    *        and a cold-start/offline FSM can restore the last good forecast
    *        from it instead of falling straight to clear-sky (work doc #15).
+   * @param {number} [opts.meteredRefreshHours] - While the uplink is metered,
+   *        allow one tier-1 Open-Meteo download per this many hours when the
+   *        Signal K Weather provider yields nothing. 0 (default) keeps the
+   *        work-doc-#19 behaviour of never downloading Open-Meteo while
+   *        metered (GitHub #5).
    */
-  constructor(app, { forecastHours, forecastCacheHours, dataDir } = {}) {
+  constructor(
+    app,
+    { forecastHours, forecastCacheHours, meteredRefreshHours, dataDir } = {},
+  ) {
     this.app = app;
     this.currentTier = Tier.OPEN_METEO;
     this.forecastHours = Math.min(
@@ -630,11 +641,25 @@ class IngestionFSM {
      * roaming LTE). On a metered link the FSM skips the tier-1 Open-Meteo
      * download and reads tier 2 (Signal K Weather provider) — a same-server
      * localhost request — instead, reusing forecasts a provider plugin has
-     * already fetched under its own data budget. Never downloads to WAN on
-     * our own initiative while set. Reset together with `uplinkOnline`
-     * (work doc #19).
+     * already fetched under its own data budget. With
+     * `weather.meteredRefreshHours` ≥ 1 one tier-1 download per the
+     * configured interval is allowed when tier 2 yields nothing; otherwise
+     * never downloads to WAN on our own initiative while set. Reset together
+     * with `uplinkOnline` (work doc #19, relaxed per GitHub #5).
      */
     this.uplinkMetered = false;
+    /**
+     * Metered-uplink tier-1 refresh cadence, in hours (0 = never download
+     * Open-Meteo while metered, the pre-#5 behaviour).
+     */
+    this.meteredRefreshHours = Math.max(0, meteredRefreshHours ?? 0);
+    this.meteredRefreshMs = this.meteredRefreshHours * 3600000;
+    /**
+     * Timestamp of the last tier-1 Open-Meteo download issued *while the
+     * uplink was metered*. Gates the `meteredRefreshHours` cadence; tier-2
+     * successes and unmetered downloads leave it untouched.
+     */
+    this.lastMeteredOpenMeteoFetch = null;
     /**
      * Timestamp (ms) of the last fetch attempt made *while uplink was online*.
      * Used to cap online refetches to ~1 h even if the staleness window would
@@ -980,61 +1005,51 @@ class IngestionFSM {
       //   - Clear Sky always succeeds (pure sun geometry), so it would shadow
       //     a restored real (stale) forecast, which is strictly better.
       // Both are reached only via the restore/hybrid/clear-sky fallback below.
+      // On a metered uplink with `weather.meteredRefreshHours` ≥ 1, the
+      // tier-1 Open-Meteo download is deferred past tier 2 (Signal K Weather
+      // provider): the provider serves a forecast it already fetched under
+      // its own data budget, so the ~2.6 kB WAN download is only bought when
+      // tier 2 yields nothing and the configured cadence is due (GitHub #5).
+      let meteredTier1Due = false;
       for (let tier = Tier.OPEN_METEO; tier < Tier.LOGBOOK; tier++) {
         // On a metered (volume-billed) uplink, skip the tier-1 Open-Meteo
         // download and read tier 2 instead: the Signal K Weather API is a
         // same-server localhost request serving forecasts a provider plugin
         // has already fetched under its own data budget (work doc #19). If
         // tier 2 yields nothing, fall through to the offline ladder below —
-        // do not buy a WAN download the user did not opt into.
+        // do not buy a WAN download the user did not opt into, unless the
+        // metered refresh cadence allows one (GitHub #5).
         if (tier === Tier.OPEN_METEO && this.uplinkMetered) {
-          this.app.debug(
-            "Uplink is metered — skipping Open-Meteo download, reading Signal K Weather provider",
-          );
+          if (this.meteredRefreshDue(attemptNow)) {
+            meteredTier1Due = true;
+            this.app.debug(
+              `Uplink is metered — trying the Signal K Weather provider first, Open-Meteo allowed every ${this.meteredRefreshHours} h`,
+            );
+          } else {
+            this.app.debug(
+              "Uplink is metered — skipping Open-Meteo download, reading Signal K Weather provider",
+            );
+          }
           continue;
         }
-        this.app.debug(`Trying tier ${tier}: ${this.getTierName(tier)}`);
-        let forecast;
-        try {
-          forecast = await this.fetchFromTier(tier);
-        } catch (error) {
-          // A failing tier (network error, timeout) must not abort the
-          // fallback chain - try the next tier instead
-          this.app.debug(
-            `Tier ${this.getTierName(tier)} failed: ${error.message}`,
-          );
+        const forecast = await this.attemptTier(tier, attemptNow);
+        if (forecast == null) {
           continue;
         }
-        // A tier "success" must carry hours that are still in the future:
-        // a Signal K Weather provider serving its own stale dataset answers
-        // with points that are all in the past, which would otherwise be
-        // published as a fresh tier-2 forecast with zero future coverage
-        // (shadowing the on-disk restore). The 2 h grace absorbs
-        // hour-truncated timestamps, not stale datasets.
-        if (
-          forecast &&
-          forecast.length > 0 &&
-          !isDegenerateForecast(forecast) &&
-          hasFutureCoverage(forecast, attemptNow, 2 * 3600000)
-        ) {
-          this.currentTier = tier;
-          this.lastFetchTime = new Date();
-          this.lastForecast = this.postProcessForecast(forecast);
-          this.announcedStaleServe = false;
-          this.announcedCacheHit = false;
-          this.app.debug(
-            `Got ${this.lastForecast.length} forecast points from ${this.getTierName(tier)}`,
-          );
-          await this.cacheForecast();
-          return this.lastForecast;
-        }
-        if (forecast && forecast.length > 0) {
-          // Degenerate (all-zero) or all-past payload: a "success" that
-          // carries no usable forecast. Treat as a failed tier, never cache
-          // it.
-          this.app.debug(
-            `Tier ${this.getTierName(tier)} returned a degenerate or all-past forecast — trying next tier`,
-          );
+        return await this.commitTierForecast(tier, forecast);
+      }
+
+      // Deferred metered tier-1 download: tier 2 had its chance and the
+      // configured refresh cadence is due. Mark the attempt even on failure
+      // so a dead link does not retry more often than the cadence.
+      if (meteredTier1Due) {
+        this.lastMeteredOpenMeteoFetch = new Date(attemptNow);
+        this.app.debug(
+          "Tier 2 yielded nothing — fetching Open-Meteo on the metered uplink",
+        );
+        const forecast = await this.attemptTier(Tier.OPEN_METEO, attemptNow);
+        if (forecast != null) {
+          return await this.commitTierForecast(Tier.OPEN_METEO, forecast);
         }
       }
     }
@@ -1056,6 +1071,94 @@ class IngestionFSM {
       return restored;
     }
     return this.buildStaleHybridForecast();
+  }
+
+  /**
+   * Whether a metered-uplink tier-1 Open-Meteo download is due:
+   * `weather.meteredRefreshHours` ≥ 1 and the configured interval has
+   * elapsed since the last metered download (or none has happened yet).
+   *
+   * @param {number} attemptNow - Attempt timestamp (ms)
+   * @returns {boolean} True when the metered cadence allows a download
+   */
+  meteredRefreshDue(attemptNow) {
+    if (!(this.meteredRefreshMs > 0)) {
+      return false;
+    }
+    if (!this.lastMeteredOpenMeteoFetch) {
+      return true;
+    }
+    return (
+      attemptNow - this.lastMeteredOpenMeteoFetch.getTime() >=
+      this.meteredRefreshMs
+    );
+  }
+
+  /**
+   * Fetches one forecast tier and applies the usability checks shared by
+   * the tier loop and the deferred metered Open-Meteo attempt.
+   *
+   * A tier "success" must carry hours that are still in the future: a
+   * Signal K Weather provider serving its own stale dataset answers with
+   * points that are all in the past, which would otherwise be published as
+   * a fresh tier-2 forecast with zero future coverage (shadowing the on-disk
+   * restore). The 2 h grace absorbs hour-truncated timestamps, not stale
+   * datasets.
+   *
+   * @param {number} tier - Tier id
+   * @param {number} attemptNow - Attempt timestamp (ms)
+   * @returns {Promise<Array|null>} Raw usable forecast points, or null when
+   *   the tier failed, returned nothing usable, or was degenerate
+   */
+  async attemptTier(tier, attemptNow) {
+    this.app.debug(`Trying tier ${tier}: ${this.getTierName(tier)}`);
+    let forecast;
+    try {
+      forecast = await this.fetchFromTier(tier);
+    } catch (error) {
+      // A failing tier (network error, timeout) must not abort the
+      // fallback chain - try the next tier instead
+      this.app.debug(`Tier ${this.getTierName(tier)} failed: ${error.message}`);
+      return null;
+    }
+    if (
+      forecast &&
+      forecast.length > 0 &&
+      !isDegenerateForecast(forecast) &&
+      hasFutureCoverage(forecast, attemptNow, 2 * 3600000)
+    ) {
+      return forecast;
+    }
+    if (forecast && forecast.length > 0) {
+      // Degenerate (all-zero) or all-past payload: a "success" that
+      // carries no usable forecast. Treat as a failed tier, never cache
+      // it.
+      this.app.debug(
+        `Tier ${this.getTierName(tier)} returned a degenerate or all-past forecast — trying next tier`,
+      );
+    }
+    return null;
+  }
+
+  /**
+   * Records a successful tier fetch: sets the active tier, post-processes,
+   * caches and returns the forecast.
+   *
+   * @param {number} tier - Tier id that produced the forecast
+   * @param {Array} forecast - Raw forecast points from the tier
+   * @returns {Promise<Array>} Post-processed forecast
+   */
+  async commitTierForecast(tier, forecast) {
+    this.currentTier = tier;
+    this.lastFetchTime = new Date();
+    this.lastForecast = this.postProcessForecast(forecast);
+    this.announcedStaleServe = false;
+    this.announcedCacheHit = false;
+    this.app.debug(
+      `Got ${this.lastForecast.length} forecast points from ${this.getTierName(tier)}`,
+    );
+    await this.cacheForecast();
+    return this.lastForecast;
   }
 
   /**
