@@ -350,7 +350,16 @@ test.describe("builders over recorded fixtures", () => {
 
   test.after(async () => {
     store.close();
-    await fs.rm(dataDir, { recursive: true, force: true });
+    // maxRetries/retryDelay: background work started by a test (e.g. the
+    // retro-weather cache warm still writing day files after its response
+    // returned) can race the recursive rm with a fresh file — ENOTEMPTY on
+    // the final rmdir. fs.rm retries exactly those errors.
+    await fs.rm(dataDir, {
+      recursive: true,
+      force: true,
+      maxRetries: 10,
+      retryDelay: 50,
+    });
   });
 
   async function loadSamples(from, to) {
@@ -596,7 +605,14 @@ test.describe("route registration", () => {
       await fn(dataDir, store);
     } finally {
       store.close();
-      await fs.rm(dataDir, { recursive: true, force: true });
+      // See the test.after cleanup note: background writers (retro-weather
+      // warm) can race the rm; retry the transient ENOTEMPTY.
+      await fs.rm(dataDir, {
+        recursive: true,
+        force: true,
+        maxRetries: 10,
+        retryDelay: 50,
+      });
     }
   }
 

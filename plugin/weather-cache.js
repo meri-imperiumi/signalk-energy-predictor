@@ -337,6 +337,15 @@ async function writeWeatherCache(dataDir, dateKey, bucket, hours, tier) {
   try {
     await handle.writeFile(JSON.stringify(serializeHours(merged)), "utf-8");
     await handle.sync();
+  } catch (error) {
+    // Never leak the temp file if the write itself fails (e.g. the parent
+    // directory vanished mid-write)
+    try {
+      await fs.unlink(tmpPath);
+    } catch (_unlinkError) {
+      /* best effort */
+    }
+    throw error;
   } finally {
     await handle.close();
   }

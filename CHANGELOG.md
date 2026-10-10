@@ -12,6 +12,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **Wind-protection learning recorded a burst of duplicate observations per throttle gate** (`plugin/index.js`): the learning pass is fired un-awaited on every wind-bearing delta and awaits the forecast fetch after the throttle check — so when the 5-minute gate opened, every invocation already in flight completed and learned, measured in production as 4–5 duplicate records per gate (~1,376 wind-protection records/day, 5× the intended volume) and 4–5 EMA updates on the same evidence. A synchronous in-flight claim now collapses concurrent invocations into one completed pass; failed attempts still do not consume the throttle slot.
+- **A failed weather-cache write no longer leaks its temp file** (`plugin/weather-cache.js`): if anything failed between the temp file being created and the atomic rename (e.g. the parent directory disappearing mid-write), the `.tmp` file stayed behind; it is now unlinked on failure.
 
 ## [0.12.0] - 2026-10-11
 
