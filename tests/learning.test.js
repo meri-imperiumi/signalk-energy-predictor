@@ -275,6 +275,19 @@ test.describe("SolarMatrix", () => {
         );
       }
     });
+
+    test("maxSoc option raises the state-of-charge gate", () => {
+      // LiFePO4 banks stay in bulk nearly to full; with the hardcoded 0.8
+      // gate the best-learning hours of the season were discarded
+      const readings = {
+        engineRunning: false,
+        batterySoc: 0.9,
+        shorePowerConnected: false,
+      };
+      assert.strictEqual(isValidTick(readings), false); // default 0.8 gate
+      assert.strictEqual(isValidTick(readings, { maxSoc: 0.98 }), true);
+      assert.strictEqual(isValidTick(readings, { maxSoc: 0.85 }), false);
+    });
   });
 
   test.describe("normalizeControllerMode", () => {
@@ -367,6 +380,28 @@ test.describe("SolarMatrix", () => {
         },
       });
       assert.strictEqual(result, true);
+    });
+
+    test("update honors the maxSoc gate override", () => {
+      const matrix = new SolarMatrix("test-array");
+      const params = {
+        navState: "anchored",
+        actualPowerW: 50,
+        capacityWp: 100,
+        ghi: 683.5,
+        sunAzimuthRad: 0,
+        sunElevationRad: Math.PI / 6,
+        awaRad: null,
+        readings: {
+          engineRunning: false,
+          batterySoc: 0.9,
+          shorePowerConnected: false,
+        },
+      };
+      // Default 0.8 gate drops the tick
+      assert.strictEqual(matrix.update(params), false);
+      // Raised gate (LiFePO4-style) lets it through
+      assert.strictEqual(matrix.update({ ...params, maxSoc: 0.98 }), true);
     });
 
     test("does not update on invalid tick", () => {

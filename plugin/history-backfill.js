@@ -11,6 +11,7 @@ const {
   SolarMatrix,
   theoreticalPower,
   normalizeControllerMode,
+  DEFAULT_MAX_SOC,
 } = require("./learning.js");
 const { sunPosition, irradianceFromCloudCover } = require("./solar.js");
 const {
@@ -873,6 +874,7 @@ function engineRunningAt(point, columns, columnIndexes) {
  * @param {number} [params.latitude] - Fallback latitude when position history is absent
  * @param {number} [params.longitude] - Fallback longitude when position history is absent
  * @param {number} [params.resolution] - Sample resolution in seconds
+ * @param {number} [params.maxSoc] - Learning SoC gate override (see isValidTick)
  * @returns {{dataPoints: number, binUpdates: number, droppedTicks: number, totalActualWh: number, totalPredictedWh: number, mae: number, rmse: number}}
  */
 function replayHistory({
@@ -884,6 +886,7 @@ function replayHistory({
   latitude,
   longitude,
   resolution = DEFAULT_RESOLUTION,
+  maxSoc = DEFAULT_MAX_SOC,
 }) {
   if (!array.powerPath) {
     throw new Error(`Array ${array.id} has no power path configured`);
@@ -1001,6 +1004,7 @@ function replayHistory({
           columnValue(point, controllerModeColumn),
         ),
       },
+      maxSoc,
     });
 
     if (updated) {
@@ -1355,6 +1359,7 @@ async function populateFromHistory({
       historyData,
       weather,
       resolution,
+      maxSoc: config.learning?.maxSoc ?? DEFAULT_MAX_SOC,
     });
 
     matrices.push(matrix.toJSON());

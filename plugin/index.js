@@ -375,6 +375,9 @@ const DEFAULT_CONFIG = {
     saveIntervalMinutes: 120,
     emaAlpha: 0.05,
     defaultEfficiency: 0.7,
+    // Learning SoC gate: drop ticks at or above this state of charge
+    // (controller may be limiting near full). Raise for LiFePO4.
+    maxSoc: 0.8,
   },
   weather: {
     preferredProvider: "",
@@ -2507,6 +2510,8 @@ module.exports = (app) => {
           sunElevationRad: sunPos.altitude,
           awaRad: awa,
           readings,
+          maxSoc:
+            pluginConfig?.learning?.maxSoc ?? DEFAULT_CONFIG.learning.maxSoc,
         });
         updatedArrays++;
       }

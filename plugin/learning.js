@@ -176,6 +176,15 @@ function emaUpdate(existingEfficiency, observedEfficiency, alpha = EMA_ALPHA) {
 }
 
 /**
+ * Default state-of-charge learning gate: ticks at or above this SoC are
+ * dropped because the charge controller may be limiting output near full.
+ * Configurable via `learning.maxSoc` (GitHub #3) — LiFePO4 banks stay in
+ * bulk nearly to full, where a 0.8 gate would discard the best-learning
+ * hours of the season.
+ */
+const DEFAULT_MAX_SOC = 0.8;
+
+/**
  * Victron solar charger operation-mode codes (VE.Direct `OperationMode`,
  * as published by e.g. bt-sensors-plugin-sk as `{ code, message }`).
  * Only code 3 (BULK) is bulk-equivalent; anything else is limiting or off.
@@ -252,9 +261,13 @@ function normalizeControllerMode(raw) {
  *        `normalizeControllerMode` first, so raw bt-sensors-style
  *        `{ code, message }` objects, upper-case labels and Victron numeric
  *        codes are all handled.
+ * @param {object} [options] - Gate options
+ * @param {number} [options.maxSoc=DEFAULT_MAX_SOC] - Drop ticks at or above
+ *        this state of charge [0, 1]. Raise it for chemistries whose
+ *        controllers stop limiting only near full (e.g. LiFePO4 at 0.98).
  * @returns {boolean} True if tick is valid for learning
  */
-function isValidTick(readings) {
+function isValidTick(readings, { maxSoc = DEFAULT_MAX_SOC } = {}) {
   const { engineRunning, batterySoc, shorePowerConnected, controllerMode } =
     readings;
 
@@ -263,8 +276,8 @@ function isValidTick(readings) {
     return false;
   }
 
-  // Battery full - drop tick (controller may be limiting)
-  if (batterySoc != null && batterySoc >= 0.8) {
+  // Battery (nearly) full - drop tick (controller may be limiting)
+  if (batterySoc != null && batterySoc >= maxSoc) {
     return false;
   }
 
@@ -353,6 +366,7 @@ class SolarMatrix {
    * @param {number} params.sunElevationRad - Sun elevation in radians
    * @param {number|null} params.awaRad - Apparent Wind Angle in radians (for sailing state)
    * @param {object} params.readings - Telemetry readings for sanitization gate
+   * @param {number} [params.maxSoc] - Learning SoC gate override (see isValidTick)
    * @returns {boolean} True if matrix was updated
    */
   update(params) {
@@ -365,10 +379,11 @@ class SolarMatrix {
       sunElevationRad,
       awaRad,
       readings,
+      maxSoc,
     } = params;
 
     // Pass through sanitization gate
-    if (!isValidTick(readings)) {
+    if (!isValidTick(readings, { maxSoc })) {
       return false;
     }
 
@@ -448,6 +463,7 @@ module.exports = {
   normalizeControllerMode,
   EMA_ALPHA,
   DEFAULT_EFFICIENCY,
+  DEFAULT_MAX_SOC,
   AZIMUTH_BIN,
   ELEVATION_BIN,
   AWA_BIN,

@@ -593,6 +593,15 @@ function buildPluginSchema() {
             minimum: 0.1,
             maximum: 1.0,
           },
+          maxSoc: {
+            type: "number",
+            title: "Maximum Learning SoC",
+            description:
+              "Learning drops samples at or above this state of charge, since the charge controller may be limiting output near full. Raise it for chemistries whose controllers stay in bulk nearly to full — e.g. 0.98 for a LiFePO4 bank — otherwise the best-learning hours of the season are discarded",
+            default: 0.8,
+            minimum: 0.5,
+            maximum: 1.0,
+          },
         },
       },
       weather: {
