@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Changed
+- **Per-cycle deploy-state seeding reads 6 h of samples instead of 48 h** (`plugin/index.js`): `getLastDeployStates()` loaded and JSON-parsed every sample from the last 48 hours (~576 records at the 5-min cadence) on every prediction cycle, then discarded everything older than the 6-hour freshness window; the plugin-start sticky-state seed loaded the same 48 hours to use just the newest sample. Both now use the store's existing newest-first `latestRecords()` read bounded by the freshness window, so the prediction cycle and startup do the same work with two orders of magnitude less parsing.
 - **Windowed record reads stall the event loop in small chunks instead of 2000-row ones** (`plugin/storage.js`): the keyset-paginated SQLite reads parse each page in one synchronous batch, so the page size is the size of a single event-loop stall — and the webapp fires all five window endpoints concurrently on every prediction-cycle refresh. The default keyset page drops from 2000 to 250 rows: on a month-view load (~8–9k samples) the loop now yields in ~30 low-millisecond chunks instead of 4–5 ~50 ms ones (several times worse on Pi-class boards), with unchanged total wall time since keyset seeks are index-cheap.
 
 ### Added

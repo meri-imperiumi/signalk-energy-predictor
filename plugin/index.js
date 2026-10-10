@@ -1267,19 +1267,24 @@ module.exports = (app) => {
     if (!recorder) return null;
     try {
       const now = Date.now();
-      const from = new Date(now - 2 * 24 * 3600000);
-      const to = new Date(now);
-      const samples = await recorder.getRecords("sample", from, to);
+      // Newest-first within the freshness window only. The previous
+      // implementation loaded every sample from the last 48 h (~576 records
+      // at the 5-min cadence) and JSON-parsed them on every prediction
+      // cycle, then discarded everything older than the freshness cutoff;
+      // the bounded newest-first read returns the same usable set — at most
+      // the samples the freshness window can even contain — without the
+      // per-cycle parse work.
+      const samples = recorder.latestRecords(
+        "sample",
+        new Date(now - SEED_FRESHNESS_MS),
+        DEPLOY_SEED_MAX_SAMPLES,
+      );
       if (samples.length === 0) return null;
       // Walk newest-first; take the most recent definite state per device
       // within the freshness window. A device absent from the newest sample
       // (e.g. FLINsail at night) is recovered from an earlier sample.
       const result = {};
-      const cutoff = now - SEED_FRESHNESS_MS;
-      for (let i = samples.length - 1; i >= 0; i--) {
-        const s = samples[i];
-        const ts = new Date(s.timestamp).getTime();
-        if (Number.isNaN(ts) || ts < cutoff) break; // older than freshness
+      for (const s of samples) {
         const states = s.deployStates;
         if (!states || typeof states !== "object") continue;
         for (const [id, state] of Object.entries(states)) {
@@ -1314,15 +1319,17 @@ module.exports = (app) => {
     if (!recorder) return;
     try {
       const now = Date.now();
-      // Look back up to 2 days for the most recent sample
-      const from = new Date(now - 2 * 24 * 3600000);
-      const to = new Date(now);
-      const samples = await recorder.getRecords("sample", from, to);
-      if (samples.length === 0) {
+      // Look back up to 2 days for the most recent sample — newest-first
+      // LIMIT 1 instead of loading and parsing every sample in the window
+      const [last] = recorder.latestRecords(
+        "sample",
+        new Date(now - 2 * 24 * 3600000),
+        1,
+      );
+      if (!last) {
         app.debug("seedStickyState: no recent samples found, skipping seed");
         return;
       }
-      const last = samples[samples.length - 1];
       // Seed navState only if the server doesn't have it
       if (
         last.navState &&
@@ -2103,6 +2110,14 @@ module.exports = (app) => {
    * night so the live inference yields null) while bounding staleness.
    */
   const SEED_FRESHNESS_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+  /**
+   * Hard ceiling on samples fetched for deploy-state seeding — a full day
+   * at the 5-min recording cadence, far above what the 6 h freshness window
+   * can contain. Pure safety bound for the LIMIT on the newest-first read;
+   * the freshness window, not this number, decides what is used.
+   */
+  const DEPLOY_SEED_MAX_SAMPLES = 288;
 
   /**
    * Rolling solar power samples per path for running averages.
