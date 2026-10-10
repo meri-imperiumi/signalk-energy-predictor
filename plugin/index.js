@@ -492,6 +492,15 @@ module.exports = (app) => {
    */
   const activePredictionCycles = new Set();
 
+  /**
+   * When the last prediction cycle actually started (ms). Gates the
+   * uplink-online edge trigger: a flapping link fires the edge on every
+   * recovered probe, and a full cycle per edge flooded the record store
+   * (measured in production).
+   * @type {number}
+   */
+  let lastPredictionCycleStartedAt = 0;
+
   /** @type {Function[]} */
   const unsubscribes = [];
 
@@ -1581,6 +1590,9 @@ module.exports = (app) => {
     }
 
     app.debug("Starting prediction cycle...");
+    // Stamp before the (possibly slow) forecast fetch: rapid uplink flaps
+    // must see a fresh cycle stamp even while this one is in flight
+    lastPredictionCycleStartedAt = Date.now();
 
     try {
       // Get weather forecast
@@ -2090,8 +2102,17 @@ module.exports = (app) => {
     arrivedAt: null,
     /** @type {number|null} last WPF learning tick (ms), throttled */
     lastLearn: 0,
+    /** @type {boolean} in-flight claim: one learning pass at a time */
+    learning: false,
   };
   const WPF_LEARN_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes
+
+  /**
+   * Minimum age of the last prediction cycle for an uplink-online edge to
+   * trigger another one. Below this, a recovered probe is treated as link
+   * flapping rather than a connectivity recovery worth an immediate cycle.
+   */
+  const UPLINK_EDGE_CYCLE_MIN_GAP_MS = 10 * 60 * 1000; // 10 minutes
 
   /**
    * Delay before the first prediction cycle at startup, so
@@ -2211,7 +2232,26 @@ module.exports = (app) => {
               });
               if (becameOnline) {
                 app.debug("Uplink came online — triggering forecast fetch");
-                schedulePredictionCycle("Uplink-online prediction cycle");
+                // Flapping-link guard: signalk-internet toggles
+                // offline↔online on every failed connectivity probe, and
+                // each recovery edge used to trigger a full prediction
+                // cycle — ~500 cycles/day measured in production (median
+                // gap 82 s against the configured 15-min interval), each
+                // writing a full cycle record to the store. Run the edge
+                // cycle only when the last one is old enough that fresh
+                // uplink data can actually change something; between edges
+                // the scheduled cycle and the 1 h online fetch cap cover
+                // the refresh.
+                if (
+                  Date.now() - lastPredictionCycleStartedAt >
+                  UPLINK_EDGE_CYCLE_MIN_GAP_MS
+                ) {
+                  schedulePredictionCycle("Uplink-online prediction cycle");
+                } else {
+                  app.debug(
+                    "Edge prediction cycle skipped: the last cycle is fresh",
+                  );
+                }
               }
             }
 
@@ -2555,8 +2595,6 @@ module.exports = (app) => {
   async function runWindProtectionLearning() {
     if (!windProtection || !ingestionFSM) return;
 
-    const cfg = pluginConfig?.windProtection || {};
-
     // Only learn at rest
     const navStateRaw =
       deltaState.get("navigation.state") || app.getSelfPath("navigation.state");
@@ -2572,9 +2610,35 @@ module.exports = (app) => {
 
     // Throttle: don't learn more often than the WPF interval
     const now = Date.now();
-    if (now - wpfState.lastLearn < WPF_LEARN_INTERVAL_MS) {
+    if (now - wpfState.lastLearn < WPF_LEARN_INTERVAL_MS || wpfState.learning) {
       return;
     }
+    // Claim the throttle slot synchronously, before any await. This
+    // function is fired un-awaited on every wind-bearing delta and the
+    // forecast fetch below yields — without the claim, every invocation
+    // already past the gate completes once the fetch resolves, producing
+    // a burst of duplicate observations (4-5 per gate opening measured in
+    // production: each an extra recorder INSERT and an extra EMA update
+    // on the same evidence, 5x the intended write volume). Failed
+    // attempts do not consume the slot: lastLearn only advances on a
+    // completed pass.
+    wpfState.learning = true;
+    try {
+      await runWindProtectionLearningGated(now, navState);
+    } finally {
+      wpfState.learning = false;
+    }
+  }
+
+  /**
+   * One WPF learning attempt, past the throttle/in-flight gates.
+   *
+   * @param {number} now - Attempt timestamp (ms)
+   * @param {string} navState - Resolved navigation state (anchored/moored)
+   * @returns {Promise<void>}
+   */
+  async function runWindProtectionLearningGated(now, navState) {
+    const cfg = pluginConfig?.windProtection || {};
 
     // Resolve position
     const pos = unwrapPosition(

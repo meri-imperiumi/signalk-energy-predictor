@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **A flapping uplink no longer records a full prediction cycle per recovery** (`plugin/index.js`): signalk-internet toggles `network.internet.state` offline↔online on every failed connectivity probe, and each offline→online edge triggered a full prediction cycle — ~500 cycles/day measured against six months of production data (median gap 82 s against the configured 15-min interval), each writing a full cycle record to the store, which is what kept the record store's WAL writing continuously even at anchor. An edge now triggers a cycle only when the last one is at least 10 minutes old; between edges the scheduled cycle and the 1 h online fetch cap cover the refresh.
+
+### Fixed
+- **Wind-protection learning recorded a burst of duplicate observations per throttle gate** (`plugin/index.js`): the learning pass is fired un-awaited on every wind-bearing delta and awaits the forecast fetch after the throttle check — so when the 5-minute gate opened, every invocation already in flight completed and learned, measured in production as 4–5 duplicate records per gate (~1,376 wind-protection records/day, 5× the intended volume) and 4–5 EMA updates on the same evidence. A synchronous in-flight claim now collapses concurrent invocations into one completed pass; failed attempts still do not consume the throttle slot.
+
 ## [0.12.0] - 2026-10-11
 
 ### Changed

@@ -735,3 +735,86 @@ test.describe("WPF learning basis: never learn from a measured nowcast", () => {
     }
   });
 });
+
+test.describe("WPF learning write discipline", () => {
+  test("concurrent invocations collapse to a single observation, not a burst", async () => {
+    const app = new FakeSignalKApp();
+    const lat = 60.1;
+    const lon = 21.8;
+    app.setSelfPath("navigation.position", { latitude: lat, longitude: lon });
+    app.setSelfPath("navigation.state", { value: "anchored" });
+    app.setSelfPath("environment.wind.speedTrue", { value: 4 });
+    app.setSelfPath("environment.wind.directionTrue", { value: Math.PI / 2 });
+
+    app.dataPath = await mkdtemp(join(tempDir, "t-"));
+    const plugin = makePlugin(app);
+    await plugin.start(baseConfig(), () => {});
+    const {
+      windProtection,
+      ingestionFSM,
+      runWindProtectionLearning,
+      wpfState,
+      recorder,
+    } = plugin.__getInternals();
+    windProtection.alpha = 1;
+
+    // No network: Open-Meteo answers 400 (non-retryable) so the FSM's
+    // forecast fetches fail fast to the offline ladder
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      if (String(url).includes("open-meteo")) {
+        return { ok: false, status: 400, json: async () => ({}) };
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    };
+
+    try {
+      // A real (tier 1) forecast carrying wind, so learning proceeds
+      ingestionFSM.lastForecast = [
+        {
+          time: new Date(),
+          ghi: 0,
+          cloudCover: null,
+          windSpeedMs: 10,
+          gustSpeedMs: null,
+          windDirectionDeg: 90,
+        },
+      ];
+      ingestionFSM.currentTier = 1; // Tier.OPEN_METEO
+      ingestionFSM.lastFetchTime = new Date();
+
+      // Bypass the dwell window and the 5-minute throttle
+      wpfState.placeKey = windProtection.resolvePlace(lat, lon, 500);
+      wpfState.arrivedAt = Date.now() - 20 * 60000;
+      wpfState.lastLearn = 0;
+
+      // The delta path fires this un-awaited at wind-update rate. When the
+      // throttle gate opens, several invocations are already in flight
+      // behind the forecast-fetch await; the in-flight claim must collapse
+      // them into ONE observation (production measured 4-5 duplicates per
+      // gate opening, each an extra INSERT and EMA update).
+      await Promise.all(
+        Array.from({ length: 8 }, () => runWindProtectionLearning()),
+      );
+
+      const records = await recorder.getRecords(
+        "wind-protection",
+        new Date(Date.now() - 60000),
+        new Date(),
+      );
+      assert.strictEqual(
+        records.length,
+        1,
+        `expected exactly 1 wind-protection record, got ${records.length}`,
+      );
+      assert.strictEqual(
+        windProtection.sizeSpeed,
+        1,
+        "the factor must have taken exactly one EMA step",
+      );
+    } finally {
+      globalThis.fetch = origFetch;
+      await plugin.stop();
+    }
+  });
+});

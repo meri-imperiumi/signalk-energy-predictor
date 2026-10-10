@@ -1232,3 +1232,92 @@ test.describe("Plugin startup resilience", () => {
     }
   });
 });
+
+test.describe("Uplink-online edge cycle guard", () => {
+  test("rapid uplink flaps trigger one edge cycle, not one per flap", async () => {
+    const app = new FakeSignalKApp();
+    const plugin = makePlugin(app);
+    const dataPath = await mkdtemp(join(tmpdir(), "ep-edge-"));
+    app.dataPath = dataPath;
+    const config = {
+      battery: {
+        capacityAh: 400,
+        systemVoltage: 12,
+        minSafeSoC: 0.2,
+      },
+      solarArrays: [],
+      mechanicalGenerators: [],
+      weather: {
+        openMeteoEnabled: false,
+        useLogbook: false,
+      },
+    };
+    await plugin.start(config, () => {});
+    const { recorder } = plugin.__getInternals();
+    const deltaHandler = app.subscriptionmanager.subscriptions[0].deltaHandler;
+    const feed = (path, value) =>
+      deltaHandler({
+        context: "vessels.self",
+        updates: [
+          { timestamp: new Date().toISOString(), values: [{ path, value }] },
+        ],
+      });
+
+    // No network in tests: Open-Meteo answers 400 (non-retryable) so the
+    // cycle falls to the offline ladder fast instead of retrying
+    const origFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      if (String(url).includes("open-meteo")) {
+        return { ok: false, status: 400, json: async () => ({}) };
+      }
+      throw new Error(`unexpected fetch: ${url}`);
+    };
+
+    try {
+      // Vessel + at-rest state so a cycle can complete and record
+      feed("navigation.position", { latitude: 60.1, longitude: 21.8 });
+      feed("navigation.state", "anchored");
+
+      // First recovery edge triggers an edge cycle
+      feed("network.internet.state", "offline");
+      feed("network.internet.state", "online");
+
+      // Wait until the edge cycle has been recorded (bounded)
+      let recorded = 0;
+      for (let i = 0; i < 50 && recorded === 0; i++) {
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        recorded = (
+          await recorder.getRecords(
+            "cycle",
+            new Date(Date.now() - 60000),
+            new Date(),
+          )
+        ).length;
+      }
+      assert.strictEqual(recorded, 1, "edge cycle must run and record");
+
+      // Immediate flap (probe fail -> recover) must NOT trigger another
+      // full cycle: the last one is fresh
+      feed("network.internet.state", "offline");
+      feed("network.internet.state", "online");
+      await new Promise((resolve) => setTimeout(resolve, 100));
+
+      const after = (
+        await recorder.getRecords(
+          "cycle",
+          new Date(Date.now() - 60000),
+          new Date(),
+        )
+      ).length;
+      assert.strictEqual(
+        after,
+        1,
+        "a rapid flap must not record another cycle",
+      );
+    } finally {
+      globalThis.fetch = origFetch;
+      await plugin.stop();
+      await rm(dataPath, { recursive: true, force: true });
+    }
+  });
+});
