@@ -319,6 +319,31 @@ test("keyset-paginated reads yield to the event loop between pages", async () =>
   cleanup();
 });
 
+test("default page size reads span multiple pages without loss or reordering", async () => {
+  // 600 records > the 250-row default page: the read must cross several
+  // pages, and the caller must get every record exactly once, in order.
+  // This pins the small default page size — a future bump back toward a
+  // page that parses in one long synchronous chunk should fail here.
+  const { store, cleanup } = makeStore();
+  const base = Date.UTC(2026, 8, 1);
+  for (let i = 0; i < 600; i++) {
+    await store.recordSample(makeSample(new Date(base + i * 300000)));
+  }
+  const rows = await store.getRecords(
+    "sample",
+    new Date(base),
+    new Date(base + 600 * 300000),
+  );
+  assert.equal(rows.length, 600);
+  for (let i = 1; i < rows.length; i++) {
+    assert.ok(
+      new Date(rows[i].timestamp) > new Date(rows[i - 1].timestamp),
+      `row ${i} out of order`,
+    );
+  }
+  cleanup();
+});
+
 test("latestRecords returns newest-first within the since window", async () => {
   const { store, cleanup } = makeStore();
   const base = Date.UTC(2026, 8, 1);

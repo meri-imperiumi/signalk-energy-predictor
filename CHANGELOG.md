@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Windowed record reads stall the event loop in small chunks instead of 2000-row ones** (`plugin/storage.js`): the keyset-paginated SQLite reads parse each page in one synchronous batch, so the page size is the size of a single event-loop stall — and the webapp fires all five window endpoints concurrently on every prediction-cycle refresh. The default keyset page drops from 2000 to 250 rows: on a month-view load (~8–9k samples) the loop now yields in ~30 low-millisecond chunks instead of 4–5 ~50 ms ones (several times worse on Pi-class boards), with unchanged total wall time since keyset seeks are index-cheap.
+
 ### Added
 - **`learning.maxSoc` setting** (`plugin/schema.js`, `plugin/learning.js`, `plugin/index.js`, `plugin/history-backfill.js`): the learning gate dropped every sample once the battery reached 80 % state of charge, which for LiFePO4 banks — whose controllers stay in bulk nearly to full — discards the best-learning hours of the season, live and in the history backfill alike. The threshold is now configurable (default 0.8, range 0.5–1; e.g. 0.98 suits a LiFePO4 bank).
 - **`weather.meteredRefreshHours` setting** (`plugin/schema.js`, `plugin/ingestion.js`, `plugin/index.js`): on a metered (volume-billed) uplink the forecast FSM never downloaded Open-Meteo, reading only the Signal K Weather provider — so without a provider installed, a passage longer than the forecast horizon (default 48 h) ran out of real forecast although the uplink worked. With a value ≥ 1, tier 2 is still preferred but one direct Open-Meteo download (~2.6 kB measured) per the configured interval is allowed when the provider yields nothing. 0 (default) keeps the previous behaviour.

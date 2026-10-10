@@ -139,15 +139,23 @@ class RecordStore {
    * @param {object} [config]
    * @param {boolean} [config.enabled=true] - Whether recording is enabled
    * @param {number} [config.retentionDays=90] - Retention period in days
-   * @param {number} [config.pageSize=2000] - Keyset page size (tests tune
-   *        this down to exercise the yield path)
+   * @param {number} [config.pageSize=250] - Keyset page size. Every page is
+   *        one synchronous SQLite query plus one synchronous JSON.parse
+   *        batch — the event loop only runs between pages — so the page size
+   *        is the size of a single event-loop stall. 250 rows parses in low
+   *        single-digit milliseconds even on small ARM boards; a month-view
+   *        read (8-9k rows) then stalls the loop in ~30 short chunks instead
+   *        of a few 2000-row ones, which matters because the webapp fires
+   *        all five window endpoints concurrently on every cycle refresh.
+   *        Keyset seeks are index-cheap, so more pages cost no meaningful
+   *        wall time.
    */
   constructor(app, dataDir, config = {}) {
     this.app = app;
     this.dataDir = dataDir;
     this.enabled = config.enabled !== false;
     this.retentionDays = config.retentionDays ?? 90;
-    this.pageSize = config.pageSize ?? 2000;
+    this.pageSize = config.pageSize ?? 250;
     /** @type {import("node:sqlite").DatabaseSync|null} */
     this.db = null;
     /** @type {Record<string, import("node:sqlite").StatementSync>} */
