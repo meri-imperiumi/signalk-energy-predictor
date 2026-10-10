@@ -98,6 +98,47 @@ function deepEqualPos(a, b) {
 const yieldToLoop = () => new Promise((resolve) => setImmediate(resolve));
 
 /**
+ * Shared queue for windowed-read page work. Runs one page's synchronous
+ * work (query + JSON.parse batch) per event-loop turn, across all
+ * in-flight reads.
+ *
+ * Why: a page's work runs as a microtask continuation right after its
+ * yield resolves, so when several window endpoints run concurrently (the
+ * webapp fires five on every cycle refresh) their continuations chain
+ * within the same check/timer phase and the sync work of all readers
+ * concatenates into one long event-loop block — measured at 200+ ms
+ * against six months of production data even with per-reader yields.
+ * Routing every page through this queue ends each macrotask before the
+ * next page starts, so no loop turn carries more than one page's parse
+ * regardless of concurrency. Total wall time is unchanged (same work,
+ * serialized); only its interleaving with the rest of the server improves.
+ * @type {Promise<void>}
+ */
+let pageQueue = Promise.resolve();
+
+/**
+ * @param {() => T} work - Synchronous page work (query + parse)
+ * @returns {Promise<T>} The work's result
+ * @template T
+ */
+function schedulePageSync(work) {
+  // The spacer must be a timer, not setImmediate: an immediate scheduled
+  // from a microtask that itself ran in the check phase can be processed
+  // in the same check-phase iteration, re-gluing the pages into one long
+  // loop block (measured on the production store). A 1 ms timer always
+  // fires in a later timer phase, after a full loop iteration.
+  const run = pageQueue
+    .then(() => new Promise((resolve) => setTimeout(resolve, 1)))
+    .then(work);
+  // Keep the queue alive (and unblocked) whichever way `work` settles
+  pageQueue = run.then(
+    () => {},
+    () => {},
+  );
+  return run;
+}
+
+/**
  * Maps a forecast_points row to the engine's point field names.
  * @param {object} row
  * @returns {object}
@@ -571,22 +612,44 @@ class RecordStore {
     const out = [];
     let after = from.getTime() - 1;
     for (;;) {
-      const rows = this.statements.recordsPage.all(
-        type,
-        from.getTime(),
-        to.getTime(),
-        after,
-        this.pageSize,
-      );
+      // The raw row's `ts` is the cursor source: parsed records carry only
+      // their own JSON shape (`timestamp`), not the column.
+      let pageTs = 0;
+      const rows = await schedulePageSync(() => {
+        const raw = this.statements.recordsPage.all(
+          type,
+          from.getTime(),
+          to.getTime(),
+          after,
+          this.pageSize,
+        );
+        pageTs = raw.length > 0 ? raw[raw.length - 1].ts : 0;
+        return raw.map((row) => JSON.parse(row.json));
+      });
       for (const row of rows) {
-        out.push(JSON.parse(row.json));
+        out.push(row);
       }
       if (rows.length < this.pageSize) {
         return out;
       }
-      after = rows[rows.length - 1].ts;
-      await yieldToLoop();
+      after = pageTs;
     }
+  }
+
+  /**
+   * Runs a synchronous piece of store work (a single statement query over
+   * a bounded window, or a bounded compute) through the shared page queue,
+   * so it cannot glue with other endpoints' sync work into one long
+   * event-loop block when several window endpoints run concurrently.
+   * Exposed for callers outside this module; the keyset reads use it
+   * internally per page.
+   *
+   * @param {() => T} work - Synchronous work
+   * @returns {Promise<T>} The work's result
+   * @template T
+   */
+  scheduleSync(work) {
+    return schedulePageSync(work);
   }
 
   /**
@@ -606,22 +669,29 @@ class RecordStore {
     let lastTs = from.getTime() - 1;
     let lastCycle = 0;
     for (;;) {
-      const rows = this.statements.pointsPage.all(
-        lastTs,
-        lastCycle,
-        from.getTime(),
-        to.getTime(),
-        this.pageSize,
-      );
+      let pageTs = 0;
+      let pageCycle = 0;
+      const rows = await schedulePageSync(() => {
+        const raw = this.statements.pointsPage.all(
+          lastTs,
+          lastCycle,
+          from.getTime(),
+          to.getTime(),
+          this.pageSize,
+        );
+        const last = raw[raw.length - 1];
+        pageTs = last ? last.ts : 0;
+        pageCycle = last ? last.cycle_ts : 0;
+        return raw.map((row) => mapPointRow(row));
+      });
       for (const row of rows) {
-        out.push(mapPointRow(row));
+        out.push(row);
       }
       if (rows.length < this.pageSize) {
         return out;
       }
-      lastTs = rows[rows.length - 1].ts;
-      lastCycle = rows[rows.length - 1].cycle_ts;
-      await yieldToLoop();
+      lastTs = pageTs;
+      lastCycle = pageCycle;
     }
   }
 
@@ -650,13 +720,16 @@ class RecordStore {
     const end = hourFloor(to);
     while (cursor <= end) {
       const chunkEnd = Math.min(cursor + chunkMs - 1, end);
-      for (const row of this.statements.hourlyWinners.all(cursor, chunkEnd)) {
-        out.push(mapPointRow(row));
+      const chunkCursor = cursor;
+      const rows = await schedulePageSync(() =>
+        this.statements.hourlyWinners
+          .all(chunkCursor, chunkEnd)
+          .map((row) => mapPointRow(row)),
+      );
+      for (const row of rows) {
+        out.push(row);
       }
       cursor = chunkEnd + 1;
-      if (cursor <= end) {
-        await yieldToLoop();
-      }
     }
     return out;
   }

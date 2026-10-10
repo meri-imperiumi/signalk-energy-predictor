@@ -14,6 +14,7 @@ const {
   ApiError,
   parseTimeWindow,
   granularityForWindow,
+  sortByTimestamp,
   sourceTypesFromConfig,
   sampleToActualPoint,
   integratePerHour,
@@ -1659,4 +1660,21 @@ test("buildDeployStates: cycles older than 24h before the latest are ignored for
     [],
     "a rec from a cycle older than 24h before the latest must not surface",
   );
+});
+
+test("sortByTimestamp: parses each timestamp once, ascending, input untouched", () => {
+  const input = [
+    { timestamp: "2026-09-03T10:00:00Z", n: 2 },
+    { timestamp: "2026-09-01T10:00:00Z", n: 0 },
+    { timestamp: "2026-09-02T10:00:00Z", n: 1 },
+  ];
+  const sorted = sortByTimestamp(input);
+  assert.deepEqual(
+    sorted.map((r) => r.n),
+    [0, 1, 2],
+  );
+  // Original array not mutated (callers rely on the keyset read order)
+  assert.equal(input[0].n, 2);
+  // Entries are the same objects, not copies
+  assert.strictEqual(sorted[2], input[0]);
 });
