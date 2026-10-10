@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.12.1] - 2026-10-11
+
 ### Changed
 - **A flapping uplink no longer records a full prediction cycle per recovery** (`plugin/index.js`): signalk-internet toggles `network.internet.state` offline↔online on every failed connectivity probe, and each offline→online edge triggered a full prediction cycle — ~500 cycles/day measured against six months of production data (median gap 82 s against the configured 15-min interval), each writing a full cycle record to the store, which is what kept the record store's WAL writing continuously even at anchor. An edge now triggers a cycle only when the last one is at least 10 minutes old; between edges the scheduled cycle and the 1 h online fetch cap cover the refresh.
 
