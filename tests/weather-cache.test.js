@@ -87,6 +87,30 @@ test("write then read round-trips with Date objects and tier preserved", async (
   assert.strictEqual(got[0].tier, 1);
 });
 
+test("atomic write leaves no temp files behind and the target is complete", async () => {
+  // The write goes through a unique temp file + fsync + rename; a crash
+  // mid-write must never leave a truncated day file (or stray .tmp litter)
+  const dir = await mkTmpDir();
+  const bucket = { latitude: 60.17, longitude: 21.39 };
+  await writeWeatherCache(dir, DATE, bucket, [hp(12), hp(13)], 2);
+  const dayDir = path.join(dir, "weather", DATE);
+  const entries = await fs.readdir(dayDir);
+  assert.deepEqual(
+    entries.filter((e) => e.endsWith(".tmp")),
+    [],
+    "temp files must be renamed away, not left behind",
+  );
+  assert.deepEqual(
+    entries.filter((e) => e.endsWith(".json")),
+    ["p60-17_p21-39.json"],
+  );
+  // The renamed file is the complete payload, not a partial write
+  const raw = JSON.parse(
+    await fs.readFile(path.join(dayDir, "p60-17_p21-39.json"), "utf-8"),
+  );
+  assert.strictEqual(raw.length, 2);
+});
+
 test("writeWeatherCache accepts knots-shaped hours (archive fetches) without losing wind", async () => {
   // `fetchHistoricalWeather` returns wind in knots under
   // `windSpeedKnots`/`gustSpeedKnots`. The cache persists only the m/s

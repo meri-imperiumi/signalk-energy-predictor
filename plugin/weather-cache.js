@@ -40,6 +40,7 @@
 
 const fs = require("node:fs/promises");
 const path = require("node:path");
+const { randomBytes } = require("node:crypto");
 
 /**
  * Bucket precision in decimal degrees (~0.01° ≈ ~1 km). Coarse enough that an
@@ -325,7 +326,21 @@ async function writeWeatherCache(dataDir, dateKey, bucket, hours, tier) {
     }
   }
   const merged = mergeHours(existing, normalizeHours(hours), tier);
-  await fs.writeFile(filePath, JSON.stringify(serializeHours(merged)), "utf-8");
+  // Atomic write: unique temp file, fsync, then rename(2) over the target —
+  // the same discipline as the matrix/load-profile/wind-protection saves in
+  // plugin/matrix.js. A power loss mid-write can then never leave a
+  // truncated day file behind (a truncated file would silently downgrade
+  // that day to a cache miss; the readers already tolerate it, but the
+  // lost hours would be gone until the next fetch re-covers them).
+  const tmpPath = `${filePath}.${process.pid}-${randomBytes(6).toString("hex")}.tmp`;
+  const handle = await fs.open(tmpPath, "w");
+  try {
+    await handle.writeFile(JSON.stringify(serializeHours(merged)), "utf-8");
+    await handle.sync();
+  } finally {
+    await handle.close();
+  }
+  await fs.rename(tmpPath, filePath);
 }
 
 /**
