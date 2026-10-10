@@ -13,6 +13,7 @@ const {
   observedEfficiency,
   emaUpdate,
   isValidTick,
+  normalizeControllerMode,
 } = require("../plugin/learning.js");
 
 test.describe("SolarMatrix", () => {
@@ -229,6 +230,92 @@ test.describe("SolarMatrix", () => {
         controllerMode: null,
       };
       assert.strictEqual(isValidTick(readings), true);
+    });
+
+    test("accepts bt-sensors-style Victron modes and upper-case labels (GitHub #2)", () => {
+      // bt-sensors-plugin-sk publishes Victron charge state as
+      // { code, message } with upper-case labels; before normalization
+      // such values dropped every sample and the array never learned
+      for (const raw of [
+        { code: 3, message: "BULK" },
+        "BULK",
+        "  bulk ",
+        { value: "BULK" },
+        3,
+      ]) {
+        assert.strictEqual(
+          isValidTick({
+            engineRunning: false,
+            batterySoc: 0.6,
+            shorePowerConnected: false,
+            controllerMode: raw,
+          }),
+          true,
+          `${JSON.stringify(raw)} should be bulk-equivalent`,
+        );
+      }
+    });
+
+    test("rejects bt-sensors-style limiting modes", () => {
+      for (const raw of [
+        { code: 4, message: "ABSORPTION" },
+        { code: 5, message: "FLOAT" },
+        "FLOAT",
+        4,
+      ]) {
+        assert.strictEqual(
+          isValidTick({
+            engineRunning: false,
+            batterySoc: 0.6,
+            shorePowerConnected: false,
+            controllerMode: raw,
+          }),
+          false,
+          `${JSON.stringify(raw)} should be rejected`,
+        );
+      }
+    });
+  });
+
+  test.describe("normalizeControllerMode", () => {
+    test("trims and lower-cases plain strings", () => {
+      assert.strictEqual(normalizeControllerMode("BULK"), "bulk");
+      assert.strictEqual(normalizeControllerMode("  Float "), "float");
+      assert.strictEqual(normalizeControllerMode("MPPT Active"), "mppt active");
+    });
+
+    test("unwraps the getSelfPath { value } wrapper", () => {
+      assert.strictEqual(normalizeControllerMode({ value: "BULK" }), "bulk");
+    });
+
+    test("reads the label from a bt-sensors charge-state object", () => {
+      assert.strictEqual(
+        normalizeControllerMode({ code: 3, message: "BULK" }),
+        "bulk",
+      );
+      assert.strictEqual(
+        normalizeControllerMode({ code: 5, message: "FLOAT" }),
+        "float",
+      );
+    });
+
+    test("maps a bare Victron operation-mode code", () => {
+      assert.strictEqual(normalizeControllerMode(3), "bulk");
+      assert.strictEqual(normalizeControllerMode(4), "absorption");
+      assert.strictEqual(normalizeControllerMode(5), "float");
+      assert.strictEqual(normalizeControllerMode(0), "off");
+    });
+
+    test("unknown numeric codes stay non-bulk", () => {
+      assert.strictEqual(normalizeControllerMode(99), "code 99");
+    });
+
+    test("returns null for unusable values", () => {
+      assert.strictEqual(normalizeControllerMode(null), null);
+      assert.strictEqual(normalizeControllerMode(undefined), null);
+      assert.strictEqual(normalizeControllerMode({}), null);
+      assert.strictEqual(normalizeControllerMode(""), null);
+      assert.strictEqual(normalizeControllerMode("   "), null);
     });
   });
 

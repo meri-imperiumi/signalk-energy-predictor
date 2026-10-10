@@ -51,7 +51,7 @@ Add each solar array:
 - **Name**: Display name for advisories
 - **Type**: Fixed or deployable
 - **Power Path**: Signal K path for power output (watts)
-- **Controller Mode Path** (optional): For charge controller sanitization
+- **Controller Mode Path** (optional): Signal K path for the charge controller's operating mode, used by the learning sanitization gate — ticks are only learned when the controller is tracking freely (`bulk` or `mppt active`), not limiting output (absorption, float, off). The value is normalized before matching, so plain strings in any case (`bulk`, `BULK`), bt-sensors-plugin-sk-style `{ code, message }` objects (e.g. `{ "code": 3, "message": "BULK" }`) and bare Victron operation-mode codes (3 = bulk) are all accepted. Leave empty if the controller publishes nothing usable — the other gates still apply
 - **Gust Limit** (deployable): Wind gust threshold for stowage (knots)
 - **Capacity (Wp)**: Peak wattage
 - **Hardware Epochs**: Historical capacity changes (optional)

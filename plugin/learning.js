@@ -176,6 +176,63 @@ function emaUpdate(existingEfficiency, observedEfficiency, alpha = EMA_ALPHA) {
 }
 
 /**
+ * Victron solar charger operation-mode codes (VE.Direct `OperationMode`,
+ * as published by e.g. bt-sensors-plugin-sk as `{ code, message }`).
+ * Only code 3 (BULK) is bulk-equivalent; anything else is limiting or off.
+ */
+const VICTRON_OPERATION_MODE_LABELS = {
+  0: "off",
+  2: "fault",
+  3: "bulk",
+  4: "absorption",
+  5: "float",
+  6: "storage",
+  7: "equalize",
+  8: "external control",
+  9: "external control",
+};
+
+/**
+ * Normalizes a raw Signal K controller-mode reading into the lower-case
+ * vocabulary the learning gate understands (`bulk`, `absorption`, `float`,
+ * `off`, `mppt active`, ...).
+ *
+ * Handles the shapes met in the wild:
+ * - a plain string ("BULK", "bulk ") → trimmed and lower-cased
+ * - the getSelfPath wrapper (`{ value: "BULK" }`) → unwrapped one level
+ * - a bt-sensors-plugin-sk charge-state object
+ *   (`{ code: 3, message: "BULK" }`) → the `message` label, or the
+ *   Victron operation-mode `code` when there is no label
+ * - a bare Victron operation-mode code (3) → the label
+ *
+ * @param {unknown} raw - Raw value from a delta, getSelfPath or history column
+ * @returns {string|null} Normalized mode, or null when nothing usable
+ */
+function normalizeControllerMode(raw) {
+  let value = raw;
+  if (value != null && typeof value === "object" && "value" in value) {
+    value = value.value; // getSelfPath shape
+  }
+  if (value != null && typeof value === "object") {
+    if (typeof value.message === "string") {
+      value = value.message;
+    } else if (typeof value.code === "number") {
+      value = value.code;
+    } else {
+      return null;
+    }
+  }
+  if (typeof value === "number") {
+    return VICTRON_OPERATION_MODE_LABELS[value] ?? `code ${value}`;
+  }
+  if (typeof value !== "string") {
+    return null;
+  }
+  const normalized = value.trim().toLowerCase();
+  return normalized === "" ? null : normalized;
+}
+
+/**
  * Data sanitization gate - checks if telemetry tick should be used for learning.
  *
  * @param {object} readings - Telemetry readings
@@ -191,7 +248,10 @@ function emaUpdate(existingEfficiency, observedEfficiency, alpha = EMA_ALPHA) {
  *        the mode is `bulk` (controllerMode) or `mppt active` (operationMode).
  *        Any other non-null value means the controller is limiting or off,
  *        so the tick is dropped (a limited tick would be mis-learned as
- *        "low efficiency at this sun angle").
+ *        "low efficiency at this sun angle"). The value is normalized via
+ *        `normalizeControllerMode` first, so raw bt-sensors-style
+ *        `{ code, message }` objects, upper-case labels and Victron numeric
+ *        codes are all handled.
  * @returns {boolean} True if tick is valid for learning
  */
 function isValidTick(readings) {
@@ -218,11 +278,8 @@ function isValidTick(readings) {
   // `mppt active` (operationMode) mean the MPPT tracker is running freely;
   // anything else (absorption, float, voltage/current limited, off, not
   // charging) means output is limited or absent and would corrupt the bin.
-  if (
-    controllerMode != null &&
-    controllerMode !== "bulk" &&
-    controllerMode !== "mppt active"
-  ) {
+  const mode = normalizeControllerMode(controllerMode);
+  if (mode != null && mode !== "bulk" && mode !== "mppt active") {
     return false;
   }
 
@@ -388,6 +445,7 @@ module.exports = {
   observedEfficiency,
   emaUpdate,
   isValidTick,
+  normalizeControllerMode,
   EMA_ALPHA,
   DEFAULT_EFFICIENCY,
   AZIMUTH_BIN,

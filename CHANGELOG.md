@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Solar arrays never learned when the Controller Mode Path publishes a bt-sensors-style Victron charge state** (`plugin/learning.js`, `plugin/index.js`, `plugin/history-backfill.js`): the learning gate compared the controller mode by strict equality against `bulk` / `mppt active`, and the raw Signal K value was fed in unnormalized — so `{ "code": 3, "message": "BULK" }` (as published by `bt-sensors-plugin-sk` for Victron SmartSolar controllers) or the plain string `BULK` dropped every sample and the array never learned, in live learning, recordings or offline backfill. Values are now normalized in one place (`normalizeControllerMode`: unwrap `{ value }`, take the `message` label or map the Victron numeric operation code, trim and lower-case) before the gate, the recorder and the backfill see them.
+
 ## [0.11.4] - 2026-10-08
 
 ### Changed

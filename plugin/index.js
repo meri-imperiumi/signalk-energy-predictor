@@ -11,7 +11,7 @@
 /** @typedef {import("@signalk/server-api").Plugin} Plugin */
 
 const { IngestionFSM, Tier, isDegenerateForecast } = require("./ingestion.js");
-const { SolarMatrix } = require("./learning.js");
+const { SolarMatrix, normalizeControllerMode } = require("./learning.js");
 const {
   WindProtectionStore,
   sectorFromDeg,
@@ -2490,8 +2490,10 @@ module.exports = (app) => {
             deltaState.get("electrical.shore.power.connected") ||
             app.getSelfPath("electrical.shore.power.connected"),
           controllerMode: array.controllerModePath
-            ? deltaState.get(array.controllerModePath) ||
-              app.getSelfPath(array.controllerModePath)
+            ? normalizeControllerMode(
+                deltaState.get(array.controllerModePath) ||
+                  app.getSelfPath(array.controllerModePath),
+              )
             : null,
         };
 
@@ -2936,8 +2938,7 @@ module.exports = (app) => {
       const modeRaw =
         deltaState.get(array.controllerModePath) ||
         app.getSelfPath(array.controllerModePath);
-      const mode =
-        modeRaw && typeof modeRaw === "object" ? modeRaw.value : modeRaw;
+      const mode = normalizeControllerMode(modeRaw);
       if (mode != null) controllerModes[array.id] = mode;
     }
 

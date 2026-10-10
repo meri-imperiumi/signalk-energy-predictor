@@ -7,7 +7,11 @@
  * @file history-backfill.js
  */
 
-const { SolarMatrix, theoreticalPower } = require("./learning.js");
+const {
+  SolarMatrix,
+  theoreticalPower,
+  normalizeControllerMode,
+} = require("./learning.js");
 const { sunPosition, irradianceFromCloudCover } = require("./solar.js");
 const {
   predictWindHour,
@@ -993,7 +997,9 @@ function replayHistory({
         engineRunning: engineRunningAt(point, propulsionCols, columns),
         batterySoc: columnNumber(point, socColumn),
         shorePowerConnected: null,
-        controllerMode: columnValue(point, controllerModeColumn),
+        controllerMode: normalizeControllerMode(
+          columnValue(point, controllerModeColumn),
+        ),
       },
     });
 
@@ -1823,7 +1829,7 @@ async function backfillSamples({
     // the :last aggregate; null where the array has no mode path).
     const controllerModes = {};
     for (const [id, col] of controllerModeColumns) {
-      const mode = columnValue(point, col);
+      const mode = normalizeControllerMode(columnValue(point, col));
       if (mode != null) controllerModes[id] = mode;
     }
     // Apparent wind angle (radians) for the sailing matrix. Read raw from
