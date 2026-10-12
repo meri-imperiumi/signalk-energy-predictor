@@ -37,12 +37,12 @@ test.describe("LoadProfile", () => {
   });
 
   test("classifies sun phases based on sun position", () => {
-    const SunCalc = require("suncalc");
+    const { sunTimes } = require("../plugin/solar.js");
     const testDate = new Date("2024-06-21T12:00:00Z");
     const sunPos = { latitude: 37.77, longitude: -122.42 };
 
     // Get actual astronomical times for the test date/location
-    const times = SunCalc.getTimes(testDate, sunPos.latitude, sunPos.longitude);
+    const times = sunTimes(testDate, sunPos.latitude, sunPos.longitude);
     const sunrise = new Date(times.sunrise);
     const sunset = new Date(times.sunset);
 

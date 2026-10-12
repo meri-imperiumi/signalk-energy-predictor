@@ -7,8 +7,13 @@
  * @file prediction.js
  */
 
-const { sunPosition, nextSunrise, nextSunset, lastSunset } =
-  require("./solar.js");
+const {
+  sunPosition,
+  sunTimes,
+  nextSunrise,
+  nextSunset,
+  lastSunset,
+} = require("./solar.js");
 const {
   evaluateCombustionTier,
   updateCombustionRuns,
@@ -20,7 +25,6 @@ const { theoreticalPower } = require("./learning.js");
 const { formatWh, offsetMinutesFromHhmm, formatLocalHHMM } =
   require("./format.js");
 const { getAcPowerPaths } = require("./schema.js");
-const SunCalc = require("suncalc");
 
 /**
  * Default prediction horizon in hours. Override via the engine's
@@ -359,10 +363,10 @@ class LoadProfile {
     }
 
     const date = new Date(timestamp);
-    const times = SunCalc.getTimes(date, position.latitude, position.longitude);
+    const times = sunTimes(date, position.latitude, position.longitude);
 
     if (!times.sunrise || !times.sunset) {
-      return SunPhase.DAY;
+      return times.alwaysUp ? SunPhase.DAY : SunPhase.NIGHT;
     }
 
     const sunrise = new Date(times.sunrise);
