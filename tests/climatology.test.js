@@ -256,11 +256,21 @@ test.describe("FSM integration", () => {
     assert.strictEqual(fsm.currentTier, Tier.CLEAR_SKY);
   });
 
-  test("getCurrentGHI floor is climatology-scaled when the region is known", async () => {
+  test("getCurrentGHI floor is climatology-scaled when the region is known", async (t) => {
+    // Freeze the clock: getCurrentGHI takes its own timestamps, and the
+    // offline ladder (mocked fetch → stale hybrid floor) stamps the served
+    // point a few event-loop turns after the test computed its expected
+    // altitude. The sun moves enough in those milliseconds (~0.04 W/m² per
+    // second GHI change at this latitude) to break the 1e-6 W/m² tolerance
+    // — flaky near sunrise/sunset and on loaded CI runners. A fixed noon
+    // instant keeps the sun above the horizon so the scaling branch is
+    // always the one exercised.
+    const now = new Date("2026-07-01T09:00:00Z");
+    t.mock.timers.enable({ apis: ["Date"], now });
     const fsm = makeFSM();
     fsm.climatology = {
-      kc: { [climatology.monthOf(new Date())]: 0.75 },
-      fetchedAt: new Date(),
+      kc: { [climatology.monthOf(now)]: 0.75 },
+      fetchedAt: now,
       cell: climatology.cellKey(60.17, 24.94),
     };
     fsm.climatologyCell = fsm.climatology.cell;
@@ -270,20 +280,14 @@ test.describe("FSM integration", () => {
       throw new Error("network down");
     };
     try {
-      const now = new Date();
       const { altitude } = require("../plugin/solar.js").sunPosition(
         now,
         60.17,
         24.94,
       );
       const ghi = await fsm.getCurrentGHI();
-      if (altitude > 0) {
-        assert.strictEqual(ghi.tier, Tier.CLIMATOLOGY);
-        assert.ok(Math.abs(ghi.ghi - maxIrradiance(altitude) * 0.75) < 1e-6);
-      } else {
-        // Below the horizon the clear-sky model returns 0 either way
-        assert.strictEqual(ghi.ghi, 0);
-      }
+      assert.strictEqual(ghi.tier, Tier.CLIMATOLOGY);
+      assert.ok(Math.abs(ghi.ghi - maxIrradiance(altitude) * 0.75) < 1e-6);
     } finally {
       globalThis.fetch = origFetch;
     }
