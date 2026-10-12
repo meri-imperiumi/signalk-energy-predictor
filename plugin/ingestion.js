@@ -1,11 +1,13 @@
 /**
- * Weather data ingestion using a 4-tier fallback FSM.
+ * Weather data ingestion using a 5-tier fallback FSM.
  *
  * Tiers:
  * 1. Direct NWP (Open-Meteo REST API) - shortwave_radiation
  * 2. Signal K Weather API (in-process) - cloudCover (0-1)
  * 3. Logbook (logentries resource API) - cloudCover (ratio 0-1)
- * 4. Clear Sky Baseline - theoretical max from sun position
+ * 4. Climatology - NASA POWER monthly all-sky/clear-sky ratio scaling the
+ *    clear-sky curve (regional, seasonal cloudiness; work doc #29)
+ * 5. Clear Sky Baseline - theoretical max from sun position
  *
  * Tiers 2-3 always talk to the Signal K server the plugin runs inside:
  * tier 2 calls `app.weatherApi.getForecasts()` directly (the same object
@@ -33,6 +35,7 @@ const {
   irradianceFromCloudCover,
 } = require("./solar.js");
 const weatherCache = require("./weather-cache.js");
+const climatology = require("./climatology.js");
 
 /**
  * Unwraps a Signal K path value to a number, handling both the bare number
@@ -136,11 +139,19 @@ const MAX_FORECAST_HOURS = 168;
 const DEFAULT_FORECAST_CACHE_HOURS = 24;
 
 /**
- * Reuse window for low-quality tiers (logbook observations, clear sky). Short: they
+ * Reuse window for low-quality tiers (logbook observations, climatology,
+ * clear sky). Short: they
  * are cheap to regenerate and carry no forward-looking wind, so there is no
  * value in caching them long. In minutes to match `getForecast`'s units.
  */
 const LOW_TIER_CACHE_MINUTES = 15;
+
+/**
+ * Minimum interval between NASA POWER climatology fetch attempts (ms).
+ * Climatology is static monthly data — a failed or missing fetch is
+ * retried no more than hourly, and a fetched cell never refetches.
+ */
+const CLIMATOLOGY_FETCH_INTERVAL_MS = 60 * 60 * 1000;
 
 /**
  * Fetch-cadence constants driven by uplink status (work doc #15 update #1).
@@ -161,7 +172,8 @@ const Tier = {
   OPEN_METEO: 1,
   SIGNAL_K_WEATHER: 2,
   LOGBOOK: 3,
-  CLEAR_SKY: 4,
+  CLIMATOLOGY: 4,
+  CLEAR_SKY: 5,
 };
 
 /**
@@ -629,6 +641,13 @@ class IngestionFSM {
     this.minFetchIntervalMs = 60000; // Don't retry more often than once per minute
     this.position = { latitude: null, longitude: null };
     this.cachedCloudCover = []; // From logbook, used as fallback for future hours
+    // Climatology for the current ~1° cell (work doc #29): NASA POWER
+    // monthly all-sky/clear-sky ratio, loaded from the on-disk cache when
+    // present, fetched once per cell when online. Static data — never
+    // expires. Null means "unknown region" → the floor stays pure clear sky.
+    this.climatology = null;
+    this.climatologyCell = null;
+    this.lastClimatologyAttempt = 0;
     this.dataDir = dataDir || null;
     /**
      * Uplink status driving fetch cadence (work doc #15 update #1). True if
@@ -731,14 +750,14 @@ class IngestionFSM {
    * Returns the in-memory reuse window (ms) for the current tier.
    *
    * Tier 1/2 (real forecasts, incl. restored-from-disk) stay usable for
-   * `forecastCacheHours`; tier 3/4 (logbook observations, clear sky) keep the short
-   * window — cheap to regenerate and carry no forward-looking wind.
+   * `forecastCacheHours`; tiers 3-5 (logbook observations, climatology,
+   * clear sky) keep the short window — cheap to regenerate and carry no
+   * forward-looking wind.
    *
    * @returns {number} max age in ms
    */
   forecastMaxAgeMs() {
-    const lowTier =
-      this.currentTier === Tier.LOGBOOK || this.currentTier === Tier.CLEAR_SKY;
+    const lowTier = this.currentTier >= Tier.LOGBOOK;
     const hours = lowTier
       ? LOW_TIER_CACHE_MINUTES / 60
       : this.forecastCacheHours;
@@ -766,6 +785,62 @@ class IngestionFSM {
       return { wanOnline: response.ok };
     } catch (error) {
       return { wanOnline: false };
+    }
+  }
+
+  /**
+   * Ensures the climatology cloud factor for the current ~1° cell is in
+   * memory (work doc #29). The on-disk cell cache is authoritative and
+   * offline-safe — climatology is static monthly data that never expires.
+   * A network fetch happens only when the cell is unknown, the uplink is
+   * online and unmetered (a NASA POWER download is a WAN download the
+   * metered-uplink policy deliberately suppresses, same as tier 1), and
+   * the hourly attempt throttle allows one. All failures are soft: the
+   * floor simply stays pure clear sky.
+   *
+   * @returns {Promise<void>}
+   */
+  async ensureClimatology() {
+    const { latitude, longitude } = this.position;
+    if (latitude == null || longitude == null) return;
+    const cell = climatology.cellKey(latitude, longitude);
+    if (this.climatology && this.climatologyCell === cell) return;
+
+    try {
+      const cached = await climatology.loadCachedKc(
+        this.dataDir,
+        latitude,
+        longitude,
+      );
+      if (cached) {
+        this.climatology = cached;
+        this.climatologyCell = cell;
+        return;
+      }
+    } catch (error) {
+      this.app.debug?.(`Climatology: cache read failed: ${error.message}`);
+    }
+
+    if (!this.uplinkOnline || this.uplinkMetered) return;
+    if (
+      Date.now() - this.lastClimatologyAttempt <
+      CLIMATOLOGY_FETCH_INTERVAL_MS
+    ) {
+      return;
+    }
+    this.lastClimatologyAttempt = Date.now();
+    try {
+      const data = await climatology.fetchKc(latitude, longitude);
+      this.climatology = data;
+      this.climatologyCell = cell;
+      if (this.dataDir) {
+        await climatology.saveKc(this.dataDir, latitude, longitude, data);
+      }
+      this.app.debug?.(
+        `Climatology: fetched Kc for cell ${cell} (${Object.keys(data.kc).length} months)`,
+      );
+    } catch (error) {
+      this.app.debug?.(`Climatology: fetch failed: ${error.message}`);
     }
   }
 
@@ -918,6 +993,9 @@ class IngestionFSM {
         windSpeedMs: p.windSpeedMs ?? null,
         gustSpeedMs: p.gustSpeedMs ?? null,
         windDirectionDeg: p.windDirectionDeg ?? null,
+        // Per-point tier (hybrid hours can mix tiers 4/5 at a month
+        // boundary): a point's own tier wins over the write-level default.
+        tier: p.tier ?? null,
       });
     }
     try {
@@ -992,10 +1070,18 @@ class IngestionFSM {
       this.lastFetchAttempt = new Date(attemptNow);
       if (this.uplinkOnline) this.lastOnlineFetchAttempt = attemptNow;
 
+      // Climatology for the current cell (work doc #29): load from disk
+      // when cached (cheap, offline-safe), fetch once per cell when the
+      // uplink allows. Rides the same network-allowed gate as the other
+      // fetches so it never bypasses the uplink cadence. Best-effort —
+      // all failures keep the clear-sky floor intact.
+      await this.ensureClimatology();
+
       // Try real network forecast tiers in order until one succeeds with
       // actual data. Note: empty forecast counts as failure (an empty array is
       // truthy in JS, but carries no data - fall through to the next tier
-      // instead). Tier 3 (Logbook) and tier 4 (Clear Sky) are intentionally NOT
+      // instead). Tier 3 (Logbook), 4 (Climatology) and 5 (Clear Sky) are
+      // intentionally NOT
       // in this loop:
       //   - Logbook carries no wind, so a logbook-only "success" would shadow
       //     the on-disk restore path, which can produce logbook solar *plus*
@@ -1375,21 +1461,42 @@ class IngestionFSM {
       const { altitude } = sunPosition(time, latitude, longitude);
       let ghi;
       let source;
+      let tier;
+      let pointCloudCover = cloudCover;
       if (cloudCover != null) {
         ghi = irradianceFromCloudCover(altitude, cloudCover);
         source = "logbook";
+        tier = Tier.LOGBOOK;
       } else {
-        ghi = maxIrradiance(altitude);
-        source = "clear-sky";
+        // No logbook observations: the floor degrades from climatology
+        // (typical regional cloudiness for the month, work doc #29) to
+        // pure clear sky (the optimistic upper bound) when the region is
+        // unknown. Per-point tier tags keep cache/restore provenance
+        // honest when the horizon straddles a month boundary with gaps.
+        const kc = climatology.monthKc(
+          this.climatology,
+          climatology.monthOf(time),
+        );
+        if (kc != null) {
+          ghi = maxIrradiance(altitude) * kc;
+          source = "climatology";
+          tier = Tier.CLIMATOLOGY;
+          pointCloudCover = climatology.kcToCloudCover(kc);
+        } else {
+          ghi = maxIrradiance(altitude);
+          source = "clear-sky";
+          tier = Tier.CLEAR_SKY;
+        }
       }
       points.push({
         time,
         ghi,
-        cloudCover,
+        cloudCover: pointCloudCover,
         windSpeedMs: latestWind.speedMs,
         gustSpeedMs: latestWind.gustMs,
         windDirectionDeg: latestWind.directionDeg,
         source,
+        tier,
       });
     }
     return { points, cloudCover };
@@ -1410,13 +1517,28 @@ class IngestionFSM {
     const nowMs = Date.now();
     const { points, cloudCover } = await this.buildHybridHours(nowMs);
 
-    this.currentTier = cloudCover != null ? Tier.LOGBOOK : Tier.CLEAR_SKY;
+    // Floor tier: the best (lowest) tier present across the hybrid hours.
+    // Uniform in practice (one source covers the whole horizon); a horizon
+    // straddling a month boundary with climatology gaps can mix tiers 4/5.
+    let bestTier = Tier.CLEAR_SKY;
+    for (const p of points) {
+      const t = p.tier ?? Tier.CLEAR_SKY;
+      if (t < bestTier) bestTier = t;
+    }
+    const solarSource =
+      cloudCover != null
+        ? "logbook observations"
+        : bestTier === Tier.CLIMATOLOGY
+          ? "climatology"
+          : "clear sky";
+
+    this.currentTier = cloudCover != null ? Tier.LOGBOOK : bestTier;
     this.lastFetchTime = new Date(nowMs);
     this.lastForecast = points;
     this.announcedStaleServe = false;
     this.announcedCacheHit = false;
     this.app.debug(
-      `Stale hybrid: ${points.length} points (solar: ${cloudCover != null ? "logbook observations" : "clear sky"}, wind: latest-known ${points[0]?.windSpeedMs ?? "?"}m/s)`,
+      `Stale hybrid: ${points.length} points (solar: ${solarSource}, wind: latest-known ${points[0]?.windSpeedMs ?? "?"}m/s)`,
     );
     return this.lastForecast;
   }
@@ -1432,6 +1554,8 @@ class IngestionFSM {
         return "Signal K Weather";
       case Tier.LOGBOOK:
         return "Logbook";
+      case Tier.CLIMATOLOGY:
+        return "Climatology";
       case Tier.CLEAR_SKY:
         return "Clear Sky";
       default:
@@ -1444,7 +1568,7 @@ class IngestionFSM {
    *
    * Freshness gate (work doc #15): the in-memory forecast is served while it
    * is younger than its tier's staleness window (`forecastMaxAgeMs`: tier-1/2
-   * `forecastCacheHours`, default 24 h; tier-3/4 15 min) **and** still covers
+   * `forecastCacheHours`, default 24 h; tiers 3-5 15 min) **and** still covers
    * future hours. The coverage clause closes the end-of-offline-stretch dead
    * zone: a restored forecast whose last cached hour has passed must not be
    * served as "fresh" for the rest of its window — the ladder in
@@ -1507,8 +1631,20 @@ class IngestionFSM {
       };
     }
 
-    // Fallback to clear sky
+    // Fallback to the floor: climatology (typical regional cloudiness for
+    // the month) when the region is known, else pure clear sky. This is the
+    // GHI the learning cycle sees, so a known region keeps learning honest
+    // at low sun instead of charging optimistic clear-sky GHI to the bins.
     const { altitude } = sunPosition(now, latitude, longitude);
+    const kc = climatology.monthKc(this.climatology, climatology.monthOf(now));
+    if (kc != null) {
+      return {
+        ghi: maxIrradiance(altitude) * kc,
+        cloudCover: climatology.kcToCloudCover(kc),
+        gustSpeedMs: null,
+        tier: Tier.CLIMATOLOGY,
+      };
+    }
     return {
       ghi: maxIrradiance(altitude),
       cloudCover: 0,
@@ -1527,6 +1663,7 @@ class IngestionFSM {
       [Tier.OPEN_METEO]: "Open-Meteo",
       [Tier.SIGNAL_K_WEATHER]: "Signal K Weather API",
       [Tier.LOGBOOK]: "Signal K Logbook",
+      [Tier.CLIMATOLOGY]: "Climatology Baseline",
       [Tier.CLEAR_SKY]: "Clear Sky Baseline",
     };
 

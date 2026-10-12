@@ -11,7 +11,7 @@
  *
  *  - **Backfill**: Open-Meteo archive (tier 1) is the best, so it effectively
  *    seeds each day; re-runs read from disk (zero network, works offline).
- *  - **Live forecast**: any tier writes; a later Clear Sky (tier 4) only fills
+ *  - **Live forecast**: any tier writes; a later Clear Sky (tier 5) only fills
  *    hours a real forecast (tier 1-3) didn't cover, and a later real forecast
  *    overwrites Clear Sky values for its hours.
  *
@@ -35,7 +35,7 @@
  * @property {number|null} gustSpeedMs
  * @property {number|null} windDirectionDeg
  * @property {number|null} [tier] - 1=Open-Meteo, 2=SK Weather, 3=Logbook,
- *           4=Clear Sky. Lower is better quality. Absent on legacy reads.
+ *           4=Climatology, 5=Clear Sky. Lower is better quality. Absent on legacy reads.
  */
 
 const fs = require("node:fs/promises");
@@ -172,6 +172,54 @@ function deserializeHours(raw) {
   }));
 }
 
+/**
+ * Current on-disk schema version for weather cache day files. Version 1
+ * wraps the hours in `{ schemaVersion, hours }`; version 0 (legacy) was a
+ * bare hours array, where tier 4 meant Clear Sky — with the climatology
+ * tier (work doc #29) tier 4 is Climatology and tier 5 is Clear Sky, so
+ * legacy files are re-tagged on read (tier 4 → 5).
+ */
+const WEATHER_CACHE_SCHEMA_VERSION = 1;
+
+/**
+ * Re-tags legacy tier-4 (pre-climatology Clear Sky) points to tier 5 so
+ * they cannot masquerade as Climatology quality after the tier renumber.
+ * @param {WeatherPoint[]} hours
+ * @returns {WeatherPoint[]}
+ */
+function remapLegacyTier4(hours) {
+  return hours.map((h) => (h.tier === 4 ? { ...h, tier: 5 } : h));
+}
+
+/**
+ * Parses a day-file JSON payload in either schema: legacy bare hours array
+ * (version 0, tier 4 = Clear Sky → re-tagged to 5) or version ≥ 1 wrapped
+ * `{ schemaVersion, hours }`.
+ * @param {unknown} parsed
+ * @returns {WeatherPoint[]|null}
+ */
+function parseDayFile(parsed) {
+  if (Array.isArray(parsed)) {
+    return remapLegacyTier4(deserializeHours(parsed));
+  }
+  if (parsed && Array.isArray(parsed.hours)) {
+    return deserializeHours(parsed.hours);
+  }
+  return null;
+}
+
+/**
+ * Serializes a day file in the current schema.
+ * @param {WeatherPoint[]} hours
+ * @returns {string}
+ */
+function serializeDayFile(hours) {
+  return JSON.stringify({
+    schemaVersion: WEATHER_CACHE_SCHEMA_VERSION,
+    hours: serializeHours(hours),
+  });
+}
+
 /** Fields that may be filled from a worse-tier point when the better one lacks them. */
 const MERGE_FIELDS = [
   "ghi",
@@ -285,7 +333,7 @@ async function readWeatherCache(dataDir, dateKey, bucket) {
   const filePath = weatherCachePath(dataDir, dateKey, bucket);
   try {
     const content = await fs.readFile(filePath, "utf-8");
-    return deserializeHours(JSON.parse(content));
+    return parseDayFile(JSON.parse(content));
   } catch (error) {
     if (error.code === "ENOENT") {
       return null;
@@ -308,7 +356,7 @@ async function readWeatherCache(dataDir, dateKey, bucket) {
  * @param {WeatherPoint[]} hours - incoming points to merge in
  * @param {number} [tier] - tier of the incoming points (defaults to each
  *        point's own `tier`); Open-Meteo archive = 1, SK Weather = 2,
- *        Logbook = 3, Clear Sky = 4
+ *        Logbook = 3, Climatology = 4, Clear Sky = 5
  * @returns {Promise<void>}
  */
 async function writeWeatherCache(dataDir, dateKey, bucket, hours, tier) {
@@ -316,9 +364,7 @@ async function writeWeatherCache(dataDir, dateKey, bucket, hours, tier) {
   await fs.mkdir(path.dirname(filePath), { recursive: true });
   let existing = null;
   try {
-    existing = deserializeHours(
-      JSON.parse(await fs.readFile(filePath, "utf-8")),
-    );
+    existing = parseDayFile(JSON.parse(await fs.readFile(filePath, "utf-8")));
   } catch (error) {
     if (error.code !== "ENOENT") {
       // Corrupt: start fresh rather than lose the incoming write
@@ -335,7 +381,7 @@ async function writeWeatherCache(dataDir, dateKey, bucket, hours, tier) {
   const tmpPath = `${filePath}.${process.pid}-${randomBytes(6).toString("hex")}.tmp`;
   const handle = await fs.open(tmpPath, "w");
   try {
-    await handle.writeFile(JSON.stringify(serializeHours(merged)), "utf-8");
+    await handle.writeFile(serializeDayFile(merged), "utf-8");
     await handle.sync();
   } catch (error) {
     // Never leak the temp file if the write itself fails (e.g. the parent
@@ -442,9 +488,7 @@ async function readWeatherCacheCoarse(dataDir, dateKey, coarseBucket) {
     let hours;
     let stat;
     try {
-      hours = deserializeHours(
-        JSON.parse(await fs.readFile(filePath, "utf-8")),
-      );
+      hours = parseDayFile(JSON.parse(await fs.readFile(filePath, "utf-8")));
       stat = await fs.stat(filePath);
     } catch (error) {
       // Corrupt or vanished between readdir/read: skip this file
@@ -461,10 +505,12 @@ async function readWeatherCacheCoarse(dataDir, dateKey, coarseBucket) {
 module.exports = {
   BUCKET_DECIMALS,
   RESTORE_BUCKET_DECIMALS,
+  WEATHER_CACHE_SCHEMA_VERSION,
   weatherPositionBucket,
   weatherRestoreBucket,
   weatherCachePath,
   mergeHours,
+  parseDayFile,
   readWeatherCache,
   readWeatherCacheCoarse,
   writeWeatherCache,

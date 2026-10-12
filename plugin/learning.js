@@ -30,6 +30,24 @@ const AWA_BIN = 30;
 const DEFAULT_EFFICIENCY = 0.7;
 
 /**
+ * Relative weight of elevation distance vs azimuth distance in the
+ * neighbor-lookup metric. Efficiency varies more with sun height (tilt
+ * geometry, shading at low sun) than with azimuth — the anchored matrix
+ * already averages over anchor swings, so azimuth is the gentler axis.
+ * A 10° elevation step therefore counts as much as a 20° azimuth step.
+ */
+const ELEVATION_WEIGHT = 2;
+
+/**
+ * Maximum search radius (in distance-metric units) for the neighbor
+ * lookup: learned bins farther than this contribute nothing and the
+ * lookup falls back to DEFAULT_EFFICIENCY. Radius 3 in the metric means
+ * e.g. elevation ±15°, or azimuth ±45°, or any mix of the two within
+ * the combined distance.
+ */
+const MAX_NEIGHBOR_RADIUS = 3;
+
+/**
  * Bins a value into discrete buckets.
  *
  * @param {number} value - Value in degrees
@@ -107,6 +125,67 @@ function sailingKey(azimuthRad, elevationRad, awaRad) {
   const el = binElevation(elevationRad);
   const awa = binAWA(awaRad);
   return `${az}_${el}_${awa}`;
+}
+
+/**
+ * Finds the best efficiency estimate from neighboring learned bins when the
+ * exact bin is unlearned.
+ *
+ * Instead of a flat DEFAULT_EFFICIENCY fallback, learned bins near the
+ * target sun position (azimuth 15° × elevation 10° grid, azimuth wrapped
+ * across ±180°) vote with inverse-distance weights under the metric
+ *
+ *   d² = (Δazimuth/15°)² + (ELEVATION_WEIGHT·Δelevation/10°)²
+ *
+ * Bins farther than MAX_NEIGHBOR_RADIUS are ignored; with no learned bin
+ * inside the radius the caller falls back to DEFAULT_EFFICIENCY.
+ *
+ * Note: rig shading is encoded per-azimuth, so this smears a shadow edge
+ * into an unlearned adjacent bin — the neighbors are still the best
+ * available prior, but the smear is a known failure mode at partially
+ * shaded places.
+ *
+ * @param {Map<string, number>} map - Anchored efficiency map (keys "az_el")
+ * @param {number} azimuthRad - Sun azimuth in radians
+ * @param {number} elevationRad - Sun elevation in radians
+ * @returns {number|null} Interpolated efficiency [0, 1], or null when no
+ *          learned bin lies within the radius
+ */
+function nearestAnchoredEfficiency(map, azimuthRad, elevationRad) {
+  const targetAz = binAzimuth(azimuthRad);
+  const targetEl = binElevation(elevationRad);
+
+  let weightSum = 0;
+  let valueSum = 0;
+  for (const [key, value] of map) {
+    const [azStr, elStr] = key.split("_");
+    const binAz = Number(azStr);
+    const binEl = Number(elStr);
+    if (Number.isNaN(binAz) || Number.isNaN(binEl)) {
+      continue;
+    }
+    let dAz = Math.abs(binAz - targetAz);
+    if (dAz > 180) {
+      dAz = 360 - dAz; // wrap across the ±180° boundary
+    }
+    const dEl = Math.abs(binEl - targetEl);
+    const d2 =
+      (dAz / AZIMUTH_BIN) ** 2 +
+      ((ELEVATION_WEIGHT * dEl) / ELEVATION_BIN) ** 2;
+    if (d2 > MAX_NEIGHBOR_RADIUS * MAX_NEIGHBOR_RADIUS) {
+      continue;
+    }
+    // d2 >= 1 for any non-exact bin (the exact bin is looked up by the
+    // caller before this runs), so the weight is bounded and never divides
+    // by zero.
+    const weight = 1 / d2;
+    weightSum += weight;
+    valueSum += weight * clamp01(value);
+  }
+  if (weightSum === 0) {
+    return null;
+  }
+  return valueSum / weightSum;
 }
 
 /**
@@ -321,7 +400,18 @@ class SolarMatrix {
    */
   getAnchored(azimuthRad, elevationRad) {
     const key = anchoredKey(azimuthRad, elevationRad);
-    return this.anchored.get(key) ?? DEFAULT_EFFICIENCY;
+    const learned = this.anchored.get(key);
+    if (learned != null) {
+      return learned;
+    }
+    // Exact bin unlearned: interpolate from neighboring learned bins
+    // (see nearestAnchoredEfficiency) before falling back to the flat
+    // default — a thin bin (new season, new latitude, passage) gets the
+    // best local estimate instead of a global guess.
+    return (
+      nearestAnchoredEfficiency(this.anchored, azimuthRad, elevationRad) ??
+      DEFAULT_EFFICIENCY
+    );
   }
 
   /**
@@ -407,13 +497,25 @@ class SolarMatrix {
       const existing =
         this.sailing.get(key) ??
         this.anchored.get(anchoredKey(sunAzimuthRad, sunElevationRad)) ??
+        nearestAnchoredEfficiency(
+          this.anchored,
+          sunAzimuthRad,
+          sunElevationRad,
+        ) ??
         DEFAULT_EFFICIENCY;
       const updated = emaUpdate(existing, etaObserved);
       this.sailing.set(key, updated);
     } else {
       // anchored, moored, or motoring (engine should be filtered by sanitization gate)
       const key = anchoredKey(sunAzimuthRad, sunElevationRad);
-      const existing = this.anchored.get(key) ?? DEFAULT_EFFICIENCY;
+      const existing =
+        this.anchored.get(key) ??
+        nearestAnchoredEfficiency(
+          this.anchored,
+          sunAzimuthRad,
+          sunElevationRad,
+        ) ??
+        DEFAULT_EFFICIENCY;
       const updated = emaUpdate(existing, etaObserved);
       this.anchored.set(key, updated);
     }
@@ -456,6 +558,7 @@ module.exports = {
   SolarMatrix,
   anchoredKey,
   sailingKey,
+  nearestAnchoredEfficiency,
   theoreticalPower,
   observedEfficiency,
   emaUpdate,
@@ -466,5 +569,7 @@ module.exports = {
   DEFAULT_MAX_SOC,
   AZIMUTH_BIN,
   ELEVATION_BIN,
+  ELEVATION_WEIGHT,
+  MAX_NEIGHBOR_RADIUS,
   AWA_BIN,
 };

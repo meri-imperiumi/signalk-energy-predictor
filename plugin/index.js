@@ -2739,11 +2739,12 @@ module.exports = (app) => {
     // Without a real forecast (metered uplink: tier 1 is skipped by design;
     // no tier-2 weather provider; the on-disk restore older than its
     // staleness window) the FSM serves the stale-boundary hybrid (tier 3)
-    // or Clear Sky (tier 4), whose `windSpeedMs` is the latest-known
+    // or the fallback tiers 3-5 (stale-boundary hybrid / Climatology /
+    // Clear Sky), whose `windSpeedMs` is the latest-known
     // *measured* wind. Comparing measured wind against itself yields a
     // ratio of ~1 by construction and cements factor 1.0 ("no protection",
     // shown as WPF 100%) at exactly the anchorages visited without a real
-    // forecast — when local shelter learning would matter most. Tiers 3/4
+    // forecast — when local shelter learning would matter most. Tiers 3+
     // never carry real forecast wind, so gate on the FSM's current tier
     // and wait for a real forecast (live fetch or on-disk restore).
     const forecastTier = ingestionFSM.currentTier ?? 0;

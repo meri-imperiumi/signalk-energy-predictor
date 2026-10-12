@@ -456,7 +456,8 @@ async function fetchHistoricalWeather({
  *        contribute no weather instead of being fetched.
  * @returns {Promise<Array<{time: Date, ghi: number|null, cloudCover: number|null, windSpeedKnots: number|null, gustSpeedKnots: number|null, windDirectionDeg: number|null, tier: number|null}>>}
  *          `tier` records which forecast tier produced each hour (1/2 =
- *          real forecast or archive, 3/4 = logbook/clear-sky hybrid whose
+ *          real forecast or archive, 3/4/5 = logbook/climatology/clear-sky
+ *          fallback whose
  *          wind, if any, is a measured nowcast), so consumers like the WPF
  *          replay can refuse to learn from self-referential wind.
  */
@@ -480,12 +481,12 @@ async function fetchHistoricalWeatherTrack({
         // knots (what `fetchHistoricalWeather` returns and what
         // `interpolateWeather` and the sample/generator replays read), so
         // convert — keeping `tier` so consumers can tell a real forecast
-        // (tier 1/2) from a hybrid/Clear Sky point (tier 3/4).
+        // (tier 1/2) from a fallback point (tier 3/4/5).
         // A cached day from a real-forecast tier whose hours carry no wind
         // at all is corrupted by the old wind-dropping writer (knots-shaped
         // input serialized as nulls): treat it as a miss so it is re-fetched
         // instead of permanently blocking the archive wind for that day.
-        // Windless tier 3/4 days are legitimate (Clear Sky/logbook writes
+        // Windless tier 3/4/5 days are legitimate (Clear Sky/logbook writes
         // carry no wind) and stay cached.
         const bestTier = cached.reduce(
           (best, p) => (p.tier != null && p.tier < best ? p.tier : best),
@@ -703,7 +704,7 @@ function interpolateWeather(weather, time) {
     gustSpeedKnots: closest.gustSpeedKnots ?? null,
     windDirectionDeg: closest.windDirectionDeg ?? null,
     // Which forecast tier produced this hour (1/2 = real forecast,
-    // 3/4 = logbook/clear-sky hybrid). Null on legacy/test points.
+    // 3/4/5 = logbook/climatology/clear-sky fallback). Null on legacy/test points.
     tier: closest.tier ?? null,
   };
 }
@@ -2343,7 +2344,8 @@ function replayWindProtection({
     // Forecast for this bucket
     const wx = interpolateWeather(weather, time);
     // Never learn from weather whose wind is itself measured wind: the
-    // live fallback tiers (3 = logbook hybrid, 4 = clear sky) cache the
+    // live fallback tiers (3 = logbook hybrid, 4 = climatology, 5 = clear
+    // sky) cache the
     // latest-known *measured* wind as their "forecast" wind. Comparing
     // measured wind against itself yields a ratio of ~1 by construction
     // and cements factor 1.0 ("no protection") at exactly the anchorages

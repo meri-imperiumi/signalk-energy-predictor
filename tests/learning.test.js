@@ -9,11 +9,16 @@ const {
   SolarMatrix,
   anchoredKey,
   sailingKey,
+  nearestAnchoredEfficiency,
   theoreticalPower,
   observedEfficiency,
   emaUpdate,
   isValidTick,
   normalizeControllerMode,
+  ELEVATION_WEIGHT,
+  MAX_NEIGHBOR_RADIUS,
+  AZIMUTH_BIN,
+  ELEVATION_BIN,
 } = require("../plugin/learning.js");
 
 test.describe("SolarMatrix", () => {
@@ -349,6 +354,122 @@ test.describe("SolarMatrix", () => {
       // No anchored bin learned either -> flat default
       const eff = matrix.getSailing(0, Math.PI / 4, Math.PI / 2);
       assert.strictEqual(eff, 0.7);
+    });
+
+    test("interpolates from neighbor bins for unknown anchored bin", () => {
+      // A thin bin (new season, new latitude) gets the best local estimate
+      // from adjacent learned bins instead of the flat 0.7 default.
+      const matrix = new SolarMatrix("test-array");
+      matrix.anchored.set("0_40", 0.5); // el 40°, same azimuth
+      matrix.anchored.set("0_60", 0.8); // el 60°, same azimuth
+      // Target el 50°: both neighbors 10° away, equal distance metric
+      // (dAz=0, dEl=10 -> d²=(2·10/10)²=4) -> average of the two.
+      const eff = matrix.getAnchored(0, (50 * Math.PI) / 180);
+      assert.strictEqual(eff, 0.65);
+    });
+
+    test("weights nearer bins more heavily", () => {
+      // Target el 40° (unlearned). Neighbors: azimuth ±15° bins at d²=1
+      // each; elevation bins 30/50 at d²=4 each. The closer azimuth
+      // neighbors dominate the weighted average.
+      const matrix = new SolarMatrix("test-array");
+      matrix.anchored.set("15_40", 0.9);
+      matrix.anchored.set("-15_40", 0.9);
+      matrix.anchored.set("0_30", 0.1);
+      matrix.anchored.set("0_50", 0.1);
+      const eff = matrix.getAnchored(0, (40 * Math.PI) / 180);
+      const expected = (0.9 * 1 + 0.9 * 1 + 0.1 * 0.25 + 0.1 * 0.25) / 2.5;
+      assert.ok(Math.abs(eff - expected) < 1e-9);
+      assert.ok(eff > 0.7, "closer azimuth neighbors dominate");
+    });
+
+    test("wraps azimuth distance across the ±180° boundary", () => {
+      const matrix = new SolarMatrix("test-array");
+      matrix.anchored.set("165_40", 0.3); // +165°
+      matrix.anchored.set("-165_40", 0.3); // -165°
+      // Target azimuth 175°: nearest bins are 10° away across the wrap.
+      const eff = matrix.getAnchored(
+        (175 * Math.PI) / 180,
+        (40 * Math.PI) / 180,
+      );
+      assert.strictEqual(eff, 0.3);
+    });
+
+    test("falls back to flat default when no learned bin within radius", () => {
+      const matrix = new SolarMatrix("test-array");
+      matrix.anchored.set("0_0", 0.9);
+      // Target elevation 60°: dEl = 60 -> d² = (2·60/10)² = 144 > 9
+      const eff = matrix.getAnchored(0, Math.PI / 3);
+      assert.strictEqual(eff, 0.7);
+    });
+
+    test("nearestAnchoredEfficiency returns null on empty map", () => {
+      assert.strictEqual(nearestAnchoredEfficiency(new Map(), 0, 0.5), null);
+    });
+
+    test("seeding a new bin from neighbors uses the local prior", () => {
+      // The EMA seed in update() should come from neighboring bins, not the
+      // global default, so new bins start converged to their neighborhood.
+      const matrix = new SolarMatrix("test-array");
+      matrix.anchored.set("0_30", 0.4); // dEl=10 -> d²=4
+      matrix.anchored.set("0_50", 0.6); // dEl=10 -> d²=4
+      matrix.update({
+        navState: "anchored",
+        actualPowerW: 47,
+        capacityWp: 100,
+        ghi: 683.5,
+        sunAzimuthRad: 0,
+        sunElevationRad: (40 * Math.PI) / 180,
+        awaRad: null,
+        readings: {
+          engineRunning: false,
+          batterySoc: 0.6,
+          shorePowerConnected: false,
+        },
+      });
+      // Seed for the new bin 0_40: neighbors at equal d²=4 -> 0.5.
+      // theoretical = 100 · 683.5/1000 = 68.35, observed eta = 47/68.35
+      const expected = 0.05 * (47 / 68.35) + 0.95 * 0.5;
+      const seeded = matrix.anchored.get("0_40");
+      assert.ok(Math.abs(seeded - expected) < 1e-9);
+      const eff = matrix.getAnchored(0, (40 * Math.PI) / 180);
+      assert.ok(Math.abs(eff - expected) < 1e-9);
+    });
+
+    test("learned exact bins are never modified by the fallback path", () => {
+      const matrix = new SolarMatrix("test-array");
+      matrix.anchored.set("0_40", 0.42);
+      // Lookup near the exact bin returns the learned value untouched.
+      assert.strictEqual(matrix.getAnchored(0, (40 * Math.PI) / 180), 0.42);
+    });
+
+    test("sailing fallback inherits neighbor interpolation", () => {
+      const matrix = new SolarMatrix("test-array");
+      matrix.anchored.set("0_40", 0.42);
+      // Sailing bin for el 45° unlearned; exact anchored bin (40°) is also
+      // unlearned for that elevation, so the neighbor lookup applies.
+      const eff = matrix.getSailing(0, (45 * Math.PI) / 180, Math.PI / 2);
+      assert.strictEqual(eff, 0.42);
+    });
+
+    test("elevation dominates azimuth in the distance metric", () => {
+      // ELEVATION_WEIGHT=2: a 10° elevation step (d²=4) outweighs a 15°
+      // azimuth step (d²=1)?? No — the metric must favor the closer axis.
+      // A bin 15° away in azimuth (d²=1) beats a bin 10° away in elevation
+      // (d²=4): the azimuth-neighbor dominates the weighted average.
+      assert.strictEqual(ELEVATION_WEIGHT, 2);
+      assert.strictEqual(MAX_NEIGHBOR_RADIUS, 3);
+      assert.strictEqual(AZIMUTH_BIN, 15);
+      assert.strictEqual(ELEVATION_BIN, 10);
+
+      const map = new Map([
+        ["15_40", 0.9], // dAz=15 -> d²=1
+        ["0_50", 0.1], // dEl=10 -> d²=4
+      ]);
+      const eff = nearestAnchoredEfficiency(map, 0, (45 * Math.PI) / 180);
+      const expected = (0.9 * 1 + 0.1 * 0.25) / 1.25;
+      assert.ok(Math.abs(eff - expected) < 1e-9);
+      assert.ok(eff > 0.7, "azimuth neighbor (closer) dominates");
     });
 
     test("falls back to anchored bin for unknown sailing bin", () => {

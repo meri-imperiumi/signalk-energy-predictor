@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Climatology tier for the clear-sky fallback** (`plugin/climatology.js`, `plugin/ingestion.js`): the fallback floor no longer assumes 0 % cloud everywhere — a systematically optimistic assumption exactly in the situations where prediction matters most (mid-passage, no uplink). NASA POWER's monthly climatology (~1° grid, 1981–present, no API key, US-government public domain) supplies the regional all-sky/clear-sky ratio `Kc(month, cell)`: once a ~1° cell is fetched, its 12 ratio values scale the clear-sky curve into a *typical* expectation for the region and month, fully offline. A new tier 4 (Climatology) sits between Logbook and Clear Sky: real forecast > logbook persistence > typical regional cloudiness > pure clear sky. Cells never expire (climatology is static); the fetch rides the existing uplink-aware cadence, is skipped on metered uplinks (same WAN-download policy as tier 1), and every failure degrades softly to pure clear sky. The learning cycle's `getCurrentGHI` floor and the history-backfill's cached weather inherit the scaling, so learned efficiency stays honest at low sun in known regions.
+- **Neighbor-interpolated efficiency fallback** (`plugin/learning.js`): an unlearned azimuth×elevation bin no longer falls back to the flat 0.7 default — learned bins within a search radius (elevation-weighted distance metric, azimuth wrapped across ±180°) vote with inverse-distance weights, so thin bins (new season, new latitude, passage hours) get the best local estimate instead of a global guess. The same lookup seeds the EMA in `SolarMatrix.update()`, so new bins start converged to their neighborhood; the sailing matrix inherits the behavior through its existing anchored fallback. Learned exact bins are untouched — read-path only, no matrix migration. Constants (`ELEVATION_WEIGHT`, `MAX_NEIGHBOR_RADIUS`) are module-level and tunable against recorded data.
+
+### Changed
+- **Clear Sky demoted to tier 5** (`plugin/ingestion.js`, `plugin/weather-cache.js`): the fallback ladder is now 5 tiers with Climatology inserted as tier 4. Weather-cache day files carry a `schemaVersion` marker; legacy unversioned files (bare hours array) are re-tagged on read so old tier-4 Clear Sky points cannot masquerade as Climatology quality — merge behavior keeps even unmigrated caches correct, and same-tier writes refresh them. Source labels gain "Climatology Baseline"; tier-range gates (`>= LOGBOOK`) absorb the new tier unchanged.
+
 ## [0.12.1] - 2026-10-11
 
 ### Changed

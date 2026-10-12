@@ -297,7 +297,7 @@ class AdvisoryPublisher {
         value: {
           displayName: "Forecast source",
           description:
-            'Which weather-forecast source the current prediction is built on (e.g. "Open-Meteo", "Signal K Weather API", "Signal K Logbook", "Clear Sky Baseline"), or null when no forecast is available',
+            'Which weather-forecast source the current prediction is built on (e.g. "Open-Meteo", "Signal K Weather API", "Signal K Logbook", "Climatology Baseline", "Clear Sky Baseline"), or null when no forecast is available',
         },
       },
       {
@@ -830,7 +830,7 @@ class AdvisoryPublisher {
    * notification) for the instrument panel / webapp to render.
    *
    * @param {string|null} weatherSource - Human-readable source name
-   *        (e.g. "Open-Meteo", "Clear Sky"), or null when no forecast is
+   *        (e.g. "Open-Meteo", "Climatology Baseline", "Clear Sky"), or null when no forecast is
    *        available this cycle
    * @param {number} validHours - Hours the current forecast actually covers
    *        (the prediction's effective horizon); 0 when no forecast
@@ -1221,7 +1221,7 @@ class AdvisoryPublisher {
    * @param {number} [params.batterySoC] - Current battery SoC [0–1]
    * @param {string|null} [params.weatherSource=null] - Human-readable
    *        forecast source name in use this cycle (e.g. "Open-Meteo",
-   *        "Signal K Weather API", "Signal K Logbook", "Clear Sky
+   *        "Signal K Weather API", "Signal K Logbook", "Climatology Baseline", "Clear Sky
    *        Baseline"), or null when no forecast is available
    * @param {number} [params.validHours=0] - Hours the current forecast
    *        actually covers (the prediction's effective horizon)

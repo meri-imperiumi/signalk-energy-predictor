@@ -19,6 +19,7 @@ const {
   weatherRestoreBucket,
   weatherCachePath,
   mergeHours,
+  parseDayFile,
   readWeatherCache,
   readWeatherCacheCoarse,
   writeWeatherCache,
@@ -104,11 +105,72 @@ test("atomic write leaves no temp files behind and the target is complete", asyn
     entries.filter((e) => e.endsWith(".json")),
     ["p60-17_p21-39.json"],
   );
-  // The renamed file is the complete payload, not a partial write
+  // The renamed file is the complete payload, not a partial write, in the
+  // versioned day-file schema
   const raw = JSON.parse(
     await fs.readFile(path.join(dayDir, "p60-17_p21-39.json"), "utf-8"),
   );
-  assert.strictEqual(raw.length, 2);
+  assert.strictEqual(raw.schemaVersion, 1);
+  assert.strictEqual(raw.hours.length, 2);
+});
+
+test("legacy bare-array day files are re-tagged: tier 4 (old Clear Sky) becomes tier 5", async () => {
+  // Tier 4 used to be Clear Sky; with the climatology tier it is
+  // Climatology and Clear Sky moved to tier 5 (work doc #29). Unversioned
+  // (legacy) day files must be re-tagged on read so old Clear Sky hours
+  // cannot masquerade as Climatology quality in the tier merge.
+  const dir = await mkTmpDir();
+  const bucket = { latitude: 60.17, longitude: 21.39 };
+  const dayDir = path.join(dir, "weather", DATE);
+  await fs.mkdir(dayDir, { recursive: true });
+  const legacy = [
+    { time: NOON_ISO, ghi: 500, cloudCover: null, tier: 4 },
+    {
+      time: new Date(new Date(NOON_ISO).getTime() + 3600000).toISOString(),
+      ghi: 400,
+      cloudCover: null,
+      tier: 2,
+    },
+  ];
+  await fs.writeFile(
+    path.join(dayDir, "p60-17_p21-39.json"),
+    JSON.stringify(legacy),
+    "utf-8",
+  );
+  const hours = await readWeatherCache(dir, DATE, bucket);
+  assert.ok(hours);
+  assert.strictEqual(
+    hours[0].tier,
+    5,
+    "legacy Clear Sky tier 4 re-tagged to 5",
+  );
+  assert.strictEqual(hours[1].tier, 2, "real-forecast tiers untouched");
+
+  // And the tier merge sees the re-tagged values: a new Climatology (tier 4)
+  // write must now beat the legacy Clear Sky (tier 5) point.
+  await writeWeatherCache(dir, DATE, bucket, [
+    { time: new Date(NOON_ISO), ghi: 300, cloudCover: 0.5, tier: 4 },
+  ]);
+  const merged = await readWeatherCache(dir, DATE, bucket);
+  assert.strictEqual(
+    merged[0].tier,
+    4,
+    "climatology beats re-tagged legacy clear sky",
+  );
+  assert.strictEqual(merged[0].ghi, 300);
+});
+
+test("parseDayFile reads the versioned schema without re-tagging", () => {
+  const hours = parseDayFile({
+    schemaVersion: 1,
+    hours: [
+      { time: NOON_ISO, ghi: 300, cloudCover: 0.5, tier: 4 },
+      { time: NOON_ISO, ghi: 800, cloudCover: 0, tier: 5 },
+    ],
+  });
+  assert.strictEqual(hours[0].tier, 4, "versioned climatology stays tier 4");
+  assert.strictEqual(hours[1].tier, 5);
+  assert.ok(hours[0].time instanceof Date);
 });
 
 test("writeWeatherCache accepts knots-shaped hours (archive fetches) without losing wind", async () => {
