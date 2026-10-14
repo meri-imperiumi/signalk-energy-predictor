@@ -48,7 +48,7 @@
     "node": ">=22.12.0"
   },
   "dependencies": {
-    "@openwaters/almanac": "^0.8.0"
+    "@openwaters/almanac": "^0.10.0"
   },
   "devDependencies": {
     "@signalk/server-api": "^2.30.0"

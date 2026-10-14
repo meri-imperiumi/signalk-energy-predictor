@@ -56,6 +56,18 @@ test("sunTimes tells polar day from polar night", () => {
   assert.strictEqual(polarNight.alwaysDown, true);
 });
 
+test("sunTimes boundary: noon altitude alone does not decide polar day", () => {
+  // 70.55N on 2024-11-22: the Sun's refracted centre altitude at upper
+  // transit is about -0.22°, above -0.27° but below the horizon. The
+  // sunrise/set horizon convention must win over the raw altitude, so
+  // this is polar night, not polar day.
+  const times = sunTimes(new Date("2024-11-22T12:00:00Z"), 70.55, 0);
+  assert.strictEqual(times.sunrise, null);
+  assert.strictEqual(times.sunset, null);
+  assert.strictEqual(times.alwaysUp, false);
+  assert.strictEqual(times.alwaysDown, true);
+});
+
 test("sunTimes degrades to nulls outside the supported range", () => {
   const times = sunTimes(new Date("1900-01-01"), 60, 25);
   assert.strictEqual(times.sunrise, null);

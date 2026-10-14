@@ -12,7 +12,12 @@
  * @file solar.js
  */
 
-const { sunAltAz, sunEvents, sunTransits } = require("@openwaters/almanac");
+const {
+  sunAltAz,
+  sunEvents,
+  sunIsUp,
+  sunTransits,
+} = require("@openwaters/almanac");
 
 /**
  * Solar constant (W/m² at mean Earth-Sun distance)
@@ -32,12 +37,6 @@ const CLEAR_SKY_TRANSMITTANCE = 0.75;
 const EVENT_SEARCH_WINDOW_MS = 48 * 3600000;
 
 const DEG_TO_RAD = Math.PI / 180;
-
-/**
- * How far the Sun's center sits below its upper limb, for telling polar day
- * from polar night.
- */
-const SUN_SEMIDIAMETER_DEG = 0.27;
 
 /**
  * Calculates solar altitude (elevation) and azimuth using Almanac.
@@ -150,8 +149,9 @@ function sunTimes(date, latitude, longitude) {
     const sunset = events.find((e) => e.kind === "set")?.time ?? null;
     if (sunrise === null || sunset === null) {
       // No rise or set all day, so the Sun stays on one side of the horizon:
-      // look at the upper transit to tell polar day from polar night.
-      const up = sunAltAz(day.noon, observer).altDeg + SUN_SEMIDIAMETER_DEG > 0;
+      // use the sunrise/set horizon convention at the upper transit to tell
+      // polar day from polar night.
+      const up = sunIsUp(day.noon, observer);
       return {
         sunrise: null,
         sunset: null,

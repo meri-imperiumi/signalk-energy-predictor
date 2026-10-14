@@ -41,16 +41,22 @@ function makeFakeApp() {
 /**
  * Longitude that puts the sun near local midnight (below horizon) or local
  * noon (above horizon) at the equator, regardless of when the test runs.
+ * Normalized to [-180, 180] as Signal K positions are; wrapping by 360°
+ * does not change the sun's position at an instant.
  */
+function normalizeLongitude(longitude) {
+  return longitude - 360 * Math.round(longitude / 360);
+}
+
 function midnightLongitude() {
   const now = new Date();
   const utcHours = now.getUTCHours() + now.getUTCMinutes() / 60;
-  return (0 - utcHours) * 15;
+  return normalizeLongitude((0 - utcHours) * 15);
 }
 function noonLongitude() {
   const now = new Date();
   const utcHours = now.getUTCHours() + now.getUTCMinutes() / 60;
-  return (12 - utcHours) * 15;
+  return normalizeLongitude((12 - utcHours) * 15);
 }
 
 /** Builds a 24h forecast where gust varies per hour. */

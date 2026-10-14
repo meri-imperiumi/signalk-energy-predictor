@@ -1080,9 +1080,12 @@ test.describe("Solar learning regression", () => {
     // Position at the local-midnight meridian on the equator, so the sun
     // is well below the horizon regardless of when the test runs (the
     // inverse of the local-noon trick used by the other learning tests).
+    // Normalized to [-180, 180] as Signal K positions are; wrapping by
+    // 360° does not change the sun's position at an instant.
     const now = new Date();
     const utcHours = now.getUTCHours() + now.getUTCMinutes() / 60;
-    const longitude = (0 - utcHours) * 15;
+    let longitude = (0 - utcHours) * 15;
+    longitude -= 360 * Math.round(longitude / 360);
     const latitude = 0;
 
     const powerPath = "electrical.solar.cabin-roof.panelPower";

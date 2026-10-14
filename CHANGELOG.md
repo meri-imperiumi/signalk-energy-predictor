@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Polar day/night flags now use the sunrise horizon convention** (`plugin/solar.js`, issue #6): the no-crossing branch of `sunTimes()` classified polar day versus night from the Sun's refracted centre altitude at upper transit plus a fixed 0.27° solar-semidiameter offset — an approximation that disagrees with the horizon `sunEvents()` actually solves against. In the reported case (70.55°N, 2024-11-22), transit altitude of about −0.22° passed the `+0.27°` test and polar night was reported as `alwaysUp` although the Sun never clears the horizon. The classification now uses Almanac's `sunIsUp()`, which applies the same upper-limb horizon convention as the rise/set events; the semidiameter constant is gone and `@openwaters/almanac` is bumped from `^0.8.0` to `^0.10.0`. Irradiance and panel-yield calculations are untouched and keep using altitude. Note: Almanac 0.10.0 also began validating `longitudeDeg` to [−180, 180] and raising `RangeError` outside it; the plugin consumes Signal K positions, which are always normalized, but test helpers that derived longitudes past −180° now wrap them by 360° (which does not change the sun's position at an instant). A boundary case at 70.55°N joins the Svalbard day/night tests in `tests/solar.test.js`.
+
 ## [0.12.3] - 2026-10-12
 
 ## [0.12.2] - 2026-10-12
