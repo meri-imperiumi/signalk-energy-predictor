@@ -622,7 +622,7 @@ test.describe("route registration", () => {
       registerApiRoutes(router, {
         app: makeApp(),
         getConfig: () => CONFIG,
-        store,
+        getStore: () => store,
         dataDir,
       });
       for (const p of [
@@ -655,7 +655,7 @@ test.describe("route registration", () => {
       registerApiRoutes(router, {
         app: makeApp(),
         getConfig: () => CONFIG,
-        store,
+        getStore: () => store,
         dataDir,
       });
       const from = "2026-08-22T00:00:00Z";
@@ -680,6 +680,50 @@ test.describe("route registration", () => {
     });
   });
 
+  test("routes read the store per request: a reopened store serves after a config-save restart", async () => {
+    await withFixtures(async (dataDir, store) => {
+      // Signal K calls registerWithRouter once, at plugin registration. A
+      // configuration save stops the plugin (closing the store it captured)
+      // and starts a fresh one. Routes captured the old store object used to
+      // answer every request with "RecordStore is not open (call open()
+      // first)" until the whole server was restarted; the getter must be
+      // resolved per request so the new store is picked up.
+      let current = store;
+      const router = makeRouter();
+      registerApiRoutes(router, {
+        app: makeApp(),
+        getConfig: () => CONFIG,
+        getStore: () => current,
+        dataDir,
+      });
+      const from = "2026-08-22T00:00:00Z";
+      const to = "2026-08-22T02:00:00Z";
+
+      const before = makeRes();
+      await router.routes.get("/api/actuals")({ query: { from, to } }, before);
+      assert.strictEqual(before.statusCode, null);
+      assert.ok(before.body.totals.solarWh > 0);
+
+      // Simulate the config-save restart: close the registered store, open
+      // a fresh one with the same data, and swap it in.
+      store.close();
+      const reopened = new RecordStore({ debug() {}, error() {} }, dataDir, {});
+      reopened.open();
+      try {
+        current = reopened;
+        const after = makeRes();
+        await router.routes.get("/api/actuals")({ query: { from, to } }, after);
+        assert.strictEqual(after.statusCode, null);
+        assert.strictEqual(
+          after.body.totals.solarWh,
+          before.body.totals.solarWh,
+        );
+      } finally {
+        reopened.close();
+      }
+    });
+  });
+
   test("concurrent identical window loads are shared between endpoints", async () => {
     await withFixtures(async (dataDir, store) => {
       // Count underlying cycle-metadata reads by patching the fixture
@@ -694,7 +738,7 @@ test.describe("route registration", () => {
       registerApiRoutes(router, {
         app: makeApp(),
         getConfig: () => ({ ...CONFIG, weather: { forecastHours: 48 } }),
-        store,
+        getStore: () => store,
         dataDir,
       });
       const from = "2026-08-22T00:00:00Z";
@@ -765,7 +809,7 @@ test.describe("route registration", () => {
               : null,
         },
         getConfig: () => CONFIG,
-        store,
+        getStore: () => store,
         dataDir,
       });
       const res = makeRes();
@@ -786,7 +830,7 @@ test.describe("route registration", () => {
             path === "environment.time.timezoneOffset" ? { value: -930 } : null,
         },
         getConfig: () => CONFIG,
-        store,
+        getStore: () => store,
         dataDir,
       });
       const res = makeRes();
@@ -801,7 +845,7 @@ test.describe("route registration", () => {
       registerApiRoutes(router, {
         app: { debug() {}, error() {}, getSelfPath: () => null },
         getConfig: () => CONFIG,
-        store,
+        getStore: () => store,
         dataDir,
       });
       const res = makeRes();
@@ -827,7 +871,7 @@ test.describe("route registration", () => {
         registerApiRoutes(router, {
           app: makeApp(),
           getConfig: () => CONFIG,
-          store,
+          getStore: () => store,
           dataDir,
           // No getUplinkStatus: unknown uplink defaults to offline, so no
           // background warm either
@@ -868,7 +912,7 @@ test.describe("route registration", () => {
         registerApiRoutes(router, {
           app: makeApp(),
           getConfig: () => CONFIG,
-          store,
+          getStore: () => store,
           dataDir,
           getUplinkStatus: () => ({ online: true, metered: false }),
         });
@@ -896,7 +940,7 @@ test.describe("route registration", () => {
         registerApiRoutes(meteredRouter, {
           app: makeApp(),
           getConfig: () => CONFIG,
-          store,
+          getStore: () => store,
           dataDir,
           getUplinkStatus: () => ({ online: true, metered: true }),
         });

@@ -3496,7 +3496,12 @@ module.exports = (app) => {
       deps.registerApiRoutes(router, {
         app,
         getConfig: () => pluginConfig,
-        store: recorder,
+        // Read per request — Signal K registers the router once at plugin
+        // registration and never re-registers it on a configuration-save
+        // restart, so a captured store would go stale (closed) after the
+        // first config edit and every endpoint would answer
+        // "RecordStore is not open (call open() first)".
+        getStore: () => recorder,
         dataDir: app.getDataDirPath(),
         getWindProtection: () => windProtection,
         // Uplink state for the retro-weather background warm: archive

@@ -111,7 +111,7 @@ registerApiRoutes(router, {
     mechanicalGenerators: [{ id: "wind-1", type: "wind" }],
     weather: { forecastHours: FORECAST_HOURS },
   }),
-  store,
+  getStore: () => store,
   dataDir: dir,
 });
 

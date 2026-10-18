@@ -926,6 +926,12 @@ async function loadCycles(
  * @param {object} params.app - Signal K server API (for logging)
  * @param {() => object|null} params.getConfig - Returns current plugin
  *   configuration (for device→source typing)
+ * @param {() => import("./storage.js").RecordStore|null} params.getStore
+ *   Returns the current record store. Read per request, never captured:
+ *   Signal K calls `registerWithRouter` once at plugin registration, while a
+ *   configuration save stops the plugin (closing the store it captured)
+ *   and starts a fresh one — a store captured at registration time would
+ *   go stale and every endpoint would answer "RecordStore is not open".
  * @param {string} params.dataDir - Plugin data directory with recordings
  * @param {() => ({online: boolean, metered: boolean})} [params.getUplinkStatus]
  *   Returns the current uplink state (from the ingestion FSM, mirrored
@@ -934,7 +940,7 @@ async function loadCycles(
  */
 function registerApiRoutes(
   router,
-  { app, getConfig, store, dataDir, getWindProtection, getUplinkStatus },
+  { app, getConfig, getStore, dataDir, getWindProtection, getUplinkStatus },
 ) {
   // Concurrent identical loads are shared at the underlying record-read
   // level: the webapp fires all window endpoints at once, and several
@@ -958,7 +964,7 @@ function registerApiRoutes(
   };
   const readRecords = (type, from, to) =>
     share(`records|${type}|${from.getTime()}|${to.getTime()}`, () =>
-      store.getRecords(type, from, to),
+      getStore().getRecords(type, from, to),
     );
   // Adapter the loaders use; row reads go through the shared closure.
   // scheduleSync forwards to the store's shared page queue so single-
@@ -966,10 +972,10 @@ function registerApiRoutes(
   // other endpoints' sync work into one long event-loop block.
   const sharedReadStore = {
     getRecords: readRecords,
-    getPointsByCycleRange: (f, t) => store.getPointsByCycleRange(f, t),
-    getDeploySpans: (f, t) => store.getDeploySpans(f, t),
-    getDeployActionPoints: (f, t) => store.getDeployActionPoints(f, t),
-    scheduleSync: (work) => store.scheduleSync(work),
+    getPointsByCycleRange: (f, t) => getStore().getPointsByCycleRange(f, t),
+    getDeploySpans: (f, t) => getStore().getDeploySpans(f, t),
+    getDeployActionPoints: (f, t) => getStore().getDeployActionPoints(f, t),
+    scheduleSync: (work) => getStore().scheduleSync(work),
   };
   const readSamples = (from, to) => readRecords("sample", from, to);
   const loadWindowCycles = (from, to) =>
@@ -1085,7 +1091,7 @@ function registerApiRoutes(
           )
         : // Aggregated window: freshest prediction per hour, resolved in
           // SQL (no forecast JSON parsed at all)
-          store
+          getStore()
             .getHourlyWinners(from, to)
             .then((winners) =>
               buildDailyPredictions(winnersToHourly(winners), from, to),
@@ -1132,7 +1138,7 @@ function registerApiRoutes(
     // materializes cycle records at all
     return Promise.all([
       readSamples(from, to),
-      Promise.resolve(store.getHourlyWinners(from, to)),
+      Promise.resolve(getStore().getHourlyWinners(from, to)),
     ])
       .then(([samples, winners]) =>
         res.json(
