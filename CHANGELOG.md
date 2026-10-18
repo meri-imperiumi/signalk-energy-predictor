@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.0] - 2026-10-19
+
 ### Added
 - **The house DC load path is configurable, and recorded house load includes the AC paths** (`plugin/schema.js`, `plugin/prediction.js`, `plugin/index.js`, `plugin/history-backfill.js`, issue #7): house consumption was read from one hard-coded path, `electrical.venus.dcPower`, so installations without a Victron Venus device saw zero house load everywhere — the load profile, `forecast.consumption`, `net`, `timeToFull`/`timeToEmpty`, and the webapp Consumption card. A new `houseLoadPaths` setting (array, summed, like `acPowerPaths`) defaults to `electrical.venus.dcPower` so Venus installations are unchanged; every DC house load reader switches to it (live load profile, recorder, engine-detection shunt-signature fallback, history backfill), and the setting description states the expected meaning: Venus `dcPower` semantics (net battery shunt plus directly-fed solar, i.e. `/Dc/System/Power`) — DC loads excluding inverter draw, which belongs in `acPowerPaths`. The recorder's `houseLoadW` — live and backfilled alike — is now the sum of the DC house load paths and `acPowerPaths`, the same total the load profile learns from, so recorded consumption no longer omits inverter loads; already-recorded samples keep their values.
 
