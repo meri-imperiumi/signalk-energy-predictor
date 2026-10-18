@@ -726,6 +726,48 @@ test.describe("PredictionEngine.updateLoadProfile gross consumption", () => {
     });
   });
 
+  test("DC house load sums configured paths, ignoring the Venus default", () => {
+    // Boats without a Venus device publish the DC system power on their own
+    // path (issue #7): configured paths are summed, and the default Venus
+    // path is not read even when it publishes.
+    withDaytimeNow(() => {
+      const pathValues = new Map([
+        ["electrical.venus.dcPower", 999],
+        ["electrical.dc.house.power", 45],
+        ["electrical.dc.fridge.power", 25],
+        ["electrical.venus.vebusDcPower", 0],
+        ["navigation.state", "moored"],
+        ["navigation.position", { latitude: -18.86, longitude: -159.8 }],
+      ]);
+      const { PredictionEngine } = require("../plugin/prediction.js");
+      const app = {
+        debug() {},
+        error() {},
+        getSelfPath: (p) => pathValues.get(p),
+      };
+      const engine = new PredictionEngine({
+        battery: { capacityAh: 400, systemVoltage: 12, minSafeSoC: 0.2 },
+        solarArrays: [],
+        mechanicalGenerators: [],
+        getEfficiency: () => 0.7,
+        getSelfPath: (p) => app.getSelfPath(p),
+        app,
+        houseLoadPaths: [
+          "electrical.dc.house.power",
+          "electrical.dc.fridge.power",
+        ],
+      });
+      engine.updateLoadProfile();
+      const bin = engine.loadProfile.bins.get("at-rest:day");
+      assert.ok(bin, "sample should be ingested into a day bin");
+      assert.strictEqual(
+        bin.dcEma,
+        70,
+        `DC EMA should sum 45+25 from the configured paths, got ${bin.dcEma}`,
+      );
+    });
+  });
+
   test("AC consumption is read from the default VE.Bus path", () => {
     // No acPowerPaths configured: the engine falls back to the Venus
     // VE.Bus inverter DC draw (the standard source), feeding the AC bins.

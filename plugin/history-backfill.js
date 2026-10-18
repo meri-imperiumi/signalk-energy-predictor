@@ -26,6 +26,8 @@ const {
   parseManufacturerCurve,
   getAcPowerPaths,
   DEFAULT_AC_POWER_PATHS,
+  getHouseLoadPaths,
+  DEFAULT_HOUSE_LOAD_PATHS,
 } = require("./schema.js");
 const weatherCache = require("./weather-cache.js");
 const {
@@ -1208,6 +1210,7 @@ async function populateFromHistory({
     (a) => a.enabled !== false && a.powerPath,
   );
   const acPowerPaths = getAcPowerPaths(config.acPowerPaths);
+  const houseLoadPaths = getHouseLoadPaths(config.houseLoadPaths);
 
   const seeded = new Map();
   if (!fresh) {
@@ -1261,7 +1264,9 @@ async function populateFromHistory({
       // the gust is taken as the max of true wind speed over each resolution
       // bucket (History API :max aggregate).
       "environment.wind.speedTrue:max",
-      "electrical.venus.dcPower",
+      // DC house load (Venus dcPower default) for the load profile replay
+      // and the recorded samples — configured per boat (issue #7)
+      ...houseLoadPaths,
       // AC (inverter) consumption for the load profile replay — configured
       // per boat (VE.Bus default when unset), not a hardcoded Venus path
       ...acPowerPaths,
@@ -1309,7 +1314,12 @@ async function populateFromHistory({
   const positionColumn = columns.get("navigation.position");
   const stwColumn = columns.get("navigation.speedThroughWater");
   const propulsionCols = propulsionColumns(historyData);
-  const houseLoadColumn = columns.get("electrical.venus.dcPower");
+  const houseLoadColumns = houseLoadPaths
+    .map((p) => columns.get(p))
+    .filter((col) => col != null);
+  const acLoadColumns = acPowerPaths
+    .map((p) => columns.get(p))
+    .filter((col) => col != null);
   const socColumn = columns.get(socPath);
   const arrayColumns = new Map(
     arrays
@@ -1330,7 +1340,8 @@ async function populateFromHistory({
     arrayColumns,
     generatorColumns,
     socColumn,
-    houseLoadColumn,
+    houseLoadColumns,
+    acLoadColumns,
     positionColumn,
   );
   // Write carried nav/position/propulsion back into historyData so the
@@ -1417,6 +1428,7 @@ async function populateFromHistory({
     resolution,
     uncountedChargingPaths,
     acPowerPaths,
+    houseLoadPaths,
   });
   await matrixPersistence.saveLoadProfile(dataDir, loadProfile);
 
@@ -1473,6 +1485,8 @@ async function populateFromHistory({
     from,
     to,
     carried,
+    houseLoadPaths,
+    acPowerPaths,
   });
 
   // Backfill deploy/stow states onto existing samples that predate the
@@ -1536,7 +1550,10 @@ const SAMPLE_MERGE_TOLERANCE_MS = 150000;
  * @param {Map<string, number|null>} arrayColumns - id -> column index
  * @param {Map<string, number|null>} generatorColumns - id -> column index
  * @param {number|null} socColumn
- * @param {number|null} houseLoadColumn
+ * @param {Array<number>} houseLoadColumns - DC house load column indexes
+ *        (Venus dcPower semantics), summed
+ * @param {Array<number>} acLoadColumns - AC (inverter) column indexes,
+ *        summed into the recorded house load
  * @param {number|null} positionColumn
  * @returns {Array<object>} Per-point carried state, aligned with historyData.data
  */
@@ -1549,7 +1566,8 @@ function buildCarriedState(
   arrayColumns,
   generatorColumns,
   socColumn,
-  houseLoadColumn,
+  houseLoadColumns,
+  acLoadColumns,
   positionColumn,
 ) {
   const points = historyData.data || [];
@@ -1598,11 +1616,17 @@ function buildCarriedState(
     // stw: carry forward (continuous but last-known is better than null)
     const stwRaw = columnNumber(point, stwColumn);
     if (stwRaw != null) lastStw = stwRaw;
-    // soc, houseLoad: carry forward
+    // soc, houseLoad: carry forward. House load is the summed DC + AC
+    // reading of the tick (the recorded sample semantics, issue #7); a
+    // tick where every load column is silent carries the last value.
     const socRaw = columnNumber(point, socColumn);
     if (socRaw != null) lastSoc = socRaw;
-    const houseRaw = columnNumber(point, houseLoadColumn);
-    if (houseRaw != null) lastHouseLoad = houseRaw;
+    let houseW = null;
+    for (const col of [...houseLoadColumns, ...acLoadColumns]) {
+      const v = columnNumber(point, col);
+      if (v != null) houseW = (houseW ?? 0) + v;
+    }
+    if (houseW != null) lastHouseLoad = houseW;
     // array/generator power: carry forward
     const arrayPower = {};
     for (const [id, col] of arrayColumns) {
@@ -1703,6 +1727,8 @@ async function backfillSamples({
   from,
   to,
   carried,
+  houseLoadPaths = DEFAULT_HOUSE_LOAD_PATHS,
+  acPowerPaths = DEFAULT_AC_POWER_PATHS,
 }) {
   // Existing live samples: skip any replayed tick near one of these
   const existing = await store.getRecords("sample", from, to);
@@ -1744,7 +1770,12 @@ async function backfillSamples({
   const positionColumn = columns.get("navigation.position");
   const stwColumn = columns.get("navigation.speedThroughWater");
   const propulsionCols = propulsionColumns(historyData);
-  const houseLoadColumn = columns.get("electrical.venus.dcPower");
+  const houseLoadColumns = houseLoadPaths
+    .map((p) => columns.get(p))
+    .filter((col) => col != null);
+  const acLoadColumns = acPowerPaths
+    .map((p) => columns.get(p))
+    .filter((col) => col != null);
   const socColumn = columns.get(socPath);
   const arrayColumns = new Map(
     arrays
@@ -1779,7 +1810,8 @@ async function backfillSamples({
       arrayColumns,
       generatorColumns,
       socColumn,
-      houseLoadColumn,
+      houseLoadColumns,
+      acLoadColumns,
       positionColumn,
     );
 
@@ -2155,6 +2187,7 @@ function stateClassFromNavState(navState) {
  * @param {number} [params.resolution] - Sample resolution in seconds
  * @param {Array<string>} [params.uncountedChargingPaths=[]] - Charging-source power paths added back to dcPower
  * @param {Array<string>} [params.acPowerPaths] - AC (inverter) consumption paths, summed per tick
+ * @param {Array<string>} [params.houseLoadPaths] - DC house load paths with the Venus dcPower meaning, summed per tick
  * @returns {{dataPoints: number, ingested: number, gated: number}}
  */
 function replayLoadProfile({
@@ -2163,13 +2196,18 @@ function replayLoadProfile({
   resolution = DEFAULT_RESOLUTION,
   uncountedChargingPaths = [],
   acPowerPaths = DEFAULT_AC_POWER_PATHS,
+  houseLoadPaths = DEFAULT_HOUSE_LOAD_PATHS,
 }) {
   const columns = pathColumns(historyData);
-  const dcColumn = columns.get("electrical.venus.dcPower");
   const navStateColumn = columns.get("navigation.state");
   const positionColumn = columns.get("navigation.position");
   const stwColumn = columns.get("navigation.speedThroughWater");
   const propulsionCols = propulsionColumns(historyData);
+  // DC house load columns (Venus dcPower default): a tick's DC load is the
+  // sum of every configured path that reported (issue #7).
+  const dcColumns = houseLoadPaths
+    .map((p) => columns.get(p))
+    .filter((c) => c != null);
   // AC (inverter) consumption columns: read side by side with the DC house
   // load; a tick's AC load is the sum of every path that reported.
   const acColumns = acPowerPaths
@@ -2192,7 +2230,11 @@ function replayLoadProfile({
 
   for (const point of historyData.data || []) {
     const time = parseUtcTimestamp(point[0]);
-    const dcLoadW = columnNumber(point, dcColumn);
+    let dcLoadW = null;
+    for (const c of dcColumns) {
+      const v = columnNumber(point, c);
+      if (v != null) dcLoadW = (dcLoadW ?? 0) + v;
+    }
     let acLoadW = null;
     for (const c of acColumns) {
       const v = columnNumber(point, c);

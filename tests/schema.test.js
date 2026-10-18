@@ -14,6 +14,8 @@ const {
   validateConfig,
   DEFAULT_AC_POWER_PATHS,
   getAcPowerPaths,
+  DEFAULT_HOUSE_LOAD_PATHS,
+  getHouseLoadPaths,
 } = require("../plugin/schema.js");
 
 test.describe("getAcPowerPaths", () => {
@@ -46,6 +48,39 @@ test.describe("getAcPowerPaths", () => {
     assert.strictEqual(prop.type, "array");
     assert.strictEqual(prop.items.type, "string");
     assert.deepStrictEqual(prop.default, DEFAULT_AC_POWER_PATHS);
+  });
+});
+
+test.describe("getHouseLoadPaths", () => {
+  test("falls back to the Venus default when unset or empty", () => {
+    assert.deepStrictEqual(getHouseLoadPaths(undefined), [
+      "electrical.venus.dcPower",
+    ]);
+    assert.deepStrictEqual(getHouseLoadPaths(null), DEFAULT_HOUSE_LOAD_PATHS);
+    assert.deepStrictEqual(getHouseLoadPaths([]), DEFAULT_HOUSE_LOAD_PATHS);
+    assert.deepStrictEqual(
+      getHouseLoadPaths(["", "  ", 42]),
+      DEFAULT_HOUSE_LOAD_PATHS,
+    );
+  });
+
+  test("keeps configured house load paths, deduplicated", () => {
+    assert.deepStrictEqual(
+      getHouseLoadPaths([
+        "electrical.dc.house.power",
+        "electrical.dc.house.power",
+        "electrical.dc.fridge.power",
+      ]),
+      ["electrical.dc.house.power", "electrical.dc.fridge.power"],
+    );
+  });
+
+  test("schema exposes houseLoadPaths with the Venus default", () => {
+    const schema = buildPluginSchema();
+    const prop = schema.properties.houseLoadPaths;
+    assert.strictEqual(prop.type, "array");
+    assert.strictEqual(prop.items.type, "string");
+    assert.deepStrictEqual(prop.default, DEFAULT_HOUSE_LOAD_PATHS);
   });
 });
 

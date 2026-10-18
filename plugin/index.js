@@ -46,7 +46,9 @@ const {
   getDisplayName,
   validateConfig,
   DEFAULT_AC_POWER_PATHS,
+  DEFAULT_HOUSE_LOAD_PATHS,
   getAcPowerPaths,
+  getHouseLoadPaths,
 } = require("./schema.js");
 const {
   detectEngineCharging,
@@ -100,12 +102,16 @@ const PROPULSION_REVOLUTIONS_RE = /^propulsion\.([A-Za-z0-9]+)\.revolutions$/;
  *        subtracted; solar is already added back by Venus into dcPower)
  * @param {Array<object>} [engines] - Configured engines (for the
  *        alternator charger mode/power paths)
+ * @param {Array<string>} [houseLoadPaths] - Configured DC house load
+ *        paths with the Venus dcPower meaning (shunt + solar); summed
+ *        for the shunt-signature fallback
  * @returns {boolean|null} true if any engine runs, false if all stopped, null if unknown
  */
 function detectEngineRunning(
   pathValues,
   renewablePowerPaths = [],
   engines = [],
+  houseLoadPaths = DEFAULT_HOUSE_LOAD_PATHS,
 ) {
   let anyRunning = false;
   let anySignal = false;
@@ -154,8 +160,18 @@ function detectEngineRunning(
   // "stopped" from instrumentation wins over an ambiguous shunt reading
   // (which a genset charger or battery charger could also produce).
   if (!anySignal) {
+    // Venus dcPower semantics (shunt + solar), summed over the configured
+    // house load paths; a missing reading contributes nothing, and only
+    // an all-paths-missing count means "no readable shunt balance"
+    let dcPowerW = null;
+    for (const path of houseLoadPaths) {
+      const v = toNumber(pathValues.get(path));
+      if (v != null) {
+        dcPowerW = (dcPowerW ?? 0) + v;
+      }
+    }
     const charging = detectEngineCharging({
-      dcPowerW: toNumber(pathValues.get("electrical.venus.dcPower")),
+      dcPowerW,
       unaccountedChargingW: renewablePowerPaths.reduce((sum, path) => {
         const w = toNumber(pathValues.get(path));
         return w != null && w > 0 ? sum + w : sum;
@@ -165,10 +181,7 @@ function detectEngineRunning(
       ),
     });
     if (charging === true) return true;
-    if (
-      charging === false &&
-      pathValues.get("electrical.venus.dcPower") != null
-    ) {
+    if (charging === false && dcPowerW != null) {
       // A readable shunt balance with no combustion charging is a
       // definite "no engine" on boats without instrumentation.
       return false;
@@ -410,7 +423,6 @@ const SUBSCRIPTION_PATHS = [
   "environment.wind.speedTrue",
   "environment.wind.directionTrue",
   "electrical.batteries.house.capacity.stateOfCharge",
-  "electrical.venus.dcPower",
   "electrical.shore.power.connected",
   "navigation.speedOverGround",
   "propulsion.*.state",
@@ -2632,6 +2644,7 @@ module.exports = (app) => {
             deltaState,
             renewablePowerPaths(pluginConfig),
             getActiveEngines(pluginConfig),
+            getHouseLoadPaths(pluginConfig?.houseLoadPaths),
           ),
           batterySoc:
             deltaState.get(
@@ -2969,12 +2982,18 @@ module.exports = (app) => {
     // Get battery SoC
     const soc = currentSoC();
 
-    // Get house load (sum of all dcPower readings from venus)
-    const houseLoadW =
-      toNumber(
-        deltaState.get("electrical.venus.dcPower") ||
-          app.getSelfPath("electrical.venus.dcPower"),
-      ) || 0;
+    // Get house load: the configured DC house load paths (Venus dcPower
+    // default) plus the AC (inverter) paths — the same total the load
+    // profile learns from (issue #7). A missing reading contributes
+    // nothing, so a partially instrumented boat still records what it has.
+    let houseLoadW = 0;
+    for (const path of [
+      ...getHouseLoadPaths(pluginConfig?.houseLoadPaths),
+      ...getAcPowerPaths(pluginConfig?.acPowerPaths),
+    ]) {
+      houseLoadW +=
+        toNumber(deltaState.get(path) || app.getSelfPath(path)) || 0;
+    }
 
     // Get wind speed
     const windSpeedKnots =
@@ -3190,6 +3209,9 @@ module.exports = (app) => {
     // AC (inverter) consumption paths for the load profile — configured
     // per boat instead of a hardcoded Venus path (VE.Bus default when unset)
     extraPaths.push(...getAcPowerPaths(pluginConfig?.acPowerPaths));
+    // DC house load paths (Venus dcPower default) — configurable per boat
+    // (issue #7), so not in the static subscription list
+    extraPaths.push(...getHouseLoadPaths(pluginConfig?.houseLoadPaths));
 
     const allPaths = [...SUBSCRIPTION_PATHS, ...extraPaths];
     const subscription = {
@@ -3363,6 +3385,7 @@ module.exports = (app) => {
             deltaState,
             renewablePowerPaths(pluginConfig),
             getActiveEngines(pluginConfig),
+            getHouseLoadPaths(pluginConfig?.houseLoadPaths),
           ),
         // Surplus-mode detector for the consumption-learning gate
         // (LoadProfile): inside a forecast surplus window, or with an

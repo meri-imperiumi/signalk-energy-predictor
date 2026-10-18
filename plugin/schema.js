@@ -15,6 +15,8 @@ const { DEFAULT_TIER_SETTINGS } = require("./combustion.js");
  */
 const DEFAULT_AC_POWER_PATHS = ["electrical.venus.vebusDcPower"];
 
+const DEFAULT_HOUSE_LOAD_PATHS = ["electrical.venus.dcPower"];
+
 /**
  * Normalizes the configured AC power paths: keeps non-empty strings,
  * deduplicates, and falls back to the VE.Bus default when none are
@@ -30,6 +32,23 @@ function getAcPowerPaths(acPowerPaths) {
         .map((p) => p.trim())
     : [];
   return paths.length > 0 ? [...new Set(paths)] : [...DEFAULT_AC_POWER_PATHS];
+}
+
+/**
+ * Normalizes the configured DC house load paths: keeps non-empty
+ * strings, deduplicates, and falls back to the Venus default when none
+ * are configured (pre-schema-default configs keep working).
+ *
+ * @param {unknown} houseLoadPaths - Raw `houseLoadPaths` config value
+ * @returns {string[]} House load paths to read and subscribe to
+ */
+function getHouseLoadPaths(houseLoadPaths) {
+  const paths = Array.isArray(houseLoadPaths)
+    ? houseLoadPaths
+        .filter((p) => typeof p === "string" && p.trim().length > 0)
+        .map((p) => p.trim())
+    : [];
+  return paths.length > 0 ? [...new Set(paths)] : [...DEFAULT_HOUSE_LOAD_PATHS];
 }
 
 /**
@@ -155,11 +174,23 @@ function buildPluginSchema() {
         },
         required: ["capacityAh", "systemVoltage", "minSafeSoC"],
       },
+      houseLoadPaths: {
+        type: "array",
+        title: "House Load Paths",
+        description:
+          "Signal K paths for the DC house load in watts, summed — with the Venus dcPower meaning (net battery shunt plus directly-fed solar, i.e. /Dc/System/Power): DC loads excluding inverter draw, which belongs in AC Power Paths. The default covers a Victron Venus device; boats without one should list the path their calculation plugin publishes the DC system power on",
+        items: {
+          type: "string",
+          title: "House Load Path",
+          minLength: 1,
+        },
+        default: DEFAULT_HOUSE_LOAD_PATHS,
+      },
       acPowerPaths: {
         type: "array",
         title: "AC Power Paths",
         description:
-          "Signal K paths for AC power consumption in watts — read side by side with the Venus DC house load to learn the load profile's AC component. All paths are summed, so a boat with several inverters can list them all. The default covers a Victron VE.Bus inverter; boats whose primary inverter is not on VE.Bus should set their inverter's power path here",
+          "Signal K paths for AC power consumption in watts — read side by side with the DC house load to learn the load profile's AC component. All paths are summed, so a boat with several inverters can list them all. The default covers a Victron VE.Bus inverter; boats whose primary inverter is not on VE.Bus should set their inverter's power path here",
         items: {
           type: "string",
           title: "AC Power Path",
@@ -1205,4 +1236,6 @@ module.exports = {
   validateConfig,
   DEFAULT_AC_POWER_PATHS,
   getAcPowerPaths,
+  DEFAULT_HOUSE_LOAD_PATHS,
+  getHouseLoadPaths,
 };

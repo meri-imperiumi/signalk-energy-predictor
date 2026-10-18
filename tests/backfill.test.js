@@ -156,7 +156,8 @@ test.describe("buildCarriedState", () => {
       arrayColumns,
       generatorColumns,
       null, // socColumn
-      null, // houseLoadColumn
+      [], // houseLoadColumns
+      [], // acLoadColumns
       null, // positionColumn
     );
     // navState carries forward: moored, moored, sailing, sailing
@@ -205,7 +206,8 @@ test.describe("buildCarriedState", () => {
       new Map(),
       new Map(),
       null,
-      null,
+      [],
+      [],
       2,
     );
     assert.deepStrictEqual(
@@ -885,6 +887,60 @@ test.describe("replayLoadProfile", () => {
     );
     assert.strictEqual(load.dcWh, 10);
   });
+
+  test("sums configured DC house load paths instead of the Venus default", () => {
+    // The DC house load path is boat-specific (no Venus device on non-Victron
+    // installs, issue #7): configured paths are summed per tick, and the
+    // default Venus dcPower column is ignored when paths are overridden.
+    const historyData = {
+      values: [
+        { path: "electrical.dc.house.power" },
+        { path: "electrical.dc.fridge.power" },
+        { path: "electrical.venus.dcPower" },
+        { path: "electrical.venus.vebusDcPower" },
+        { path: "navigation.state" },
+        { path: "navigation.position" },
+      ],
+      data: [],
+    };
+    // dc house 1 (column 1), fridge 2, venus 999, vebus 0
+    for (let day = 0; day < 4; day++) {
+      const t = NOON + day * 24 * 3600000;
+      historyData.data.push([
+        new Date(t).toISOString(),
+        45,
+        25,
+        999,
+        0,
+        "anchored",
+        [LON, LAT],
+      ]);
+    }
+
+    const loadProfile = new LoadProfile({
+      config: { minDaysPerBin: 3 },
+      getSelfPath: () => undefined,
+      app: undefined,
+    });
+    const stats = replayLoadProfile({
+      loadProfile,
+      historyData,
+      resolution: 300,
+      houseLoadPaths: [
+        "electrical.dc.house.power",
+        "electrical.dc.fridge.power",
+      ],
+    });
+
+    assert.strictEqual(stats.ingested, 4);
+    const load = loadProfile.getLoad(SunPhase.DAY, StateClass.AT_REST);
+    assert.ok(load, "getLoad should return a value after replay");
+    assert.strictEqual(
+      load.dcWh,
+      70,
+      `DC load should sum 45+25 from the configured paths, got ${load.dcWh}`,
+    );
+  });
 });
 
 test.describe("recordings gap-fill", () => {
@@ -940,6 +996,83 @@ test.describe("recordings gap-fill", () => {
         (s) => Math.abs(Date.parse(s.timestamp) - NOON) < 60000,
       );
       assert.deepStrictEqual(noon.arrays, { live: 1 });
+    } finally {
+      store.close();
+      await fs.rm(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  test("recorded house load sums the configured DC and AC paths", async () => {
+    // The recorder's house load is the same total the load profile learns
+    // from (issue #7): the configured DC house load paths plus the AC
+    // (inverter) paths, so recorded consumption includes inverter draw.
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "bf-houseload-"));
+    const store = openStore(dataDir);
+    try {
+      const historyData = {
+        values: [
+          { path: "electrical.solar.test.power" },
+          { path: "electrical.batteries.house.capacity.stateOfCharge" },
+          { path: "navigation.state" },
+          { path: "environment.wind.angleApparent" },
+          { path: "navigation.speedThroughWater" },
+          { path: "electrical.dcsource.wind.power" },
+          { path: "electrical.dc.house.power" },
+          { path: "electrical.inverters.main.acPower" },
+          { path: "navigation.position" },
+        ],
+        data: [],
+      };
+      // Column order matches values: solar 1, soc 2, navState 3, awa 4,
+      // stw 5, windGen 6, DC house 7, inverter AC 8, position 9
+      for (let m = -10; m <= 10; m += 5) {
+        historyData.data.push([
+          new Date(NOON + m * 60000).toISOString(),
+          0,
+          0.5,
+          "anchored",
+          null,
+          null,
+          0,
+          45,
+          30,
+          [LON, LAT],
+        ]);
+      }
+
+      const written = await backfillSamples({
+        app: { debug() {} },
+        store,
+        historyData,
+        weather: makeWeather(NOON),
+        arrays: [
+          {
+            id: "test-array",
+            powerPath: "electrical.solar.test.power",
+          },
+        ],
+        generators: [],
+        socPath: "electrical.batteries.house.capacity.stateOfCharge",
+        from: new Date(NOON - 3600000),
+        to: new Date(NOON + 3600000),
+        houseLoadPaths: ["electrical.dc.house.power"],
+        acPowerPaths: ["electrical.inverters.main.acPower"],
+      });
+
+      assert.strictEqual(written, 5);
+      const samples = await store.getRecords(
+        "sample",
+        new Date(NOON - 3600000),
+        new Date(NOON + 3600000),
+      );
+      assert.strictEqual(samples.length, 5);
+      for (const s of samples) {
+        assert.strictEqual(
+          s.houseLoadW,
+          75,
+          `houseLoadW should be DC 45 + AC 30, got ${s.houseLoadW}`,
+        );
+      }
     } finally {
       store.close();
       await fs.rm(dataDir, { recursive: true, force: true });

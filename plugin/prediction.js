@@ -24,7 +24,7 @@ const {
 const { theoreticalPower } = require("./learning.js");
 const { formatWh, offsetMinutesFromHhmm, formatLocalHHMM } =
   require("./format.js");
-const { getAcPowerPaths } = require("./schema.js");
+const { getAcPowerPaths, getHouseLoadPaths } = require("./schema.js");
 
 /**
  * Default prediction horizon in hours. Override via the engine's
@@ -1046,6 +1046,7 @@ class PredictionEngine {
     predictionHours,
     getPolarModel,
     acPowerPaths,
+    houseLoadPaths,
   }) {
     this.battery = battery;
     // Config thresholds come from the schema in knots (sailor-friendly).
@@ -1132,6 +1133,10 @@ class PredictionEngine {
     // the Venus VE.Bus inverter DC draw by default, overridable for boats
     // whose inverter is not on VE.Bus. Readings from all paths are summed.
     this.acPowerPaths = getAcPowerPaths(acPowerPaths);
+    // DC house load paths feeding the load profile's DC bins: the Venus
+    // dcPower reading by default, overridable for boats without a Venus
+    // device (issue #7). Readings from all paths are summed.
+    this.houseLoadPaths = getHouseLoadPaths(houseLoadPaths);
     this.lastPrediction = [];
     /** Raw (pre-WPF) forecast from the last run, for publishing raw values */
     this.lastRawForecast = [];
@@ -1186,15 +1191,24 @@ class PredictionEngine {
   }
 
   updateLoadProfile() {
-    // Read consumption from Victron Venus.
-    // dcPower = shunt + solar, so wind/hydro/alternator charging (which flow
-    // through the shunt but aren't added back) make it understate real load.
-    // Add those back to reconstruct gross house consumption.
-    // AC consumption (inverter/shore) is independent of the DC bus: sum
-    // every configured path; a missing reading contributes nothing, and
-    // only an all-paths-missing cycle counts as "no AC sample".
-    const rawDc = this.getSelfPath("electrical.venus.dcPower");
-    const dcPowerW = toNumber(rawDc);
+    // Read consumption from the configured DC house load paths (Venus
+    // dcPower by default). dcPower = shunt + solar, so wind/hydro/alternator
+    // charging (which flow through the shunt but aren't added back) make it
+    // understate real load. Add those back to reconstruct gross house
+    // consumption. All configured paths are summed; a missing reading
+    // contributes nothing, and only an all-paths-missing cycle counts as
+    // "no DC sample". AC consumption (inverter/shore) is independent of
+    // the DC bus: sum every configured path with the same rule.
+    let dcPowerW = null;
+    const dcReadings = [];
+    for (const path of this.houseLoadPaths) {
+      const raw = this.getSelfPath(path);
+      const v = toNumber(raw);
+      if (v != null) {
+        dcPowerW = (dcPowerW ?? 0) + v;
+        dcReadings.push(`${path}=${v}`);
+      }
+    }
     const chargingW = this.uncountedChargingW();
     let acPowerW = null;
     const acReadings = [];
@@ -1207,7 +1221,7 @@ class PredictionEngine {
     }
 
     this.app?.debug?.(
-      `updateLoadProfile: dcPower=${JSON.stringify(rawDc)} (${dcPowerW}), uncountedCharging=${chargingW}, gross=${dcPowerW != null ? dcPowerW + chargingW : null}, ac=[${acReadings.join(", ")}] (${acPowerW})`,
+      `updateLoadProfile: houseLoad=[${dcReadings.join(", ")}] (${dcPowerW}), uncountedCharging=${chargingW}, gross=${dcPowerW != null ? dcPowerW + chargingW : null}, ac=[${acReadings.join(", ")}] (${acPowerW})`,
     );
 
     if (dcPowerW != null || acPowerW != null) {
