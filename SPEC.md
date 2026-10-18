@@ -197,8 +197,8 @@ The plugin maintains two types of learned state that **must persist across serve
 The following state is intentionally NOT persisted, as it repopulates from live Signal K deltas:
 
 - `deltaState` - Current Signal K values from active subscriptions
-- `solarPowerHistory` - 5-minute rolling average window for learning smoothing
-- `windHistory` - 5-minute rolling window for wind generator detection
+- `solarPowerHistory` - 5-minute verdict window (45-minute retention) for learning smoothing and deploy-state inference
+- `windHistory` - 5-minute verdict window (45-minute retention) for wind generator detection and sustained stow evidence
 - Runtime flags (`hasPosition`, `learningRunning`, etc.)
 
 **Note:** Abrupt process termination (e.g., SIGKILL, power loss, server crash) may lose learned data from the previous `saveIntervalMinutes` period. This is acceptable—the periodic saves limit data loss to a small window.

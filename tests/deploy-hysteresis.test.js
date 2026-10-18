@@ -388,10 +388,17 @@ test.describe("wind generator detection hysteresis", () => {
       "0 W in marginal gusty wind must hold the deployed state",
     );
 
-    // Sustained clear wind well above the confirm threshold: a deployed
-    // unit would produce — 0 W now confirms stowed
-    emitWind(app, 12, later(6));
-    emitWind(app, 12, later(6.7));
+    // Sustained clear wind well above the confirm threshold with 0 W
+    // throughout: the evidence trail (5-min buckets) needs ~30 min of
+    // consecutive zero-power samples above the confirm threshold before
+    // stowage confirms — a deployed unit's regulator can throttle it to
+    // zero on a full battery, and it sits still through lulls, so a brief
+    // quiet window is not proof.
+    for (let min = 6; min <= 40; min += 2) {
+      app.setSelfPath(WIND_POWER, 0);
+      emit(app, [{ path: WIND_POWER, value: 0 }], later(min));
+      emitWind(app, 12, later(min));
+    }
     await cycle();
     assert.strictEqual(
       lastDetectedState(app, "superwind"),
@@ -401,12 +408,88 @@ test.describe("wind generator detection hysteresis", () => {
 
     // A single producing gust re-confirms deployment immediately
     app.setSelfPath(WIND_POWER, 20);
-    emit(app, [{ path: WIND_POWER, value: 20 }], later(7));
+    emit(app, [{ path: WIND_POWER, value: 20 }], later(41));
     await cycle();
     assert.strictEqual(
       lastDetectedState(app, "superwind"),
       "deployed",
       "positive power must confirm deployment immediately",
+    );
+
+    await plugin.stop();
+    await rm(testDir, { recursive: true, force: true });
+  });
+
+  test("regulation SoC: a throttled deployed turbine must not read as stowed", async () => {
+    const app = new FakeSignalKApp();
+    const plugin = makePlugin(app);
+    const testDir = await mkdtemp(join(tmpdir(), "hysteresis-soc-"));
+
+    app.dataPath = testDir;
+    const config = windConfig();
+    // The Superwind's regulator brakes the turbine when the battery is
+    // full: 0 W output with strong wind is then NOT stow evidence.
+    config.mechanicalGenerators[0].regulationSoC = 0.95;
+    await plugin.start(config, () => {});
+
+    app.setSelfPath("navigation.position", { latitude: 0, longitude: 0 });
+    emit(app, [
+      { path: "navigation.position", value: { latitude: 0, longitude: 0 } },
+    ]);
+    app.setSelfPath("navigation.state", "anchored");
+    emit(app, [{ path: "navigation.state", value: "anchored" }]);
+    app.setSelfPath(SOC_PATH, 0.98);
+    emit(app, [{ path: SOC_PATH, value: 0.98 }]);
+
+    // Last known state: deployed (it produced in gusts earlier)
+    const recorder = plugin.__getInternals().recorder;
+    await recorder.recordSample({
+      timestamp: new Date(),
+      arrays: {},
+      generators: { superwind: 20 },
+      soc: 0.98,
+      houseLoadW: 100,
+      windSpeedKnots: 12,
+      navState: "anchored",
+      position: { latitude: 0, longitude: 0 },
+      stwKnots: null,
+      deployStates: { superwind: "deployed" },
+      controllerModes: {},
+      awaRad: null,
+    });
+
+    injectForecast(plugin);
+    const cycle = () => plugin.__getInternals().runPredictionCycle();
+
+    // 0 W with wind well above the confirm threshold (7.5 kn) for 40 min
+    // while the battery sits at 98%: the regulator may be braking a
+    // deployed turbine — the deployed state must be held throughout.
+    for (let min = 2; min <= 40; min += 2) {
+      app.setSelfPath(WIND_POWER, 0);
+      emit(app, [{ path: WIND_POWER, value: 0 }], later(min));
+      emitWind(app, 12, later(min));
+    }
+    await cycle();
+    assert.strictEqual(
+      lastDetectedState(app, "superwind"),
+      "deployed",
+      "at the regulation SoC, 0 W must hold the deployed state",
+    );
+
+    // The battery drains below the regulation SoC: the regulator releases.
+    // If the turbine were deployed it would resume producing within
+    // minutes — sustained zero now proves stowage (the accumulated zero
+    // trail counts once the guard lifts).
+    app.setSelfPath(SOC_PATH, 0.9);
+    emit(app, [{ path: SOC_PATH, value: 0.9 }], later(42));
+    app.setSelfPath(WIND_POWER, 0);
+    emit(app, [{ path: WIND_POWER, value: 0 }], later(42));
+    emitWind(app, 12, later(42));
+    await cycle();
+    assert.strictEqual(
+      lastDetectedState(app, "superwind"),
+      "stowed",
+      "below the regulation SoC, sustained 0 W must confirm stowed",
     );
 
     await plugin.stop();

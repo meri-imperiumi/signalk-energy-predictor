@@ -498,6 +498,14 @@ function buildPluginSchema() {
               minimum: 1,
               maximum: 10,
             },
+            regulationSoC: {
+              type: "number",
+              title: "Regulation SoC",
+              description:
+                "Battery state of charge (0-1) at or above which this generator's charge regulator may throttle its output to zero - e.g. the Superwind regulator braking the turbine on a full battery. At or above it, zero output is not evidence the generator is stowed (the detected state is held instead). Leave blank on generators that never throttle.",
+              minimum: 0.5,
+              maximum: 1,
+            },
             maxSpeedKnots: {
               type: "number",
               title: "Max Speed",

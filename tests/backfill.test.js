@@ -946,6 +946,140 @@ test.describe("recordings gap-fill", () => {
     }
   });
 
+  test("backfilled wind stow waits for sustained zero-power evidence", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "bf-stow-"));
+    const store = openStore(dataDir);
+    try {
+      const historyData = makeHistoryData();
+      // 45 min of 5-min ticks: 0 W with 15 kn archive wind throughout
+      // (confirm threshold 7.5 kn) — the streak spans 30 min only from the
+      // tick 30 min after the first, so earlier ticks hold unknown.
+      for (let m = -40; m <= 0; m += 5) {
+        pushTick(historyData, m, {
+          solar: 0,
+          soc: 0.6,
+          navState: "anchored",
+          windGen: 0,
+        });
+      }
+      await backfillSamples({
+        app: { debug() {} },
+        store,
+        historyData,
+        weather: makeWeather(NOON),
+        arrays: [],
+        generators: [
+          {
+            id: "windgen",
+            type: "wind",
+            deployable: true,
+            powerPath: "electrical.dcsource.wind.power",
+            startupSpeedKnots: 5,
+          },
+        ],
+        socPath: "electrical.batteries.house.capacity.stateOfCharge",
+        from: new Date(NOON - 45 * 60000),
+        to: new Date(NOON + 60000),
+      });
+
+      const samples = await store.getRecords(
+        "sample",
+        new Date(NOON - 45 * 60000),
+        new Date(NOON + 60000),
+      );
+      const byMinute = new Map(
+        samples.map((s) => [
+          Math.round((Date.parse(s.timestamp) - NOON) / 60000),
+          s.deployStates?.windgen ?? null,
+        ]),
+      );
+      for (let m = -40; m <= -15; m += 5) {
+        assert.strictEqual(
+          byMinute.get(m),
+          null,
+          `tick ${m} min: zero not yet sustained must stay unknown`,
+        );
+      }
+      for (let m = -10; m <= 0; m += 5) {
+        assert.strictEqual(
+          byMinute.get(m),
+          "stowed",
+          `tick ${m} min: 30 min of sustained 0 W above confirm must stow`,
+        );
+      }
+    } finally {
+      store.close();
+      await fs.rm(dataDir, { recursive: true, force: true });
+    }
+  });
+
+  test("backfilled wind stow resets when the generator produces mid-trail", async () => {
+    const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "bf-stow2-"));
+    const store = openStore(dataDir);
+    try {
+      const historyData = makeHistoryData();
+      for (let m = -40; m <= 0; m += 5) {
+        // A gust produces at −20 min: the streak restarts after it, so no
+        // tick ever reaches a sustained 30-min zero trail.
+        pushTick(historyData, m, {
+          solar: 0,
+          soc: 0.6,
+          navState: "anchored",
+          windGen: m === -20 ? 20 : 0,
+        });
+      }
+      await backfillSamples({
+        app: { debug() {} },
+        store,
+        historyData,
+        weather: makeWeather(NOON),
+        arrays: [],
+        generators: [
+          {
+            id: "windgen",
+            type: "wind",
+            deployable: true,
+            powerPath: "electrical.dcsource.wind.power",
+            startupSpeedKnots: 5,
+          },
+        ],
+        socPath: "electrical.batteries.house.capacity.stateOfCharge",
+        from: new Date(NOON - 45 * 60000),
+        to: new Date(NOON + 60000),
+      });
+
+      const samples = await store.getRecords(
+        "sample",
+        new Date(NOON - 45 * 60000),
+        new Date(NOON + 60000),
+      );
+      const byMinute = new Map(
+        samples.map((s) => [
+          Math.round((Date.parse(s.timestamp) - NOON) / 60000),
+          s.deployStates?.windgen ?? null,
+        ]),
+      );
+      assert.strictEqual(byMinute.get(-20), "deployed");
+      for (let m = -40; m <= -25; m += 5) {
+        assert.strictEqual(
+          byMinute.get(m),
+          null,
+          `tick ${m} min: zero not yet sustained must stay unknown`,
+        );
+      }
+      for (let m = -15; m <= 0; m += 5) {
+        assert.strictEqual(
+          byMinute.get(m),
+          "deployed",
+          `tick ${m} min: the mid-trail production reset the streak and the hysteresis holds deployed`,
+        );
+      }
+    } finally {
+      store.close();
+      await fs.rm(dataDir, { recursive: true, force: true });
+    }
+  });
+
   test("writes controllerModes and awaRad into gap-filled samples", async () => {
     const dataDir = await fs.mkdtemp(path.join(os.tmpdir(), "bf-fields-"));
     const store = openStore(dataDir);

@@ -1613,11 +1613,13 @@ test.describe("Detected state inference from navigation state", () => {
     );
     await plugin.start(config, () => {});
 
-    // Emit multiple wind deltas above startup threshold (sustained wind)
-    // 6 m/s = ~11.7kn, well above 5kn startup
-    // Use timestamps 60s apart to simulate sustained wind over time
+    // Emit wind deltas above the stow-confirm threshold (7.5 kn) together
+    // with zero power, spanning the sustained-evidence window: the
+    // detector only confirms stowage after STOW_EVIDENCE_MIN_MS (30 min)
+    // of consecutive 5-min buckets at 0 W with the wind above the confirm
+    // threshold. 1 m/s = ~1.94 kn; 6 m/s ≈ 11.7 kn.
     const baseTime = new Date("2026-01-01T12:00:00Z");
-    for (let i = 0; i < 3; i++) {
+    for (let i = 0; i <= 35; i++) {
       const ts = new Date(baseTime.getTime() + i * 60000);
       app.subscriptionmanager.subs.forEach(({ handler }) => {
         handler({
@@ -1625,18 +1627,23 @@ test.describe("Detected state inference from navigation state", () => {
           updates: [
             {
               timestamp: ts.toISOString(),
-              values: [{ path: "environment.wind.speedApparent", value: 6 }],
+              values: [
+                { path: "environment.wind.speedApparent", value: 6 },
+                { path: "electrical.wind.superwind.power", value: 0 },
+              ],
             },
           ],
         });
       });
     }
-    // Final delta with all state
+    // Final delta with all state — explicitly timestamped like the rest, so
+    // the histories' retention window is measured from the data's own clock
     app.subscriptionmanager.subs.forEach(({ handler }) => {
       handler({
         context: "self",
         updates: [
           {
+            timestamp: new Date(baseTime.getTime() + 36 * 60000).toISOString(),
             values: [
               { path: "navigation.state", value: "moored" },
               {
@@ -1842,25 +1849,32 @@ test.describe("Detected state inference from navigation state", () => {
     );
     await plugin.start(config, () => {});
 
-    // Emit: sailing at 5kn (above min of 3kn), but power output is 0 (stowed)
-    app.subscriptionmanager.subs.forEach(({ handler }) => {
-      handler({
-        context: "self",
-        updates: [
-          {
-            values: [
-              { path: "navigation.state", value: "sailing" },
-              {
-                path: "navigation.position",
-                value: { latitude: 60, longitude: 18 },
-              },
-              { path: "navigation.speedThroughWater", value: 5 },
-              { path: "electrical.hydro.sailinggen.power", value: 0 },
-            ],
-          },
-        ],
+    // Emit: sailing at 5 kn (above the min of 3 kn and the 3.75 kn stow-
+    // confirm threshold) with zero power output, spanning the sustained-
+    // evidence window (STOW_EVIDENCE_MIN_MS of consecutive 5-min buckets).
+    const baseTime = new Date("2026-01-01T12:00:00Z");
+    for (let i = 0; i <= 35; i++) {
+      const ts = new Date(baseTime.getTime() + i * 60000);
+      app.subscriptionmanager.subs.forEach(({ handler }) => {
+        handler({
+          context: "self",
+          updates: [
+            {
+              timestamp: ts.toISOString(),
+              values: [
+                { path: "navigation.state", value: "sailing" },
+                {
+                  path: "navigation.position",
+                  value: { latitude: 60, longitude: 18 },
+                },
+                { path: "navigation.speedThroughWater", value: 5 },
+                { path: "electrical.hydro.sailinggen.power", value: 0 },
+              ],
+            },
+          ],
+        });
       });
-    });
+    }
 
     const internals = plugin.__getInternals();
     await internals.runPredictionCycle();

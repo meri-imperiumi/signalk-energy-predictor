@@ -11,9 +11,12 @@ const {
   detectSolarArrayState,
   detectGeneratorState,
   carryForwardStates,
+  sustainedStowEvidenceMs,
   deployConfirmThresholdW,
   windStowConfirmKnots,
   hydroStowConfirmKnots,
+  STOW_EVIDENCE_MIN_MS,
+  STOW_EVIDENCE_GAP_MS,
 } = require("../plugin/deploy-state.js");
 
 test("normalizeDeployState: maps sensor strings", () => {
@@ -236,7 +239,7 @@ test("detectGeneratorState: wind deployed when producing power", () => {
   );
 });
 
-test("detectGeneratorState: wind stowed when 0 W with wind above startup", () => {
+test("detectGeneratorState: wind stowed when 0 W with wind above startup and sustained evidence", () => {
   const gen = {
     id: "superwind",
     type: "wind",
@@ -244,8 +247,26 @@ test("detectGeneratorState: wind stowed when 0 W with wind above startup", () =>
     startupSpeedKnots: 5,
   };
   assert.strictEqual(
-    detectGeneratorState(gen, { powerW: 0, windKnots: 15, underway: false }),
+    detectGeneratorState(gen, {
+      powerW: 0,
+      windKnots: 15,
+      underway: false,
+      stowEvidenceMs: STOW_EVIDENCE_MIN_MS,
+      previousState: "deployed",
+    }),
     "stowed",
+  );
+  // Same conditions, but the zero has not persisted yet: a single quiet
+  // window is not proof — a deployed unit's regulator can throttle it on
+  // a full battery and it sits still through lulls around cut-in.
+  assert.strictEqual(
+    detectGeneratorState(gen, {
+      powerW: 0,
+      windKnots: 15,
+      underway: false,
+      previousState: "deployed",
+    }),
+    "deployed",
   );
 });
 
@@ -284,7 +305,7 @@ test("detectGeneratorState: wind 0 W in marginal gusty wind holds the previous s
   );
 });
 
-test("detectGeneratorState: wind 0 W only confirms stowed clearly above startup", () => {
+test("detectGeneratorState: wind 0 W confirms stowed clearly above startup once sustained", () => {
   const gen = {
     id: "superwind",
     type: "wind",
@@ -296,9 +317,21 @@ test("detectGeneratorState: wind 0 W only confirms stowed clearly above startup"
       powerW: 0,
       windKnots: 8,
       underway: false,
+      stowEvidenceMs: STOW_EVIDENCE_MIN_MS,
       previousState: "deployed",
     }),
     "stowed",
+  );
+  // Barely above the confirm threshold: without the sustained evidence
+  // the deployed state is held.
+  assert.strictEqual(
+    detectGeneratorState(gen, {
+      powerW: 0,
+      windKnots: 8,
+      underway: false,
+      previousState: "deployed",
+    }),
+    "deployed",
   );
 });
 
@@ -360,9 +393,19 @@ test("detectGeneratorState: hydro marginal speed holds previous; clear speed sto
       powerW: 0,
       stwKnots: 4,
       navState: "sailing",
+      stowEvidenceMs: STOW_EVIDENCE_MIN_MS,
       previousState: "deployed",
     }),
     "stowed",
+  );
+  assert.strictEqual(
+    detectGeneratorState(gen, {
+      powerW: 0,
+      stwKnots: 4,
+      navState: "sailing",
+      previousState: "deployed",
+    }),
+    "deployed",
   );
   assert.strictEqual(
     detectGeneratorState(gen, {
@@ -431,7 +474,7 @@ test("detectGeneratorState: hydro stowed when not sailing", () => {
   );
 });
 
-test("detectGeneratorState: hydro stowed when sailing fast but no output", () => {
+test("detectGeneratorState: hydro stowed when sailing fast but no output, evidence sustained", () => {
   const gen = {
     id: "hydrogen",
     type: "hydro",
@@ -443,9 +486,19 @@ test("detectGeneratorState: hydro stowed when sailing fast but no output", () =>
       powerW: 0,
       stwKnots: 5,
       navState: "sailing",
+      stowEvidenceMs: STOW_EVIDENCE_MIN_MS,
       underway: false,
     }),
     "stowed",
+  );
+  assert.strictEqual(
+    detectGeneratorState(gen, {
+      powerW: 0,
+      stwKnots: 5,
+      navState: "sailing",
+      underway: false,
+    }),
+    null,
   );
 });
 
@@ -479,4 +532,122 @@ test("carryForwardStates: fills nulls from last known", () => {
   assert.strictEqual(out[1].get("flinsail"), "deployed"); // carried forward
   assert.strictEqual(out[2].get("flinsail"), "stowed");
   assert.strictEqual(out[3].get("flinsail"), "stowed"); // carried forward
+});
+
+test("sustainedStowEvidenceMs: builds across consecutive zero-wind-above-threshold samples", () => {
+  const gen = { type: "wind", startupSpeedKnots: 10, regulationSoC: null };
+  const base = Date.UTC(2026, 9, 17, 23, 0, 0);
+  const step = (k) => 5 * 60 * 1000 * k;
+  const trail = [];
+  for (let k = 0; k < 7; k++) {
+    trail.push({ timeMs: base + step(k), powerW: 0, windKnots: 16 });
+    const ms = sustainedStowEvidenceMs(gen, trail, null);
+    if (k < 6) {
+      // 5 samples span 20 min, 6 span 25 min — below the 30-min minimum
+      assert.ok(ms !== null && ms < STOW_EVIDENCE_MIN_MS, `k=${k} ms=${ms}`);
+    } else {
+      // 7 samples 5 min apart span 30 min — sustained
+      assert.strictEqual(ms, 30 * 60 * 1000);
+    }
+  }
+});
+
+test("sustainedStowEvidenceMs: positive power resets the streak", () => {
+  const gen = { type: "wind", startupSpeedKnots: 10 };
+  const base = Date.UTC(2026, 9, 17, 23, 0, 0);
+  const step = 5 * 60 * 1000;
+  const trail = [];
+  for (let k = 0; k < 6; k++) {
+    trail.push({ timeMs: base + k * step, powerW: 0, windKnots: 16 });
+  }
+  // Production in the middle: the streak restarts after it
+  trail[2] = { timeMs: base + 2 * step, powerW: 12.5, windKnots: 16 };
+  const ms = sustainedStowEvidenceMs(gen, trail, null);
+  // Evidence from the 4th sample to the 6th: 2 gaps = 10 min
+  assert.strictEqual(ms, 10 * 60 * 1000);
+});
+
+test("sustainedStowEvidenceMs: wind below the confirm threshold resets", () => {
+  const gen = { type: "wind", startupSpeedKnots: 10 };
+  const base = Date.UTC(2026, 9, 17, 23, 0, 0);
+  const step = 5 * 60 * 1000;
+  const trail = [];
+  for (let k = 0; k < 8; k++) {
+    trail.push({
+      timeMs: base + k * step,
+      powerW: 0,
+      windKnots: k === 3 ? 9 : 16, // lull below the 15 kn confirm
+    });
+  }
+  // Evidence from the 5th sample onward only: 3 gaps = 15 min
+  assert.strictEqual(sustainedStowEvidenceMs(gen, trail, null), 15 * 60 * 1000);
+});
+
+test("sustainedStowEvidenceMs: recording gap longer than the tolerance restarts", () => {
+  const gen = { type: "wind", startupSpeedKnots: 10 };
+  const base = Date.UTC(2026, 9, 17, 23, 0, 0);
+  const step = 5 * 60 * 1000;
+  const trail = [];
+  for (let k = 0; k < 4; k++) {
+    trail.push({ timeMs: base + k * step, powerW: 0, windKnots: 16 });
+  }
+  // Recorder down for 20 min (> STOW_EVIDENCE_GAP_MS), then resumes
+  trail.push({
+    timeMs: base + 3 * step + 20 * 60 * 1000,
+    powerW: 0,
+    windKnots: 16,
+  });
+  const ms = sustainedStowEvidenceMs(gen, trail, null);
+  assert.strictEqual(ms, 0); // streak restarted at the resumed sample
+});
+
+test("sustainedStowEvidenceMs: regulation SoC blocks evidence", () => {
+  const gen = { type: "wind", startupSpeedKnots: 10, regulationSoC: 0.95 };
+  const base = Date.UTC(2026, 9, 17, 23, 0, 0);
+  const step = 5 * 60 * 1000;
+  const trail = [];
+  for (let k = 0; k < 10; k++) {
+    trail.push({ timeMs: base + k * step, powerW: 0, windKnots: 16 });
+  }
+  // Battery full: a regulator may be throttling a deployed unit — no
+  // evidence, however long the zero has persisted.
+  assert.strictEqual(sustainedStowEvidenceMs(gen, trail, 0.981), null);
+  // Below the threshold the same trail is fully sustained evidence.
+  assert.strictEqual(sustainedStowEvidenceMs(gen, trail, 0.9), 45 * 60 * 1000);
+  // Unknown SoC does not block the evidence.
+  assert.strictEqual(sustainedStowEvidenceMs(gen, trail, null), 45 * 60 * 1000);
+});
+
+test("sustainedStowEvidenceMs: missing power reading is not evidence", () => {
+  const gen = { type: "wind", startupSpeedKnots: 10 };
+  const base = Date.UTC(2026, 9, 17, 23, 0, 0);
+  const step = 5 * 60 * 1000;
+  const trail = [];
+  for (let k = 0; k < 4; k++) {
+    trail.push({ timeMs: base + k * step, powerW: 0, windKnots: 16 });
+  }
+  // Power sensor went silent: no zero reading, streak breaks
+  trail.push({ timeMs: base + 4 * step, powerW: null, windKnots: 16 });
+  assert.strictEqual(sustainedStowEvidenceMs(gen, trail, null), null);
+});
+
+test("sustainedStowEvidenceMs: hydro uses speed through water", () => {
+  const gen = { type: "hydro", minSpeedKnots: 3 };
+  const base = Date.UTC(2026, 9, 17, 23, 0, 0);
+  const step = 5 * 60 * 1000;
+  const trail = [];
+  for (let k = 0; k < 8; k++) {
+    trail.push({
+      timeMs: base + k * step,
+      powerW: 0,
+      windKnots: 20,
+      stwKnots: 4.5,
+    });
+  }
+  assert.strictEqual(sustainedStowEvidenceMs(gen, trail, null), 35 * 60 * 1000);
+  // Drop below the 3.75 kn confirm at the last step: no current evidence
+  // at all (the streak would restart once the speed recovers).
+  const last = trail[trail.length - 1];
+  last.stwKnots = 3.5;
+  assert.strictEqual(sustainedStowEvidenceMs(gen, trail, null), null);
 });

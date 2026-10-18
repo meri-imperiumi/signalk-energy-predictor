@@ -60,9 +60,12 @@ const { loadActivePolarModel } = require("./polar.js");
 const {
   detectSolarArrayState,
   detectGeneratorState,
+  sustainedStowEvidenceMs,
   windStowConfirmKnots,
   hydroStowConfirmKnots,
   STOW_INFERENCE_MIN_SUN_ALT_RAD,
+  STOW_EVIDENCE_MIN_MS,
+  STOW_EVIDENCE_GAP_MS,
 } = require("./deploy-state.js");
 const { registerApiRoutes } = require("./api.js");
 const openApiSpec = require("../schema/openapi.json");
@@ -707,14 +710,20 @@ module.exports = (app) => {
    * (78 flips over one passage in the wild). Null when no history exists
    * (fresh start), so callers fall back to the instantaneous reading.
    *
+   * The window's reference time is the newest history sample (like
+   * `averagedWindKnots`), so deltas carrying explicit timestamps — including
+   * test time-travel and a stalled sensor — are measured against the data's
+   * own clock rather than wall-clock now.
+   *
    * @param {string} path - Configured power path
    * @returns {number|null} Average watts over the window, or null
    */
   function averagedPowerW(path) {
     const samples = solarPowerHistory.get(path) || [];
-    const now = Date.now();
+    if (samples.length === 0) return null;
+    const refTime = Math.max(...samples.map((s) => s.time));
     const recent = samples.filter(
-      (s) => s.time >= now - DEFAULT_POWER_AVERAGE_WINDOW_MS,
+      (s) => s.time >= refTime - DEFAULT_POWER_AVERAGE_WINDOW_MS,
     );
     if (recent.length === 0) return null;
     return recent.reduce((sum, s) => sum + s.value, 0) / recent.length;
@@ -774,6 +783,135 @@ module.exports = (app) => {
     const recent = stwHistory.filter((s) => s.time >= now - STW_HISTORY_MS);
     if (recent.length === 0) return null;
     return recent.reduce((sum, s) => sum + s.speed, 0) / recent.length;
+  }
+
+  /**
+   * Lookback window for the sustained stow-evidence trail: long enough
+   * that a streak spanning `STOW_EVIDENCE_MIN_MS` is fully represented,
+   * plus one gap tolerance so a streak just over the minimum survives.
+   */
+  const STOW_TRAIL_LOOKBACK_MS = STOW_EVIDENCE_MIN_MS + STOW_EVIDENCE_GAP_MS;
+
+  /** Trail granularity: 5-minute buckets, matching the recorded samples
+   *  and the history backfill's resolution, so live verdicts and the
+   *  recorded timeline weigh the same evidence at the same granularity. */
+  const STOW_TRAIL_BUCKET_MS = 5 * 60 * 1000;
+
+  /**
+   * Current battery state of charge (0–1) from the configured SoC path,
+   * or null when unknown. Shared by the deploy-state inference (the
+   * regulation-SoC guard) and the sample recorder.
+   *
+   * @returns {number|null}
+   */
+  function currentSoC() {
+    const socPath =
+      pluginConfig?.battery?.socPath ||
+      "electrical.batteries.house.capacity.stateOfCharge";
+    let soc = deltaState.get(socPath) || app.getSelfPath(socPath);
+    // Handle Signal K object-structured values
+    if (soc && typeof soc === "object" && typeof soc.value === "number") {
+      soc = soc.value;
+    }
+    return toNumber(soc);
+  }
+
+  /**
+   * Sustained stow-evidence trail for a deployable generator, built from
+   * the delta-fed histories (the same streams the learning and deploy-state
+   * averaging already track): 5-minute epoch-aligned buckets of mean power,
+   * mean wind and mean speed-through-water, oldest first. Wind and STW
+   * carry forward across buckets where their sensor was silent (mirroring
+   * the history backfill's carry-forward); power does not — a zero reading
+   * must be actual, so a silent charger never fabricates stow evidence.
+   *
+   * The caller's current reading is appended as the newest step, timed at
+   * the trail's reference instant: the newest history sample when one
+   * exists (deltas may carry explicit timestamps — tests time-travel and a
+   * stalled sensor must not strand the window in the past), else
+   * wall-clock now.
+   *
+   * @param {object} gen - Generator config (id, powerPath)
+   * @param {{powerW: number|null, windKnots: number|null, stwKnots: number|null}} current
+   *        The live reading being evaluated
+   * @returns {Array<{timeMs: number, powerW: number|null, windKnots: number|null, stwKnots: number|null}>}
+   */
+  function generatorStowTrail(gen, current) {
+    const powerAll =
+      gen.powerPath != null ? solarPowerHistory.get(gen.powerPath) || [] : [];
+    const windAll = [
+      ...(windHistory.get("environment.wind.speedApparent") || []),
+      ...(windHistory.get("environment.wind.speedOverGround") || []),
+      ...(windHistory.get("environment.wind.speedTrue") || []),
+    ];
+    const stwAll = stwHistory.map((s) => ({
+      time: s.time,
+      value: toKnots(s.speed),
+    }));
+    const newestRaw = Math.max(
+      0,
+      ...powerAll.map((s) => s.time),
+      ...windAll.map((s) => s.time),
+      ...stwAll.map((s) => s.time),
+    );
+    const ref = newestRaw > 0 ? newestRaw : Date.now();
+    const windowStart = ref - STOW_TRAIL_LOOKBACK_MS;
+    const powerRaw = powerAll.filter(
+      (s) => s.time > windowStart && s.time <= ref,
+    );
+    const windRaw = windAll.filter(
+      (s) => s.time > windowStart && s.time <= ref,
+    );
+    const stwRaw = stwAll.filter((s) => s.time > windowStart && s.time <= ref);
+
+    const bucketIndex = (time) => Math.floor(time / STOW_TRAIL_BUCKET_MS);
+    const accum = new Map();
+    const add = (time, key, value) => {
+      const idx = bucketIndex(time);
+      let b = accum.get(idx);
+      if (!b) {
+        b = {
+          powerSum: 0,
+          powerCount: 0,
+          windSum: 0,
+          windCount: 0,
+          stwSum: 0,
+          stwCount: 0,
+        };
+        accum.set(idx, b);
+      }
+      const sumKey = `${key}Sum`;
+      const countKey = `${key}Count`;
+      b[sumKey] += value;
+      b[countKey] += 1;
+    };
+    for (const s of powerRaw) add(s.time, "power", s.value);
+    for (const s of windRaw) add(s.time, "wind", s.speed);
+    for (const s of stwRaw) add(s.time, "stw", s.value);
+
+    const indices = [...accum.keys()].sort((a, b) => a - b);
+    const trail = [];
+    let lastWind = null;
+    let lastStw = null;
+    for (const idx of indices) {
+      const b = accum.get(idx);
+      const powerW = b.powerCount > 0 ? b.powerSum / b.powerCount : null;
+      if (b.windCount > 0) lastWind = b.windSum / b.windCount;
+      if (b.stwCount > 0) lastStw = b.stwSum / b.stwCount;
+      trail.push({
+        timeMs: idx * STOW_TRAIL_BUCKET_MS,
+        powerW,
+        windKnots: lastWind,
+        stwKnots: lastStw,
+      });
+    }
+    trail.push({
+      timeMs: ref,
+      powerW: current.powerW ?? null,
+      windKnots: current.windKnots ?? lastWind,
+      stwKnots: current.stwKnots ?? lastStw,
+    });
+    return trail;
   }
 
   /**
@@ -1712,31 +1850,19 @@ module.exports = (app) => {
             seededDeployStateIds.delete(gen.id);
           }
         }
-        // For deployable generators, infer from power output — the
-        // window-averaged output when history exists (a 0↔20 W flicker at
-        // cut-in must not flip the detected state every sample), the
-        // instantaneous reading otherwise.
-        if (gen.deployable && gen.powerPath) {
+        // For deployable generators, infer via the shared detector — the
+        // same one the sample recorder and both backfill passes use. Power
+        // evidence is the window-averaged output when history exists (a
+        // 0↔20 W flicker at cut-in must not flip the detected state every
+        // sample), the instantaneous reading otherwise. Stowage evidence
+        // is the sustained trail (consecutive recorded samples of 0 W with
+        // conditions above the confirm threshold), not a single window.
+        if (gen.deployable) {
           const powerVal =
-            averagedPowerW(gen.powerPath) ??
-            toNumber(deltaState.get(gen.powerPath));
-          if (powerVal != null && powerVal > 0) {
-            currentDeployStates.set(gen.id, "deployed");
-            seededDeployStateIds.delete(gen.id);
-          }
-        }
-        // Wind generator: 0 W is only stow evidence when the sustained
-        // wind is clearly above the startup speed (1.5×). In gusty,
-        // marginal winds around cut-in a deployed unit sits still through
-        // the lulls and only spins up in gusts — hold the previous state
-        // instead. Runs even when a seed is present: a definite live
-        // "stowed" reading overwrites the carried-forward state; marginal
-        // or missing wind evidence leaves the seed in place.
-        if (gen.deployable && gen.type === "wind") {
-          const powerVal =
-            averagedPowerW(gen.powerPath) ??
-            toNumber(deltaState.get(gen.powerPath));
-          const confirmSpeed = windStowConfirmKnots(gen);
+            gen.powerPath != null
+              ? (averagedPowerW(gen.powerPath) ??
+                toNumber(deltaState.get(gen.powerPath)))
+              : null;
           const currentWind = toKnots(
             deltaState.get("environment.wind.speedApparent") ||
               deltaState.get("environment.wind.speedOverGround") ||
@@ -1745,73 +1871,36 @@ module.exports = (app) => {
               app.getSelfPath("environment.wind.speedOverGround") ||
               app.getSelfPath("environment.wind.speedTrue"),
           );
-          const { avgWindKnots: avgWind, recentCount } =
-            averagedWindKnots(currentWind);
-          app.debug(
-            `Wind gen ${gen.id}: avgWind=${avgWind?.toFixed(1) ?? "null"}kn (${recentCount} samples), powerVal=${powerVal}, confirmSpeed=${confirmSpeed.toFixed(1)}kn`,
-          );
-          if (
-            powerVal != null &&
-            powerVal === 0 &&
-            avgWind != null &&
-            avgWind >= confirmSpeed &&
-            recentCount >= 2
-          ) {
-            currentDeployStates.set(gen.id, "stowed");
-            seededDeployStateIds.delete(gen.id);
-          }
-        }
-        // Hydro is stowed when not sailing — unless it is producing
-        // power: a towed generator spinning in the prop wash while
-        // motoring IS down (a rule violation the deployment
-        // recommendation flags), not stowed.
-        if (gen.deployable && gen.type === "hydro" && navState !== "sailing") {
-          const hydroPower =
-            gen.powerPath != null
-              ? (averagedPowerW(gen.powerPath) ??
-                toNumber(deltaState.get(gen.powerPath)))
-              : null;
-          if (!(hydroPower != null && hydroPower > 0)) {
-            currentDeployStates.set(gen.id, "stowed");
-            seededDeployStateIds.delete(gen.id);
-          }
-        }
-        // Hydro: if sailing clearly above the minimum speed but no power
-        // output, it is stowed. Runs even when a seed is present (definite
-        // live reading wins). The power read is the window average
-        // (flicker-proof) and the speed the sustained STW average —
-        // marginal-production conditions hold the previous state instead
-        // of flapping it.
-        if (gen.deployable && gen.type === "hydro") {
-          const powerVal =
-            averagedPowerW(gen.powerPath) ??
-            toNumber(deltaState.get(gen.powerPath));
+          const { avgWindKnots: avgWind } = averagedWindKnots(currentWind);
           const sustainedMs = observedStwMs();
-          const speed =
+          const stwKnots =
             sustainedMs != null
               ? toKnots(sustainedMs)
               : toKnots(deltaState.get("navigation.speedThroughWater"));
-          if (
-            powerVal != null &&
-            powerVal === 0 &&
-            speed != null &&
-            speed >= hydroStowConfirmKnots(gen)
-          ) {
-            currentDeployStates.set(gen.id, "stowed");
-            seededDeployStateIds.delete(gen.id);
-          }
-        }
-        // Wind generators stowed when underway ONLY if not producing
-        // power. A wind generator spinning and charging while motoring
-        // (e.g. a short hop) IS deployed.
-        if (gen.deployable && gen.type === "wind" && underway) {
-          const powerVal =
-            gen.powerPath != null
-              ? (averagedPowerW(gen.powerPath) ??
-                toNumber(deltaState.get(gen.powerPath)))
-              : null;
-          if (!(powerVal != null && powerVal > 0)) {
-            currentDeployStates.set(gen.id, "stowed");
+          const trail = generatorStowTrail(gen, {
+            powerW: powerVal,
+            windKnots: avgWind,
+            stwKnots,
+          });
+          const stowEvidence = sustainedStowEvidenceMs(
+            gen,
+            trail,
+            currentSoC(),
+          );
+          app.debug(
+            `Deployable gen ${gen.id} (${gen.type}): avgWind=${avgWind?.toFixed(1) ?? "null"}kn, stw=${stwKnots?.toFixed(1) ?? "null"}kn, powerVal=${powerVal}, stowEvidenceMs=${stowEvidence ?? "null"}`,
+          );
+          const state = detectGeneratorState(gen, {
+            powerW: powerVal,
+            windKnots: avgWind,
+            stwKnots,
+            navState,
+            underway,
+            previousState: currentDeployStates.get(gen.id) ?? null,
+            stowEvidenceMs: stowEvidence,
+          });
+          if (state != null) {
+            currentDeployStates.set(gen.id, state);
             seededDeployStateIds.delete(gen.id);
           }
         }
@@ -2268,7 +2357,11 @@ module.exports = (app) => {
                   : Date.now();
                 const samples = solarPowerHistory.get(v.path) || [];
                 samples.push({ value: powerW, time: sampleTime });
-                const cutoff = sampleTime - DEFAULT_POWER_AVERAGE_WINDOW_MS;
+                // Retain the sustained stow-evidence trail's lookback (the
+                // deploy-state inference weighs up to 45 min of zero-power
+                // evidence); averagedPowerW and the learning window filter
+                // down to their own shorter windows internally.
+                const cutoff = sampleTime - STOW_TRAIL_LOOKBACK_MS;
                 while (samples.length > 0 && samples[0].time < cutoff) {
                   samples.shift();
                 }
@@ -2291,7 +2384,9 @@ module.exports = (app) => {
                     STW_SAMPLE_INTERVAL_MS
                 ) {
                   stwHistory.push({ speed: speedMs, time: now });
-                  const cutoff = now - STW_HISTORY_MS;
+                  // Retain the sustained stow-evidence trail's lookback
+                  // (observedStwMs filters down to its own 10-min window).
+                  const cutoff = now - STOW_TRAIL_LOOKBACK_MS;
                   while (stwHistory.length > 0 && stwHistory[0].time < cutoff) {
                     stwHistory.shift();
                   }
@@ -2320,8 +2415,11 @@ module.exports = (app) => {
                   speed: toKnots(v.value),
                   time: now,
                 });
-                // Trim to window
-                const cutoff = now - WIND_HISTORY_MS;
+                // Trim to window — the sustained stow-evidence trail's
+                // lookback (the deploy-state inference weighs up to 45 min
+                // of wind evidence); averagedWindKnots and the gust
+                // estimate filter down to their own shorter windows.
+                const cutoff = now - STOW_TRAIL_LOOKBACK_MS;
                 while (history.length > 0 && history[0].time < cutoff) {
                   history.shift();
                 }
@@ -2869,15 +2967,7 @@ module.exports = (app) => {
     }
 
     // Get battery SoC
-    const socPath =
-      pluginConfig?.battery?.socPath ||
-      "electrical.batteries.house.capacity.stateOfCharge";
-    let soc = deltaState.get(socPath) || app.getSelfPath(socPath);
-    // Handle Signal K object-structured values
-    if (soc && typeof soc === "object" && typeof soc.value === "number") {
-      soc = soc.value;
-    }
-    soc = toNumber(soc);
+    const soc = currentSoC();
 
     // Get house load (sum of all dcPower readings from venus)
     const houseLoadW =
@@ -2997,6 +3087,17 @@ module.exports = (app) => {
         const sustainedMs = observedStwMs();
         return sustainedMs != null ? toKnots(sustainedMs) : stwKnots;
       })();
+      // Sustained stow evidence: the recorded samples trail (the same 5-min
+      // granularity the stored timeline carries) plus this recording as the
+      // newest step. Stowage confirms only after the evidence has persisted
+      // STOW_EVIDENCE_MIN_MS — and not while the battery is at the
+      // generator's regulation SoC (a throttled deployed unit reads 0 W).
+      const stowTrail = generatorStowTrail(gen, {
+        powerW,
+        windKnots: avgWindKnots ?? windSpeedKnots,
+        stwKnots: sustainedStwKnots,
+      });
+      const stowEvidence = sustainedStowEvidenceMs(gen, stowTrail, soc);
       const state = detectGeneratorState(gen, {
         powerW,
         deployStateRaw,
@@ -3005,6 +3106,7 @@ module.exports = (app) => {
         navState,
         underway,
         previousState: lastKnownDeployStates.get(gen.id) ?? null,
+        stowEvidenceMs: stowEvidence,
       });
       if (state != null) {
         deployStates[gen.id] = state;

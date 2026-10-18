@@ -9,13 +9,17 @@
  *    (quantization noise in low irradiance must not flap the state);
  *    0 W in daytime → stowed; underway → stowed.
  *  - Wind generator: power > 0 → deployed (immediate); 0 W with wind
- *    clearly above startup (≥ 1.5×) → stowed; 0 W in the marginal band
+ *    clearly above startup (≥ 1.5×) confirms stowed only once the
+ *    evidence has persisted (STOW_EVIDENCE_MIN_MS of consecutive zero
+ *    samples — the recorded 5-minute granularity — and not while the
+ *    battery is at the generator's regulation SoC, where a regulator may
+ *    throttle a deployed unit to zero); 0 W in the marginal band
  *    around startup → hold the previous state (a deployed unit's high
  *    starting reluctance keeps it still through lulls in gusty
  *    conditions); underway → stowed.
  *  - Hydro generator: not sailing → stowed; power > 0 → deployed;
- *    0 W sailing clearly above min speed (≥ 1.25×) → stowed; marginal
- *    speed → hold the previous state.
+ *    0 W sailing clearly above min speed (≥ 1.25×) → stowed once the
+ *    evidence has persisted; marginal speed → hold the previous state.
  *
  * The state detection is deliberately asymmetric: deployment is confirmed
  * immediately by any positive power, while stowage needs conditions that
@@ -65,6 +69,26 @@ const WIND_STOW_CONFIRM_FACTOR = 1.5;
  * See `hydroStowConfirmKnots`.
  */
 const HYDRO_STOW_CONFIRM_FACTOR = 1.25;
+
+/**
+ * Minimum duration (ms) the stow evidence — zero output with the wind
+ * (or boat speed) clearly above the generator's cut-in — must persist
+ * before it confirms stowage. A single quiet window is not proof: a
+ * deployed wind generator's regulator can throttle it to 0 W for a while
+ * (battery nearly full), and around cut-in it sits still through lulls
+ * between gusts. Thirty minutes of continuous zero with conditions well
+ * above cut-in leaves no doubt the turbine is not turning.
+ */
+const STOW_EVIDENCE_MIN_MS = 30 * 60 * 1000;
+
+/**
+ * Maximum gap (ms) between consecutive stow-evidence samples before the
+ * streak is considered broken. At the 5-minute recording cadence this
+ * tolerates two missed samples; a longer recording gap (plugin down,
+ * recorder paused) restarts the evidence count instead of pretending the
+ * zero persisted through it.
+ */
+const STOW_EVIDENCE_GAP_MS = 15 * 60 * 1000;
 
 /**
  * Power (W) that a deployable array must produce before a stowed→deployed
@@ -122,6 +146,67 @@ function windStowConfirmKnots(gen) {
  */
 function hydroStowConfirmKnots(gen) {
   return (gen.minSpeedKnots ?? 3) * HYDRO_STOW_CONFIRM_FACTOR;
+}
+
+/**
+ * Sustained stow-evidence duration (ms) at the end of a time-ordered trail
+ * of generator readings. Evidence at a step means the generator read
+ * exactly 0 W while its condition input (sustained wind for a wind
+ * generator, sustained speed through water for a hydro) was at or above
+ * the stow-confirm threshold — i.e. conditions that would spin a deployed
+ * unit, and no output. The trail is the 5-minute-granularity sample record
+ * the rest of the detection uses, so "sustained" means consecutive
+ * recorded samples agreeing, not one lucky window.
+ *
+ * A positive reading (any production), a missing reading, or a condition
+ * below the confirm threshold breaks the streak; so does a gap between
+ * consecutive evidence samples larger than `STOW_EVIDENCE_GAP_MS` (a
+ * recording outage must not pretend the zero persisted through it).
+ *
+ * @param {object} gen - Generator config (type, startupSpeedKnots,
+ *        minSpeedKnots, regulationSoC)
+ * @param {Array<{timeMs: number, powerW: number|null, windKnots: number|null, stwKnots: number|null}>} trail
+ *        Time-ordered sample steps, oldest first; the last entry is the
+ *        instant being evaluated
+ * @param {number|null} socNow - Battery state of charge (0–1) at the
+ *        evaluation instant. When the generator declares a regulation SoC
+ *        (its regulator throttles output to zero on a full battery) and
+ *        the battery is at or above it, zero output is uninformative and
+ *        no evidence accrues — a deployed, throttled turbine must not read
+ *        as stowed. Unknown SoC does not block evidence.
+ * @returns {number|null} Milliseconds the current evidence streak has
+ *          persisted (0 when it just started), or null when there is no
+ *          evidence at the trail's end
+ */
+function sustainedStowEvidenceMs(gen, trail, socNow) {
+  if (gen.type !== "wind" && gen.type !== "hydro") return null;
+  if (
+    gen.regulationSoC != null &&
+    socNow != null &&
+    socNow >= gen.regulationSoC
+  ) {
+    return null;
+  }
+  const conditionKey = gen.type === "wind" ? "windKnots" : "stwKnots";
+  const confirmKnots =
+    gen.type === "wind"
+      ? windStowConfirmKnots(gen)
+      : hydroStowConfirmKnots(gen);
+  const isEvidence = (step) =>
+    step.powerW === 0 &&
+    step[conditionKey] != null &&
+    step[conditionKey] >= confirmKnots;
+  const last = trail.length - 1;
+  if (last < 0 || !isEvidence(trail[last])) return null;
+  let start = last;
+  while (
+    start > 0 &&
+    isEvidence(trail[start - 1]) &&
+    trail[start].timeMs - trail[start - 1].timeMs <= STOW_EVIDENCE_GAP_MS
+  ) {
+    start--;
+  }
+  return trail[last].timeMs - trail[start].timeMs;
 }
 
 /**
@@ -213,13 +298,22 @@ function detectSolarArrayState(array, ctx) {
  *        speed and its stow-confirm threshold) 0 W holds it instead of
  *        flipping to stowed — a deployed unit's starting reluctance keeps
  *        it still through lulls in gusty conditions
+ * @param {number|null} [ctx.stowEvidenceMs] - Milliseconds the current
+ *        stow evidence (0 W with conditions at or above the stow-confirm
+ *        threshold) has persisted continuously, from
+ *        `sustainedStowEvidenceMs()`. Stowage confirms only after
+ *        `STOW_EVIDENCE_MIN_MS`; before that the previous state is held.
+ *        Null when there is no current evidence (conditions below the
+ *        confirm threshold, a positive/missing power reading, or the
+ *        generator's regulation SoC reached — a throttled deployed unit).
  * @returns {"deployed"|"stowed"|null} Inferred state, or null if unknown
  */
 function detectGeneratorState(gen, ctx) {
   if (!gen.deployable) return null;
   const sensor = normalizeDeployState(ctx.deployStateRaw);
   if (sensor != null) return sensor;
-  const { powerW, windKnots, stwKnots, navState, underway } = ctx;
+  const { powerW, windKnots, stwKnots, navState, underway, stowEvidenceMs } =
+    ctx;
   const previousState =
     ctx.previousState === "deployed" || ctx.previousState === "stowed"
       ? ctx.previousState
@@ -231,11 +325,21 @@ function detectGeneratorState(gen, ctx) {
     if (underway) return "stowed";
     if (powerW != null && powerW === 0 && windKnots != null) {
       // Stowage detection is deliberately slow: 0 W is only stow evidence
-      // when the wind is clearly above the startup speed. In gusty,
-      // marginal winds around cut-in a deployed unit sits still through
-      // the lulls and only spins up in gusts — assume it is still
-      // deployed and hold the previous state.
-      if (windKnots >= windStowConfirmKnots(gen)) return "stowed";
+      // when the wind is clearly above the startup speed — and even then
+      // only once the evidence has persisted (STOW_EVIDENCE_MIN_MS of
+      // consecutive zero samples with the wind at or above the confirm
+      // threshold, per `sustainedStowEvidenceMs`). In gusty, marginal
+      // winds around cut-in a deployed unit sits still through the lulls
+      // and only spins up in gusts; a regulator can throttle a deployed
+      // unit to zero on a full battery — assume it is still deployed and
+      // hold the previous state until the zero has proven sustained.
+      if (
+        windKnots >= windStowConfirmKnots(gen) &&
+        stowEvidenceMs != null &&
+        stowEvidenceMs >= STOW_EVIDENCE_MIN_MS
+      ) {
+        return "stowed";
+      }
       if (windKnots >= (gen.startupSpeedKnots ?? 5)) return previousState;
     }
     return null;
@@ -244,9 +348,15 @@ function detectGeneratorState(gen, ctx) {
     if (navState !== "sailing") return "stowed";
     if (powerW != null && powerW === 0 && stwKnots != null) {
       // Same asymmetric hysteresis as wind: clear speed above minimum
-      // confirms stowed; marginal speed around the minimum holds the
-      // previous state.
-      if (stwKnots >= hydroStowConfirmKnots(gen)) return "stowed";
+      // confirms stowed, but only once the evidence has persisted;
+      // marginal speed around the minimum holds the previous state.
+      if (
+        stwKnots >= hydroStowConfirmKnots(gen) &&
+        stowEvidenceMs != null &&
+        stowEvidenceMs >= STOW_EVIDENCE_MIN_MS
+      ) {
+        return "stowed";
+      }
       if (stwKnots >= (gen.minSpeedKnots ?? 3)) return previousState;
     }
     return null;
@@ -283,8 +393,11 @@ module.exports = {
   detectSolarArrayState,
   detectGeneratorState,
   carryForwardStates,
+  sustainedStowEvidenceMs,
   deployConfirmThresholdW,
   windStowConfirmKnots,
   hydroStowConfirmKnots,
   STOW_INFERENCE_MIN_SUN_ALT_RAD,
+  STOW_EVIDENCE_MIN_MS,
+  STOW_EVIDENCE_GAP_MS,
 };

@@ -31,7 +31,10 @@ const weatherCache = require("./weather-cache.js");
 const {
   detectSolarArrayState,
   detectGeneratorState,
+  sustainedStowEvidenceMs,
   STOW_INFERENCE_MIN_SUN_ALT_RAD,
+  STOW_EVIDENCE_MIN_MS,
+  STOW_EVIDENCE_GAP_MS,
 } = require("./deploy-state.js");
 const {
   WindProtectionStore,
@@ -1822,6 +1825,11 @@ async function backfillSamples({
   // detector's hysteresis dead band (sub-threshold positive power holds
   // the previous state) works across backfilled samples too.
   const previousDeployStates = new Map();
+  // Sustained stow-evidence trails, per deployable generator: the recent
+  // bucket readings (0 W + conditions above the stow-confirm threshold)
+  // the detector's sustained gate requires before confirming stowage.
+  const stowTrails = new Map();
+  const STOW_TRAIL_LOOKBACK_MS = STOW_EVIDENCE_MIN_MS + STOW_EVIDENCE_GAP_MS;
   for (let i = 0; i < dataPoints.length; i++) {
     const point = dataPoints[i];
     const st = carriedState[i];
@@ -1896,6 +1904,24 @@ async function backfillSamples({
     for (const gen of generators) {
       if (!gen.deployable) continue;
       const powerW = sample.generators[gen.id] ?? null;
+      const timeMs = time.getTime();
+      let trail = stowTrails.get(gen.id);
+      if (!trail) {
+        trail = [];
+        stowTrails.set(gen.id, trail);
+      }
+      trail.push({
+        timeMs,
+        powerW,
+        windKnots: sample.windSpeedKnots ?? null,
+        stwKnots: sample.stwKnots ?? null,
+      });
+      while (
+        trail.length > 0 &&
+        trail[0].timeMs < timeMs - STOW_TRAIL_LOOKBACK_MS
+      ) {
+        trail.shift();
+      }
       const state = detectGeneratorState(gen, {
         powerW,
         windKnots: sample.windSpeedKnots ?? null,
@@ -1903,6 +1929,7 @@ async function backfillSamples({
         navState: sample.navState,
         underway,
         previousState: previousDeployStates.get(gen.id) ?? null,
+        stowEvidenceMs: sustainedStowEvidenceMs(gen, trail, sample.soc),
       });
       if (state != null) {
         deployStates[gen.id] = state;
@@ -1972,6 +1999,11 @@ async function augmentSamplesDeployStates({
   // detector's hysteresis dead band (sub-threshold positive power holds
   // the previous state) works across augmented samples too.
   const previousDeployStates = new Map();
+  // Sustained stow-evidence trails, per deployable generator: the recent
+  // carried readings (0 W + conditions above the stow-confirm threshold)
+  // the detector's sustained gate requires before confirming stowage.
+  const stowTrails = new Map();
+  const STOW_TRAIL_LOOKBACK_MS = STOW_EVIDENCE_MIN_MS + STOW_EVIDENCE_GAP_MS;
   for (const sample of samples) {
     const navState = sample.navState || lastNav || "unknown";
     if (sample.navState) lastNav = sample.navState;
@@ -2029,6 +2061,24 @@ async function augmentSamplesDeployStates({
     for (const gen of generators) {
       if (!gen.deployable) continue;
       const powerW = lastGenPower.has(gen.id) ? lastGenPower.get(gen.id) : null;
+      const timeMs = new Date(sample.timestamp).getTime();
+      let trail = stowTrails.get(gen.id);
+      if (!trail) {
+        trail = [];
+        stowTrails.set(gen.id, trail);
+      }
+      trail.push({
+        timeMs,
+        powerW,
+        windKnots,
+        stwKnots,
+      });
+      while (
+        trail.length > 0 &&
+        trail[0].timeMs < timeMs - STOW_TRAIL_LOOKBACK_MS
+      ) {
+        trail.shift();
+      }
       const state = detectGeneratorState(gen, {
         powerW,
         windKnots,
@@ -2036,6 +2086,7 @@ async function augmentSamplesDeployStates({
         navState,
         underway,
         previousState: previousDeployStates.get(gen.id) ?? null,
+        stowEvidenceMs: sustainedStowEvidenceMs(gen, trail, sample.soc ?? null),
       });
       if (state != null) {
         deployStates[gen.id] = state;
