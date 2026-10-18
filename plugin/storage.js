@@ -7,8 +7,9 @@
  *    cycle *metadata* (cycles store their forecast as point rows instead,
  *    so windowed reads never parse out-of-window forecast JSON).
  *  - `forecast_points`: one row per forecast hour per cycle, keyed
- *    `(cycle_ts, h)` with an index on the point's own timestamp for
- *    windowed queries and SQL aggregation.
+ *    `(cycle_ts, h)` for bounded range scans; no secondary indexes (work
+ *    doc #30 — their scattered per-cycle inserts dominated the write
+ *    volume, and every point read is served from the PK range instead).
  *
  * Loop discipline: `node:sqlite` is synchronous, so every windowed read
  * is keyset-paginated (`WHERE (ts, cycle_ts) > (last)` with `ORDER BY`)
@@ -49,6 +50,22 @@ const POINT_COLUMNS = [
 ];
 
 const MS_PER_HOUR = 3600000;
+
+/**
+ * Longest forecast horizon a recorded cycle can cover, measured back from
+ * the hour buckets it covers. Bounds the cycle-timestamp scan in the
+ * winners aggregation (`getHourlyWinners`, `summaryTotals`): a cycle
+ * started at T covers hour buckets in `[T − 1h, T + horizon]` (a cycle
+ * run mid-hour records the current bucket, whose start precedes the
+ * cycle), so only cycles within `[bucket − horizon, bucket + 1h]` can
+ * cover a bucket.
+ *
+ * Matches the schema's `weather.forecastHours` maximum (168 h,
+ * plugin/schema.js) plus an hour of mid-hour skew.
+ *
+ * @type {number}
+ */
+const MAX_POINT_HORIZON_MS = 169 * MS_PER_HOUR;
 
 /**
  * Loads the node:sqlite builtin or fails with an actionable message.
@@ -224,6 +241,16 @@ class RecordStore {
     // Applies to freshly created files; existing files keep their mode
     // (retained space is reclaimed on migration-time creation anyway)
     db.exec("PRAGMA auto_vacuum = INCREMENTAL");
+    // Bounded WAL checkpoints (work doc #30): the default 1000-page
+    // threshold let the WAL accumulate for hours, then dumped the whole
+    // copy into the db in one synchronous pass on the event loop (measured
+    // at 4.3 MB in a 134 s production capture). 200 pages caps any
+    // checkpoint copy at ~800 kB while still letting commits between
+    // checkpoints coalesce dirty pages.
+    db.exec("PRAGMA wal_autocheckpoint = 200");
+    // Let the WAL file shrink back after checkpoints instead of holding
+    // its high-water mark forever
+    db.exec("PRAGMA journal_size_limit = 1048576");
     db.exec(`
       CREATE TABLE IF NOT EXISTS records (
         type TEXT NOT NULL,
@@ -241,10 +268,6 @@ class RecordStore {
         actions TEXT,
         PRIMARY KEY (cycle_ts, h)
       ) WITHOUT ROWID;
-      CREATE INDEX IF NOT EXISTS idx_points_ts_cycle
-        ON forecast_points (ts, cycle_ts);
-      CREATE INDEX IF NOT EXISTS idx_points_hour_cycle
-        ON forecast_points (hour, cycle_ts);
       CREATE TABLE IF NOT EXISTS deploy_actions (
         cycle_ts INTEGER NOT NULL,
         h INTEGER NOT NULL,
@@ -264,6 +287,13 @@ class RecordStore {
         value TEXT NOT NULL
       );
     `);
+    // Migration (work doc #30): stores created before 0.13.0 carry two
+    // secondary indexes on forecast_points whose scattered per-cycle
+    // inserts dominated the store's write volume (~30 MB/day at
+    // equilibrium). The point reads they served are bounded PK-range
+    // scans now, so the indexes are dropped for good.
+    db.exec("DROP INDEX IF EXISTS idx_points_ts_cycle");
+    db.exec("DROP INDEX IF EXISTS idx_points_hour_cycle");
 
     const pointCols = POINT_COLUMNS.map(([col]) => col);
     this.statements = {
@@ -316,11 +346,6 @@ class RecordStore {
          WHERE type = ? AND ts >= ? AND ts <= ? AND ts > ?
          ORDER BY ts LIMIT ?`,
       ),
-      pointsPage: db.prepare(
-        `SELECT * FROM forecast_points
-         WHERE (ts, cycle_ts) > (?, ?) AND ts >= ? AND ts <= ?
-         ORDER BY ts, cycle_ts LIMIT ?`,
-      ),
       hourlyWinners: db.prepare(
         `SELECT f.*
          FROM forecast_points f
@@ -328,6 +353,7 @@ class RecordStore {
            SELECT hour, MAX(cycle_ts) AS cycle_ts
            FROM forecast_points
            WHERE hour >= ? AND hour <= ?
+             AND cycle_ts >= ? AND cycle_ts <= ?
            GROUP BY hour
          ) w ON f.hour = w.hour AND f.cycle_ts = w.cycle_ts
          ORDER BY f.hour`,
@@ -376,6 +402,7 @@ class RecordStore {
            SELECT hour, MAX(cycle_ts) AS cycle_ts
            FROM forecast_points
            WHERE hour >= ? AND hour <= ?
+             AND cycle_ts >= ? AND cycle_ts <= ?
            GROUP BY hour
          ) w ON f.hour = w.hour AND f.cycle_ts = w.cycle_ts`,
       ),
@@ -601,8 +628,8 @@ class RecordStore {
    * [] when disabled only because it had no data to read).
    *
    * @param {string} type - "sample" | "wind-protection" | "cycle"
-   *        (cycle rows are metadata only — use getForecastPoints for
-   *        forecast data)
+   *        (cycle rows are metadata only — use getPointsByCycle or
+   *        pointsForCycles for forecast data)
    * @param {Date} from
    * @param {Date} to
    * @returns {Promise<object[]>}
@@ -653,49 +680,6 @@ class RecordStore {
   }
 
   /**
-   * Reads forecast points whose own timestamp falls in the window,
-   * ascending. Rows map back to getHourlyForecast() field names, with
-   * `cycleTs`, `h`, and `ts` added; `actions` is parsed.
-   *
-   * @param {Date} from
-   * @param {Date} to
-   * @returns {Promise<object[]>}
-   */
-  async getForecastPoints(from, to) {
-    this.#ensureOpen();
-    const out = [];
-    // Cursor init: (from-1, 0) precedes every row inside [from, to]
-    // (finite values only — SQLite cannot bind Infinity)
-    let lastTs = from.getTime() - 1;
-    let lastCycle = 0;
-    for (;;) {
-      let pageTs = 0;
-      let pageCycle = 0;
-      const rows = await schedulePageSync(() => {
-        const raw = this.statements.pointsPage.all(
-          lastTs,
-          lastCycle,
-          from.getTime(),
-          to.getTime(),
-          this.pageSize,
-        );
-        const last = raw[raw.length - 1];
-        pageTs = last ? last.ts : 0;
-        pageCycle = last ? last.cycle_ts : 0;
-        return raw.map((row) => mapPointRow(row));
-      });
-      for (const row of rows) {
-        out.push(row);
-      }
-      if (rows.length < this.pageSize) {
-        return out;
-      }
-      lastTs = pageTs;
-      lastCycle = pageCycle;
-    }
-  }
-
-  /**
    * The freshest hourly prediction per hour bucket in the window: for
    * each hour, the forecast point from the newest cycle that covers it
    * (mirrors the webapp builders' winner rule: greatest cycle timestamp
@@ -707,6 +691,16 @@ class RecordStore {
    * bounded hour chunks with a yield between them, so the synchronous
    * GROUP BY scans stay short even on month windows.
    *
+   * There is no ts-first index on forecast_points (dropped in work doc
+   * #30 — its scattered per-cycle inserts dominated the store's write
+   * volume), so the per-chunk winner scan is bounded by cycle timestamp
+   * instead: a cycle started at T covers hour buckets from T−1h (a
+   * cycle run mid-hour records the current bucket) to T+horizon, so
+   * only cycles in `[chunkStart − horizon, chunkEnd + 1h]` can cover a
+   * chunk's buckets. The PK (cycle_ts, h) turns that bound into a
+   * bounded range scan; the chunk cursor then filters to the requested
+   * buckets.
+   *
    * @param {Date} from
    * @param {Date} to
    * @returns {Promise<{hour: number}[] & object[]>} - Winner points with
@@ -716,6 +710,7 @@ class RecordStore {
     this.#ensureOpen();
     const out = [];
     const chunkMs = 12 * MS_PER_HOUR;
+    const horizonMs = MAX_POINT_HORIZON_MS;
     let cursor = hourFloor(from);
     const end = hourFloor(to);
     while (cursor <= end) {
@@ -723,7 +718,12 @@ class RecordStore {
       const chunkCursor = cursor;
       const rows = await schedulePageSync(() =>
         this.statements.hourlyWinners
-          .all(chunkCursor, chunkEnd)
+          .all(
+            chunkCursor,
+            chunkEnd,
+            chunkCursor - horizonMs,
+            chunkEnd + MS_PER_HOUR,
+          )
           .map((row) => mapPointRow(row)),
       );
       for (const row of rows) {
@@ -803,7 +803,17 @@ class RecordStore {
    */
   summaryTotals(from, to) {
     this.#ensureOpen();
-    return this.statements.summaryTotals.get(hourFloor(from), hourFloor(to));
+    const start = hourFloor(from);
+    const end = hourFloor(to);
+    // Same cycle_ts bound as getHourlyWinners: only cycles started within
+    // MAX_POINT_HORIZON_MS before the window (and up to an hour into it,
+    // mid-hour cycle skew) can cover its buckets.
+    return this.statements.summaryTotals.get(
+      start,
+      end,
+      start - MAX_POINT_HORIZON_MS,
+      end + MS_PER_HOUR,
+    );
   }
 
   /**

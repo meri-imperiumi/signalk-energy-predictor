@@ -194,10 +194,7 @@ test("imports mixed records with tolerance, then renames to backup", async () =>
   );
   assert.equal(cycles.length, 1);
   assert.equal("forecast" in cycles[0], false);
-  const points = await env.store.getForecastPoints(
-    new Date(base),
-    new Date(base + 2 * HOUR),
-  );
+  const points = env.store.getPointsByCycle(new Date(base));
   assert.equal(points.length, 2);
   assert.equal(points[1].idealSolarYieldWh, 101);
 

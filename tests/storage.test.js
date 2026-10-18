@@ -156,10 +156,7 @@ test("cycle stores metadata row plus point rows; points map back to engine field
   assert.equal("forecast" in cycles[0], false);
 
   // Points: one per hour, keyed by their own timestamp
-  const points = await store.getForecastPoints(
-    new Date(at.getTime()),
-    new Date(at.getTime() + 3 * HOUR),
-  );
+  const points = store.getPointsByCycle(at);
   assert.equal(points.length, 3);
   assert.equal(points[0].cycleTs, at.getTime());
   assert.equal(points[0].h, 0);
@@ -182,10 +179,7 @@ test("cycle stores metadata row plus point rows; points map back to engine field
     forecast: [{ time: new Date(at.getTime() + 10 * HOUR).toISOString() }],
     actions: {},
   });
-  const bare = await store.getForecastPoints(
-    new Date(at.getTime() + 10 * HOUR),
-    new Date(at.getTime() + 10 * HOUR),
-  );
+  const bare = store.getPointsByCycle(new Date(at.getTime() + 10 * HOUR));
   assert.equal(bare.length, 1);
   assert.equal(bare[0].idealSolarYieldWh, null);
   assert.deepEqual(bare[0].actions, []);
@@ -284,10 +278,7 @@ test("re-recording a cycle replaces its points without stale rows", async () => 
   assert.equal(store.countForecastPoints(), 2);
   assert.equal(store.countRecords("cycle"), 1);
   // Upsert keeps the newest content
-  const points = await store.getForecastPoints(
-    at,
-    new Date(at.getTime() + 5 * HOUR),
-  );
+  const points = store.getPointsByCycle(at);
   assert.equal(points.length, 2);
   cleanup();
 });
@@ -421,6 +412,15 @@ test("getHourlyWinners returns the newest cycle's point per hour bucket", async 
   assert.equal(late.length, 1);
   assert.equal(late[0].hour, Date.UTC(2026, 8, 1, 18));
   assert.equal(late[0].idealSolarYieldWh, 50);
+  // A cycle run mid-hour covers the bucket that starts before it: a
+  // window ending exactly at that bucket still sees the mid-hour cycle
+  // as the winner (cycle_ts sits up to an hour past the bucket start)
+  const skew = await store.getHourlyWinners(
+    new Date("2026-09-01T18:00:00Z"),
+    new Date("2026-09-01T18:00:00Z"),
+  );
+  assert.equal(skew.length, 1);
+  assert.equal(skew[0].cycleTs, odd.getTime());
   cleanup();
 });
 
@@ -597,4 +597,60 @@ test("unclean close (no checkpoint) still recovers via WAL on next open", async 
   reader.close();
   writer.close();
   fs.rmSync(dir, { recursive: true, force: true });
+});
+
+test("open drops the pre-0.13 forecast_points indexes and caps WAL checkpoints", async () => {
+  const { loadSqlite, POINT_COLUMNS } = require("../plugin/storage.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "ep-storage-idx-"));
+  const dbPath = path.join(dir, "records.db");
+  try {
+    // Simulate a store created before 0.13.0: schema with both secondary
+    // indexes present
+    const { DatabaseSync } = loadSqlite();
+    const legacy = new DatabaseSync(dbPath);
+    legacy.exec("PRAGMA journal_mode = WAL");
+    legacy.exec(`
+      CREATE TABLE forecast_points (
+        cycle_ts INTEGER NOT NULL,
+        h INTEGER NOT NULL,
+        ts INTEGER NOT NULL,
+        hour INTEGER NOT NULL,
+        weather_tier INTEGER,
+        ${POINT_COLUMNS.map(([col]) => `${col} REAL`).join(",\n        ")},
+        actions TEXT,
+        PRIMARY KEY (cycle_ts, h)
+      ) WITHOUT ROWID;
+      CREATE INDEX idx_points_ts_cycle ON forecast_points (ts, cycle_ts);
+      CREATE INDEX idx_points_hour_cycle ON forecast_points (hour, cycle_ts);
+    `);
+    legacy.close();
+
+    // Reopening must drop both indexes (work doc #30) and apply the
+    // bounded-checkpoint pragmas
+    const store = new RecordStore({ debug() {}, error() {} }, dir, {});
+    store.open();
+    const indexes = store.db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND name LIKE 'idx_points_%'",
+      )
+      .all();
+    assert.deepEqual(indexes, []);
+    assert.equal(
+      store.db.prepare("PRAGMA wal_autocheckpoint").get().wal_autocheckpoint,
+      200,
+    );
+
+    // And the store still works end to end after the migration
+    const at = new Date("2026-09-01T12:00:00Z");
+    await store.recordCycle(makeCycle(at, 2));
+    assert.equal(store.getPointsByCycle(at).length, 2);
+    const winners = await store.getHourlyWinners(
+      at,
+      new Date(at.getTime() + HOUR),
+    );
+    assert.equal(winners.length, 2); // buckets 12:00 and 13:00
+    store.close();
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

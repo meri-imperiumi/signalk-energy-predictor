@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **The record store writes ~3× less to disk and no longer stalls the server on WAL checkpoint dumps** (`plugin/storage.js`; found by a production file-activity profile that caught 4.3 MB written in 134 s during normal operation): every prediction cycle upserted ~48 forecast point rows into two secondary indexes on `forecast_points` whose ts-first and hour-first orderings scatter the inserts across ~50 leaf pages per index — measured at equilibrium (90-day retention, 15-min cycles, 5-min samples) as 30.9 MB/day of writes, with the WAL silently accumulating until SQLite's default 1000-page auto-checkpoint copied the whole backlog into the db in one synchronous event-loop pass every few hours (a multi-second I/O stall candidate on the boat's SD card). The indexes are gone: their reads are served by bounded `(cycle_ts, h)` PK-range scans instead — the winners aggregation (`getHourlyWinners`, `summaryTotals`) now bounds its per-chunk `GROUP BY` by cycle timestamp (`[chunkStart − horizon, chunkEnd + 1h]`, horizon from the schema's 168 h maximum), and the dead `getForecastPoints`/`pointsPage` ts-windowed read (no production caller, tests only) was removed in favor of `getPointsByCycle`/`pointsForCycles`. `wal_autocheckpoint` drops to 200 pages (with `journal_size_limit` 1 MB) so any checkpoint copy stays ≤ ~800 kB. Equilibrium after the change: 9.7 MB/day, worst single write 272 kB, WAL capped at ~0.9 MB; the winners read costs ~3× more SQL per window (month view 21 → 59 ms total, spread over the yielding 12 h chunks) with identical results. Existing stores drop the two indexes on open().
+
 ## [0.13.0] - 2026-10-18
 
 ### Fixed
