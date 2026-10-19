@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **The webapp hides wind and hydro tiles and series of unconfigured generator types** (`plugin/api.js`, `public/ep-app.js`, `public/ep-headline-figures.js`, `public/ep-timeline-chart.js`, issue #9): the Wind yield and Hydro yield headline figures and the wind/hydro actual + predicted series (day view) and bars (week/month view) rendered unconditionally, so a solar-only boat carried two always-zero tiles and four dead chart entries. `/api/vessel` now returns `generatorTypes` alongside the timezone offset — the types of enabled `mechanicalGenerators` entries — and the app pushes the list into the figures and the chart, which drop everything tagged with an unconfigured type (legend, plot, tooltip and bars alike). The filtering is configuration-based, not data-based: a freshly configured generator shows its tiles and series immediately, and a stale or broken power path never hides a configured one. Solar needs no entry (every boat is assumed to have it), and the measured wind speed series (`windKn`) stays — it is environment data, not generator output. When the vessel meta fetch fails, everything renders as before (the always-show fallback); a generator added or removed in the plugin config appears or disappears with the next prediction cycle.
+
 ## [0.14.1] - 2026-10-19
 
 ### Fixed

@@ -172,8 +172,8 @@
     "/api/vessel": {
       "get": {
         "tags": ["vessel"],
-        "summary": "Vessel meta for user-facing time rendering",
-        "description": "Returns the vessel's solar-local UTC offset (minutes), derived from the current longitude, so the webapp can anchor its day/week/month window and render event times in the crew's solar-local frame rather than the browser's civil timezone. Returns null when the position is unknown (client falls back to the browser timezone).",
+        "summary": "Vessel meta for time rendering and generator visibility",
+        "description": "Returns the vessel's ship's-time UTC offset (minutes), from the onboard timezone published by @meri-imperiumi/signalk-ships-time, so the webapp can anchor its day/week/month window and render event times in the crew's ship's-time frame rather than the browser's civil timezone. Returns null when the offset is unpublished (client falls back to the browser timezone). Also returns the configured mechanical generator types so the webapp can hide wind/hydro tiles and series of unconfigured generator types.",
         "responses": {
           "200": {
             "description": "Vessel meta",
@@ -211,6 +211,11 @@
             "type": "integer",
             "nullable": true,
             "description": "Vessel onboard timezone (ship's time) UTC offset in minutes (east positive), from the `environment.time.timezoneOffset` path published by @meri-imperiumi/signalk-ships-time. Null when unpublished (ships-time plugin absent)."
+          },
+          "generatorTypes": {
+            "type": "array",
+            "items": { "type": "string", "enum": ["wind", "hydro"] },
+            "description": "Mechanical generator types configured and enabled on the vessel, derived from the plugin configuration (configuration presence, not recorded data). The webapp omits the headline figures, series and bars of types missing from the list; solar needs no entry (every boat is assumed to have it)."
           }
         }
       },

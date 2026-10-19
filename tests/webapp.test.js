@@ -396,6 +396,53 @@ test("headline figures show hydro yield", () => {
   assert.match(source, /yield\?\.hydro\?\.totalWh/);
 });
 
+test("webapp hides wind and hydro tiles and series of unconfigured generator types", () => {
+  // The configured mechanical generator types come from /api/vessel
+  // (generatorTypes, derived from the plugin config's enabled
+  // mechanicalGenerators — configuration presence, not recorded data).
+  // The app pushes them to the headline figures and the chart, which
+  // omit the tiles/series/bars of unconfigured types. Solar is
+  // unconditional, and the measured wind speed (windKn) is environment
+  // data that must survive the filtering. With the meta fetch failed
+  // (null types) everything stays visible — the always-show fallback.
+  const app = readFileSync(path.join(PUBLIC_DIR, "ep-app.js"), "utf8");
+  assert.match(app, /body\?\.generatorTypes/);
+  assert.match(app, /this\.figuresEl\.setGeneratorTypes\?\.\(types\)/);
+  assert.match(app, /this\.chartEl\.setGeneratorTypes\?\.\(types\)/);
+
+  const figures = readFileSync(
+    path.join(PUBLIC_DIR, "ep-headline-figures.js"),
+    "utf8",
+  );
+  assert.match(figures, /setGeneratorTypes\(types\)/);
+  assert.match(
+    figures,
+    /hasWind[\s\S]*?hasHydro[\s\S]*\.\.\.\(hasWind[\s\S]*\.\.\.\(hasHydro/,
+    "wind and hydro figures must render conditionally on the configured types",
+  );
+
+  const chart = readFileSync(
+    path.join(PUBLIC_DIR, "ep-timeline-chart.js"),
+    "utf8",
+  );
+  assert.match(chart, /setGeneratorTypes\(types\)/);
+  // Every wind/hydro series (actual, predicted, day and period bars) is
+  // tagged so the filter can drop them; untagged series (solar, load,
+  // SoC, windKn) always render
+  const tagged = chart.match(/gen: "(wind|hydro)"/g) || [];
+  assert.strictEqual(
+    tagged.length,
+    8,
+    `wind/hydro day+period series must all carry a gen tag (found ${tagged.length})`,
+  );
+  assert.match(
+    chart,
+    /generatorTypes == null\) return defs;/,
+    "unknown types must fall back to showing every series",
+  );
+  assert.match(chart, /d\.gen == null \|\| generatorTypes\.includes\(d\.gen\)/);
+});
+
 test("webapp follows the tactical console theme spec", () => {
   const css = readFileSync(path.join(PUBLIC_DIR, "styles.css"), "utf8");
   // Day/night intensity shifting via data-mode on the document root
@@ -446,8 +493,12 @@ test("headline figure cards fit the app shell on one line", () => {
     "utf8",
   );
   // Card count: the figure() calls in the summary render path (the
-  // null-summary fallback adds one "Summary" card, not more)
-  const cards = (figures.match(/^\s{6}this\.figure\(/gm) || []).length;
+  // null-summary fallback adds one "Summary" card, not more). The wind
+  // and hydro figures render conditionally on the configured generator
+  // types, so they sit inside conditional spreads — count figure calls
+  // starting a line at any depth, which the fallback's inline call
+  // (this.appendChild(this.figure(...))) does not match.
+  const cards = (figures.match(/^\s*this\.figure\(/gm) || []).length;
   assert.ok(cards >= 7, "expected the summary figures to render");
   const grid = css.match(
     /ep-headline-figures\s*\{[\s\S]*?grid-template-columns:\s*([^;]+);[\s\S]*?gap:\s*([^;]+);/,

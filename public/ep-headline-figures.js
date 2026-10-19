@@ -9,6 +9,31 @@ class EpHeadlineFigures extends HTMLElement {
     super();
     /** @type {object|null} */
     this.summary = null;
+    /** @type {string[]|null} Configured mechanical generator types (from
+     *  /api/vessel via the app). Solar is unconditional — every boat is
+     *  assumed to have it. null = unknown (meta fetch not yet landed or
+     *  failed): wind and hydro figures stay visible so a failed fetch
+     *  degrades to the always-show rendering instead of hiding data. */
+    this.generatorTypes = null;
+  }
+
+  /**
+   * Sets the configured mechanical generator types and re-renders so
+   * figures of unconfigured types disappear (a boat adding a generator
+   * later sees its figure appear with the config change). No-op when
+   * unchanged.
+   * @param {string[]|null} types
+   */
+  setGeneratorTypes(types) {
+    const next = Array.isArray(types)
+      ? [...new Set(types)].sort().join(",")
+      : null;
+    const current = Array.isArray(this.generatorTypes)
+      ? [...new Set(this.generatorTypes)].sort().join(",")
+      : null;
+    if (next === current) return;
+    this.generatorTypes = types ? [...new Set(types)] : null;
+    if (this.isConnected) this.render();
   }
 
   /**
@@ -109,6 +134,11 @@ class EpHeadlineFigures extends HTMLElement {
       ? `±${acc.meanAbsoluteErrorPercent?.toFixed?.(0) ?? acc.meanAbsoluteErrorPercent}%`
       : "—";
     const accSub = hasAcc ? "mean abs. error" : "no predictions recorded";
+    // Mechanical-generator figures render only for configured types
+    const hasWind =
+      this.generatorTypes == null || this.generatorTypes.includes("wind");
+    const hasHydro =
+      this.generatorTypes == null || this.generatorTypes.includes("hydro");
 
     this.append(
       this.figure(
@@ -127,22 +157,30 @@ class EpHeadlineFigures extends HTMLElement {
           : null,
         "theme-orange",
       ),
-      this.figure(
-        "Wind yield",
-        this.formatWh(s.yield?.wind?.totalWh),
-        s.yield?.wind?.averageW != null
-          ? `avg ${this.formatW(s.yield.wind.averageW)}`
-          : null,
-        "theme-teal",
-      ),
-      this.figure(
-        "Hydro yield",
-        this.formatWh(s.yield?.hydro?.totalWh),
-        s.yield?.hydro?.averageW != null
-          ? `avg ${this.formatW(s.yield.hydro.averageW)}`
-          : null,
-        "theme-blue",
-      ),
+      ...(hasWind
+        ? [
+            this.figure(
+              "Wind yield",
+              this.formatWh(s.yield?.wind?.totalWh),
+              s.yield?.wind?.averageW != null
+                ? `avg ${this.formatW(s.yield.wind.averageW)}`
+                : null,
+              "theme-teal",
+            ),
+          ]
+        : []),
+      ...(hasHydro
+        ? [
+            this.figure(
+              "Hydro yield",
+              this.formatWh(s.yield?.hydro?.totalWh),
+              s.yield?.hydro?.averageW != null
+                ? `avg ${this.formatW(s.yield.hydro.averageW)}`
+                : null,
+              "theme-blue",
+            ),
+          ]
+        : []),
       this.figure(
         "Combined yield",
         this.formatWh(s.yield?.combined?.totalWh),

@@ -145,6 +145,33 @@ function sourceTypesFromConfig(config) {
 }
 
 /**
+ * Mechanical generator types the vessel has configured and enabled.
+ *
+ * Configuration presence, not recorded data: a freshly configured
+ * generator has no samples yet, but its webapp tiles and series must
+ * already show (and a stale or broken power path must not hide them).
+ * The webapp omits the headline figures, actual/predicted series and
+ * period bars of types missing from this list; solar needs no entry
+ * here (every boat is assumed to have it).
+ *
+ * @param {object|null} config - Plugin configuration
+ * @param {object[]} [config.mechanicalGenerators] - Generator configurations
+ * @returns {string[]} Enabled generator types, e.g. ["wind"]
+ */
+function generatorTypesFromConfig(config) {
+  const types = new Set();
+  for (const gen of config?.mechanicalGenerators || []) {
+    if (gen.enabled === false) {
+      continue;
+    }
+    if (gen.type === "wind" || gen.type === "hydro") {
+      types.add(gen.type);
+    }
+  }
+  return [...types].sort();
+}
+
+/**
  * Resolves the navigation state for a retro-predicted hour.
  *
  * `stateAt` returns the latest sample at or before the hour, or null before
@@ -1075,8 +1102,16 @@ function registerApiRoutes(
   // depending on the browser timezone. Returns null when the offset is
   // unpublished (ships-time plugin absent) so the client falls back to
   // the browser timezone.
+  //
+  // `generatorTypes` drives which mechanical-generator tiles and series
+  // the webapp shows (solar is unconditional): a solar-only boat should
+  // not see Wind/Hydro yield figures and zero-filled wind/hydro series
+  // it can never have data for.
   router.get("/api/vessel", (_req, res) => {
-    res.json({ timezoneOffsetMinutes: shipsTimeOffsetMinutes(app) });
+    res.json({
+      timezoneOffsetMinutes: shipsTimeOffsetMinutes(app),
+      generatorTypes: generatorTypesFromConfig(getConfig()),
+    });
   });
 
   router.get("/api/predictions", (req, res) => {
@@ -1844,6 +1879,7 @@ module.exports = {
   granularityForWindow,
   sortByTimestamp,
   sourceTypesFromConfig,
+  generatorTypesFromConfig,
   resolveNavState,
   sampleToActualPoint,
   integratePerHour,

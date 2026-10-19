@@ -45,7 +45,7 @@ const COLORS = {
 const PREFS_KEY = "ep:series";
 
 /**
- * @typedef {{id: string, label: string, color: string, predicted?: boolean, kind: "line"|"bar", axis: "left"|"right"}} SeriesDef
+ * @typedef {{id: string, label: string, color: string, predicted?: boolean, kind: "line"|"bar", axis: "left"|"right", gen?: "wind"|"hydro"}} SeriesDef
  */
 
 /** @type {SeriesDef[]} */
@@ -57,13 +57,21 @@ const DAY_SERIES = [
     kind: "line",
     axis: "left",
   },
-  { id: "wind", label: "Wind", color: COLORS.wind, kind: "line", axis: "left" },
+  {
+    id: "wind",
+    label: "Wind",
+    color: COLORS.wind,
+    kind: "line",
+    axis: "left",
+    gen: "wind",
+  },
   {
     id: "hydro",
     label: "Hydro",
     color: COLORS.hydro,
     kind: "line",
     axis: "left",
+    gen: "hydro",
   },
   {
     id: "load",
@@ -95,6 +103,7 @@ const DAY_SERIES = [
     predicted: true,
     kind: "line",
     axis: "left",
+    gen: "wind",
   },
   {
     id: "predHydro",
@@ -103,6 +112,7 @@ const DAY_SERIES = [
     predicted: true,
     kind: "line",
     axis: "left",
+    gen: "hydro",
   },
   {
     id: "predLoad",
@@ -145,6 +155,7 @@ const PERIOD_SERIES = [
     color: COLORS.wind,
     kind: "bar",
     axis: "left",
+    gen: "wind",
   },
   {
     id: "windPred",
@@ -153,6 +164,7 @@ const PERIOD_SERIES = [
     predicted: true,
     kind: "bar",
     axis: "left",
+    gen: "wind",
   },
   {
     id: "hydroActual",
@@ -160,6 +172,7 @@ const PERIOD_SERIES = [
     color: COLORS.hydro,
     kind: "bar",
     axis: "left",
+    gen: "hydro",
   },
   {
     id: "hydroPred",
@@ -168,6 +181,7 @@ const PERIOD_SERIES = [
     predicted: true,
     kind: "bar",
     axis: "left",
+    gen: "hydro",
   },
   {
     id: "socPred",
@@ -193,6 +207,18 @@ const PERIOD_SERIES = [
  * from `/api/vessel`; null = use the browser timezone (fallback).
  */
 let timezoneOffsetMinutes = null;
+
+/**
+ * Mechanical generator types the vessel has configured (from
+ * `/api/vessel`). Series and bars tagged with a `gen` type outside the
+ * list are omitted — legend, drawing, tooltip and all — so a solar-only
+ * boat sees no wind/hydro entries that can never carry data. The measured
+ * wind speed (`windKn`) is environment data and stays. Solar has no tag
+ * (every boat is assumed to have it). null = unknown (meta fetch not yet
+ * landed or failed): nothing is filtered, the always-show fallback.
+ * @type {string[]|null}
+ */
+let generatorTypes = null;
 
 /**
  * Local calendar key (YYYY-MM-DD) for a timestamp — the ship's-time
@@ -261,6 +287,25 @@ class EpTimelineChart extends HTMLElement {
     if (this.isConnected) this.render();
   }
 
+  /**
+   * Sets the configured mechanical generator types (from `/api/vessel`)
+   * and re-renders so series of unconfigured types drop out of the
+   * legend, the plot and the tooltip (a boat adding a generator later
+   * sees its series appear with the config change). No-op when unchanged.
+   * @param {string[]|null} types
+   */
+  setGeneratorTypes(types) {
+    const key = Array.isArray(types)
+      ? [...new Set(types)].sort().join(",")
+      : null;
+    const currentKey = generatorTypes
+      ? [...new Set(generatorTypes)].sort().join(",")
+      : null;
+    if (key === currentKey) return;
+    generatorTypes = key === null ? null : [...new Set(types)];
+    if (this.isConnected) this.render();
+  }
+
   connectedCallback() {
     this.style.position = "relative";
     this.loadPrefs();
@@ -295,7 +340,11 @@ class EpTimelineChart extends HTMLElement {
   }
 
   get seriesDefs() {
-    return this._data?.mode === "day" ? DAY_SERIES : PERIOD_SERIES;
+    const defs = this._data?.mode === "day" ? DAY_SERIES : PERIOD_SERIES;
+    // Untagged defs (solar, load, SoC, wind speed) always render; tagged
+    // ones render only while their generator type is configured
+    if (generatorTypes == null) return defs;
+    return defs.filter((d) => d.gen == null || generatorTypes.includes(d.gen));
   }
 
   // --- geometry helpers ---

@@ -91,6 +91,9 @@ class EpApp extends HTMLElement {
     this.selectorEl = selector;
     /** @type {number|null} */
     this.timezoneOffsetMinutes = null;
+    /** @type {string[]|null} Configured mechanical generator types (from
+     *  /api/vessel); null = unknown, all generator series stay visible. */
+    this.generatorTypes = null;
     /** @type {{mode: string, from: string, to: string}|null} Window spec
      *  of the data currently rendered by the chart/actions (null = none,
      *  e.g. after a failed refresh): refresh() keeps the rendered data
@@ -205,12 +208,14 @@ class EpApp extends HTMLElement {
 
   /**
    * Fetches the vessel meta (`/api/vessel`) and applies the ship's-time
-   * UTC offset to the selector, chart and Events list. Called on load and
-   * on every prediction cycle — the offset follows the onboard timezone
-   * (updated by @meri-imperiumi/signalk-ships-time on zone crossings), so
-   * it must not be cached for the session. A failed fetch keeps the last
-   * known offset (or the browser-timezone fallback) and retries on the
-   * next cycle.
+   * UTC offset to the selector, chart and Events list, plus the configured
+   * generator types to the figures and chart. Called on load and on every
+   * prediction cycle — the offset follows the onboard timezone (updated by
+   * @meri-imperiumi/signalk-ships-time on zone crossings), so it must not
+   * be cached for the session, and a generator added or removed in the
+   * plugin config appears/disappears with the next cycle. A failed fetch
+   * keeps the last known state (or the defaults) and retries on the next
+   * cycle.
    * @returns {Promise<boolean>} whether the offset changed and was applied
    */
   async refreshVesselMeta() {
@@ -224,14 +229,30 @@ class EpApp extends HTMLElement {
       }
       body = await response.json();
     } catch {
-      // Vessel meta unavailable: keep the current offset, retry next cycle
+      // Vessel meta unavailable: keep the current state, retry next cycle
       return false;
     }
     const offset =
       body && typeof body.timezoneOffsetMinutes === "number"
         ? body.timezoneOffsetMinutes
         : null;
+    this.applyGeneratorTypes(
+      Array.isArray(body?.generatorTypes) ? body.generatorTypes : null,
+    );
     return this.applyTimezoneOffset(offset);
+  }
+
+  /**
+   * Pushes the configured mechanical generator types (from `/api/vessel`)
+   * to the headline figures and the chart so tiles and series of
+   * unconfigured types are omitted. Solar needs no entry — every boat is
+   * assumed to have it. Stored so later refreshes keep using it.
+   * @param {string[]|null} types
+   */
+  applyGeneratorTypes(types) {
+    this.generatorTypes = types;
+    this.figuresEl.setGeneratorTypes?.(types);
+    this.chartEl.setGeneratorTypes?.(types);
   }
 
   /**

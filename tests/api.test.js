@@ -855,6 +855,57 @@ test.describe("route registration", () => {
     });
   });
 
+  test("GET /api/vessel lists the enabled configured mechanical generator types", async () => {
+    await withFixtures(async (dataDir, store) => {
+      const router = makeRouter();
+      registerApiRoutes(router, {
+        app: makeApp(),
+        // CONFIG configures one wind and one hydro generator, both enabled
+        getConfig: () => CONFIG,
+        getStore: () => store,
+        dataDir,
+      });
+      const res = makeRes();
+      await router.routes.get("/api/vessel")({}, res);
+      assert.deepStrictEqual(res.body.generatorTypes, ["hydro", "wind"]);
+    });
+  });
+
+  test("GET /api/vessel omits disabled generators and sorts the type list", async () => {
+    await withFixtures(async (dataDir, store) => {
+      const router = makeRouter();
+      registerApiRoutes(router, {
+        app: makeApp(),
+        getConfig: () => ({
+          mechanicalGenerators: [
+            { id: "stowed", type: "hydro", enabled: false },
+            { id: "superwind", type: "wind" },
+          ],
+        }),
+        getStore: () => store,
+        dataDir,
+      });
+      const res = makeRes();
+      await router.routes.get("/api/vessel")({}, res);
+      assert.deepStrictEqual(res.body.generatorTypes, ["wind"]);
+    });
+  });
+
+  test("GET /api/vessel returns an empty generator type list without mechanical generators", async () => {
+    await withFixtures(async (dataDir, store) => {
+      const router = makeRouter();
+      registerApiRoutes(router, {
+        app: makeApp(),
+        getConfig: () => ({ solarArrays: [{ id: "flinsail" }] }),
+        getStore: () => store,
+        dataDir,
+      });
+      const res = makeRes();
+      await router.routes.get("/api/vessel")({}, res);
+      assert.deepStrictEqual(res.body.generatorTypes, []);
+    });
+  });
+
   test("GET /api/retro-predicted responds cache-only: no network on the request path", async () => {
     await withFixtures(async (dataDir, store) => {
       // Blackholed uplink: a fetch would never settle. Before the fix a
