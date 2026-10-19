@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.14.1] - 2026-10-19
+
 ### Fixed
 - **The House Load Paths setting now reaches the prediction engine's live load profile** (`plugin/index.js`, issue #8): the setting added in 0.14.0 reached the sample recorder, the delta subscription and engine detection, but the `PredictionEngine` constructor call omitted it, so the engine fell back to the default `electrical.venus.dcPower` and boats without a Venus device kept recording an empty DC side of the load profile while the configured AC paths worked. The configured paths are now passed alongside `acPowerPaths`, and a regression test starts the plugin with a non-default `houseLoadPaths` and asserts the engine receives it.
 
