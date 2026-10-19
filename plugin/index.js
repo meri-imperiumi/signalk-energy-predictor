@@ -3415,6 +3415,8 @@ module.exports = (app) => {
         predictionHours: config.weather?.forecastHours,
         // AC (inverter) consumption paths for the load profile's AC bins
         acPowerPaths: getAcPowerPaths(config.acPowerPaths),
+        // DC house load paths for the load profile's DC bins
+        houseLoadPaths: getHouseLoadPaths(config.houseLoadPaths),
         // Optional polar speed model (refreshed each prediction cycle
         // from the active `polars` resource; null when unavailable)
         getPolarModel: () => polarModel,

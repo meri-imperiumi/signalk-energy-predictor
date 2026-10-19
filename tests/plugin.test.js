@@ -208,6 +208,52 @@ test.describe("Plugin basic functionality", () => {
     await plugin.stop();
   });
 
+  test("house load paths config reaches the prediction engine", async () => {
+    // Regression for #8: the House Load Paths setting reached the sample
+    // recorder, subscription and engine detection but was not passed to
+    // the PredictionEngine constructor, so the live load profile kept
+    // reading the default electrical.venus.dcPower instead.
+    const app = new FakeSignalKApp();
+    const plugin = makePlugin(app);
+    const config = {
+      battery: {
+        capacityAh: 400,
+        systemVoltage: 12,
+        minSafeSoC: 0.2,
+      },
+      solarArrays: [],
+      mechanicalGenerators: [],
+      houseLoadPaths: ["electrical.loads.house.power"],
+      acPowerPaths: ["electrical.inverters.main.acPower"],
+      weather: {
+        openMeteoEnabled: false,
+        useLogbook: false,
+      },
+    };
+
+    app.dataPath = tempDir;
+    await plugin.start(config, () => {});
+
+    const engine = plugin.__getInternals().predictionEngine;
+    assert.ok(engine);
+    assert.deepEqual(
+      engine.houseLoadPaths,
+      ["electrical.loads.house.power"],
+      "engine must receive the configured house load paths, not the default",
+    );
+    assert.ok(
+      !engine.houseLoadPaths.includes("electrical.venus.dcPower"),
+      "default Venus path must not leak into the engine when configured",
+    );
+    assert.deepEqual(
+      engine.acPowerPaths,
+      ["electrical.inverters.main.acPower"],
+      "AC power paths must stay wired too",
+    );
+
+    await plugin.stop();
+  });
+
   test("plugin calls setStatus during operation", async () => {
     const app = new FakeSignalKApp();
     const plugin = makePlugin(app);
