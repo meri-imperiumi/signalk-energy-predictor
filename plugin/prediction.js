@@ -49,6 +49,15 @@ const CRITICAL_SOC_LEAD_ACID = 0.45;
 const LOAD_SMOOTHING_HOURS = 3;
 
 /**
+ * Total (DC + AC) bin EMA below which a learned bin is treated as collapsed:
+ * seeded from a bad sample (typically a 0 W start-up cycle) and then locked
+ * there by the spike gate. A boat at rest never draws under a watt, so a
+ * bin this low carries no real information. Such bins are dropped when a
+ * profile is loaded from disk so they relearn ungated (see shouldGate).
+ */
+const COLLAPSED_EMA_W = 1;
+
+/**
  * Hourly prediction result.
  * @typedef {{hour: number, time: Date, idealSolarYieldWh: number, idealWindYieldWh: number, idealHydroYieldWh: number, houseLoadWh: number, idealNetWh: number, idealSoC: number, detectedYieldWh: number, detectedNetWh: number, detectedSoC: number, actions: Array<{id: string, idealAction: string, detectedAction: string|null, reason: string}>}} HourlyPrediction
  */
@@ -482,16 +491,29 @@ class LoadProfile {
       return "surplus-mode";
     }
 
-    // Spike/outlier gate (only check if we have an EMA value).
+    // Spike/outlier gate (only check if we have a trusted EMA value).
     // Symmetric: rejects samples that are far ABOVE or far BELOW the current
     // EMA. The high gate catches sensor spikes (e.g. a momentary 500W blip);
     // the low gate catches charging artifacts and sensor dropouts that would
     // otherwise drag a healthy bin down and lock it there (a collapsed EMA
     // then rejects all real samples via the high gate). A 3x factor allows
     // gradual seasonal drift while blocking single-sample poisoning.
+    //
+    // The band only guards bins that are already trusted for predictions
+    // (minDaysPerBin distinct sample days — the same gate getLoad() applies).
+    // A young bin has no learned value worth protecting: its EMA is still
+    // converging from whatever the first sample was, and gating it lets a
+    // near-zero seed (e.g. a 0 W reading from a start-up cycle) reject every
+    // real sample that follows and mature the bin at ~0 W (issue #10). Left
+    // ungated, the EMA converges on real samples before the bin matures, so
+    // the band engages on an already-accurate value.
     const bin = this.bins.get(binKey);
     const totalLoadW = dcLoadW + acLoadW;
-    if (bin && bin.dcEma != null) {
+    if (
+      bin &&
+      bin.dcEma != null &&
+      this.getSampleDays(binKey) >= this.minDaysPerBin
+    ) {
       const currentEma = bin.dcEma + bin.acEma;
       const upper = currentEma * this.outlierFactor;
       const lower = currentEma / this.outlierFactor;
@@ -772,6 +794,36 @@ class LoadProfile {
     }
     if (data.samplesPerBin && Array.isArray(data.samplesPerBin)) {
       this.samplesPerBin = new Map(data.samplesPerBin.map((k) => [k, true]));
+    }
+    this.dropCollapsedBins();
+  }
+
+  /**
+   * Removes bins whose total (DC + AC) EMA is below COLLAPSED_EMA_W, along
+   * with their sample days.
+   *
+   * Such a bin can only come from a bad seed — a boat at rest never draws
+   * under a watt — and once it has minDaysPerBin days it is locked: the
+   * spike gate rejects every real sample above outlierFactor × ~0 W, so it
+   * never recovers on its own and the forecast uses ~0 W of house load for
+   * that phase (issue #10). Runs when a profile is loaded from disk, so
+   * installations already carrying a stuck bin start over on it without
+   * deleting load-profile.json by hand; the bin relearns ungated (young bins
+   * skip the band in shouldGate) and passes the min-days gate on real
+   * samples.
+   *
+   * @returns {void}
+   */
+  dropCollapsedBins() {
+    for (const [binKey, bin] of this.bins) {
+      if (bin.dcEma == null) continue;
+      if (bin.dcEma + bin.acEma >= COLLAPSED_EMA_W) continue;
+      this.bins.delete(binKey);
+      for (const key of Array.from(this.samplesPerBin.keys())) {
+        if (key.startsWith(`${binKey}:`)) {
+          this.samplesPerBin.delete(key);
+        }
+      }
     }
   }
 }
@@ -1196,9 +1248,13 @@ class PredictionEngine {
     // charging (which flow through the shunt but aren't added back) make it
     // understate real load. Add those back to reconstruct gross house
     // consumption. All configured paths are summed; a missing reading
-    // contributes nothing, and only an all-paths-missing cycle counts as
-    // "no DC sample". AC consumption (inverter/shore) is independent of
-    // the DC bus: sum every configured path with the same rule.
+    // contributes nothing, and a cycle where no House Load Path yields a
+    // number records no sample at all — an AC-only reading must not enter
+    // the profile as a 0 W DC sample (issue #10: the cycle right after
+    // start-up, before the plugin that computes the house load has
+    // published, would seed a bin at 0 W that the spike gate then locks
+    // there). AC consumption (inverter/shore) is independent of the DC
+    // bus: sum every configured path with the same rule.
     let dcPowerW = null;
     const dcReadings = [];
     for (const path of this.houseLoadPaths) {
@@ -1224,7 +1280,7 @@ class PredictionEngine {
       `updateLoadProfile: houseLoad=[${dcReadings.join(", ")}] (${dcPowerW}), uncountedCharging=${chargingW}, gross=${dcPowerW != null ? dcPowerW + chargingW : null}, ac=[${acReadings.join(", ")}] (${acPowerW})`,
     );
 
-    if (dcPowerW != null || acPowerW != null) {
+    if (dcPowerW != null) {
       // Reconstruct gross DC consumption; clamp at 0 (a negative gross means
       // charging exceeded load, i.e. the battery was net charging, which is
       // not a consumption sample).

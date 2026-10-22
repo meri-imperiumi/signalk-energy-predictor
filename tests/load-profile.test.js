@@ -16,6 +16,18 @@ const {
 test.describe("LoadProfile", () => {
   let loadProfile;
 
+  // Matures a bin past the minDaysPerBin gate so the EMA band in
+  // shouldGate applies to it — the band only guards bins that are already
+  // trusted for predictions.
+  function matureBin(lp, binKey) {
+    for (let i = 0; i < lp.minDaysPerBin; i++) {
+      lp.samplesPerBin.set(
+        `${binKey}:2024-08-${String(20 + i).padStart(2, "0")}`,
+        true,
+      );
+    }
+  }
+
   test.beforeEach(() => {
     loadProfile = new LoadProfile({
       config: {
@@ -190,6 +202,7 @@ test.describe("LoadProfile", () => {
       }),
     );
     loadProfile.bins.set(binKey, { dcEma: 100, acEma: 50 });
+    matureBin(loadProfile, binKey);
 
     // Spike sample (4× current EMA)
     const gate = loadProfile.shouldGate(400, 200, binKey);
@@ -200,6 +213,7 @@ test.describe("LoadProfile", () => {
     // Seed a healthy at-rest:day bin at 90W (150 total with ac).
     const binKey = "at-rest:day";
     loadProfile.bins.set(binKey, { dcEma: 100, acEma: 50 });
+    matureBin(loadProfile, binKey);
     // A sample far below the EMA (3× below) is a charging artifact, not real
     // consumption. Without the low gate, a run of these would drag the EMA
     // to ~0 and then lock it there via the high gate.
@@ -212,13 +226,71 @@ test.describe("LoadProfile", () => {
     // so gradual decline is allowed to track.
     const binKey = "at-rest:day";
     loadProfile.bins.set(binKey, { dcEma: 100, acEma: 50 });
+    matureBin(loadProfile, binKey);
     const gate = loadProfile.shouldGate(60, 0, binKey);
     assert.strictEqual(gate, null);
   });
 
   test("does not gate normal samples", () => {
-    const gate = loadProfile.shouldGate(100, 50, "at-rest:day");
+    const binKey = "at-rest:day";
+    loadProfile.bins.set(binKey, { dcEma: 100, acEma: 50 });
+    matureBin(loadProfile, binKey);
+    const gate = loadProfile.shouldGate(100, 50, binKey);
     assert.strictEqual(gate, null);
+  });
+
+  test("does not gate a young bin, so a 0 W seed cannot lock it", () => {
+    // Issue #10: the spike band only guards bins trusted for predictions.
+    // A bin seeded at ~0 W with too few sample days would otherwise have
+    // every real sample rejected (236.9 W > 3 × ~0.002 W) and mature at
+    // ~0 W of house load.
+    loadProfile.bins.set("at-rest:day", { dcEma: 0, acEma: 0.0018 });
+    loadProfile.samplesPerBin.set("at-rest:day:2026-10-19", true);
+
+    assert.strictEqual(
+      loadProfile.shouldGate(236.9, 0.001, "at-rest:day"),
+      null,
+    );
+  });
+
+  test("a bin seeded at 0 W converges on real samples and becomes usable", () => {
+    // Issue #10 repro: the bin seeds at ~0 W from a start-up cycle that
+    // recorded a sample without a house-load reading. While young it is
+    // ungated, so the real at-rest loads that follow are learned — live
+    // cycles sample every few seconds, so the EMA is converged long before
+    // the bin matures at minDaysPerBin days.
+    const position = { latitude: 39.5, longitude: 3.0 };
+    const ingest = (t, dc, ac) =>
+      loadProfile.ingestSample({
+        time: new Date(t),
+        dcLoadW: dc,
+        acLoadW: ac,
+        position,
+        stateClass: StateClass.AT_REST,
+      });
+
+    // The bad seed.
+    assert.strictEqual(ingest("2026-10-19T11:00:00Z", 0, 0.0018), null);
+
+    // Real readings over three days, at live-cycle density.
+    for (const day of ["19", "20", "21"]) {
+      for (let m = 0; m < 30; m++) {
+        const t = `2026-10-${day}T12:${String(m).padStart(2, "0")}:00Z`;
+        assert.strictEqual(ingest(t, 236.9, 0.001), null, t);
+      }
+    }
+
+    assert.strictEqual(loadProfile.getSampleDays("at-rest:day"), 3);
+    const load = loadProfile.getLoad(SunPhase.DAY, StateClass.AT_REST);
+    assert.ok(load, "bin should be learned after 3 sample days");
+    assert.ok(
+      load.dcWh > 200,
+      `EMA should have converged toward 236.9W, got ${load.dcWh}`,
+    );
+
+    // Once mature the band engages and still admits real samples — the
+    // bin must not re-lock at its converged value.
+    assert.strictEqual(ingest("2026-10-21T13:00:00Z", 236.9, 0.001), null);
   });
 
   test("returns rolling average fallback when bin not ready", () => {
@@ -280,6 +352,55 @@ test.describe("LoadProfile", () => {
     assert.strictEqual(lp2.bins.get("at-rest:night").dcEma, 120);
     assert.strictEqual(lp2.bins.get("underway:day").acEma, 80);
     assert(lp2.samplesPerBin.has("at-rest:night:2024-08-21"));
+  });
+
+  test("drops collapsed bins and their sample days when loading", () => {
+    // Issue #10 recovery: a bin stuck at ~0 W EMA can never relearn on its
+    // own (the spike gate rejects every real sample above 3 × ~0 W), so
+    // loading a profile resets it to unlearned instead of carrying the
+    // locked state. The bins relearn ungated (young-bin skip in
+    // shouldGate); healthy bins are untouched. Bin values are the ones
+    // reported from a real installation.
+    const lp2 = new LoadProfile({
+      config: { enabled: true, minDaysPerBin: 3 },
+      getSelfPath: () => null,
+      app: { debug: () => {}, error: () => {} },
+    });
+    lp2.fromJSON({
+      bins: {
+        "at-rest:day": { dcEma: 0, acEma: 0.0010420786489005723 },
+        "at-rest:dusk": {
+          dcEma: 141.14310791636524,
+          acEma: 0.0014624444434466076,
+        },
+        "at-rest:night": { dcEma: 0, acEma: 0 },
+        "at-rest:dawn": {
+          dcEma: 148.7847673631155,
+          acEma: 0.0009042843972396357,
+        },
+      },
+      samplesPerBin: [
+        "at-rest:day:2026-10-19",
+        "at-rest:dusk:2026-10-19",
+        "at-rest:night:2026-10-19",
+        "at-rest:dawn:2026-10-20",
+        "at-rest:day:2026-10-20",
+        "at-rest:dusk:2026-10-20",
+        "at-rest:night:2026-10-20",
+        "at-rest:dawn:2026-10-21",
+        "at-rest:dusk:2026-10-21",
+        "at-rest:dawn:2026-10-22",
+      ],
+    });
+
+    assert.strictEqual(lp2.bins.has("at-rest:day"), false);
+    assert.strictEqual(lp2.bins.has("at-rest:night"), false);
+    assert.strictEqual(lp2.bins.get("at-rest:dusk").dcEma, 141.14310791636524);
+    assert.strictEqual(lp2.bins.get("at-rest:dawn").dcEma, 148.7847673631155);
+    assert.strictEqual(lp2.getSampleDays("at-rest:day"), 0);
+    assert.strictEqual(lp2.getSampleDays("at-rest:night"), 0);
+    assert.strictEqual(lp2.getSampleDays("at-rest:dusk"), 3);
+    assert.strictEqual(lp2.getSampleDays("at-rest:dawn"), 3);
   });
 
   test("tracks sample days per bin", () => {
@@ -829,6 +950,43 @@ test.describe("PredictionEngine.updateLoadProfile gross consumption", () => {
         bin.acEma,
         120,
         `AC EMA should sum 80+40 from the configured inverter paths, got ${bin.acEma}`,
+      );
+    });
+  });
+
+  test("records no sample when no house load path publishes, AC-only included", () => {
+    // Issue #10: an AC reading alone must not enter the profile as a 0 W
+    // DC sample. The cycle right after start-up — before the plugin that
+    // computes the DC house load has published — is exactly this case, and
+    // its 0 W seed used to lock the bin at ~0 W via the spike gate.
+    withDaytimeNow(() => {
+      const pathValues = new Map([
+        ["electrical.venus.vebusDcPower", 0.001],
+        ["navigation.state", "moored"],
+        ["navigation.position", { latitude: -18.86, longitude: -159.8 }],
+      ]);
+      const engine = makeEngine(pathValues);
+      engine.updateLoadProfile();
+      assert.strictEqual(
+        engine.loadProfile.bins.size,
+        0,
+        "an AC-only cycle must not seed a bin",
+      );
+      assert.strictEqual(
+        engine.loadProfile.samples.length,
+        0,
+        "an AC-only cycle must not feed the rolling average either",
+      );
+
+      // Once the house-load path publishes, learning resumes normally.
+      pathValues.set("electrical.venus.dcPower", 210);
+      engine.updateLoadProfile();
+      const bin = engine.loadProfile.bins.get("at-rest:day");
+      assert.ok(bin, "sample should be ingested once the DC path publishes");
+      assert.strictEqual(
+        bin.dcEma,
+        210,
+        `DC EMA should seed from the first real reading, got ${bin.dcEma}`,
       );
     });
   });
